@@ -1,0 +1,26 @@
+{
+  "patterns": {
+    "section": "***",
+    "article": "###",
+    "paragraph": "",
+    "subparagraph": ""
+  },
+  "doc_types": {
+    "фз": "federal_law",
+    "приказ": "order",
+    "письмо": "letter",
+    "методич": "methodology",
+    "упс": "Постановление",
+    "бобс": "Постановление"
+  },
+  "metadata_patterns": {
+    "doc_number": "(\\d+[А-Я]?-\\d+[А-Я]?)",
+    "doc_date": "(\\d{2}\\.\\d{2}\\.\\d{4})",
+    "doc_year": "(\\d{4})"
+  },
+  "chunking_settings": {
+    "chunk_size": 701,
+    "chunk_overlap": 50,
+    "min_chunk_length": 81
+  }
+}

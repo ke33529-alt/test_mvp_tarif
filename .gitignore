@@ -1,0 +1,19 @@
+﻿# Виртуальные окружения
+venv/
+venv``/
+.venv/
+env/
+
+# Данные, БД, модели
+data/
+chroma/
+chroma_db/
+*.db
+*.sqlite
+*.pth
+*.bin
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
