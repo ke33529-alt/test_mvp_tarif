@@ -66,13 +66,27 @@ def get_live_answer_stats(days: int = 7):
                     2
                 )
     
-    print(f"[APP STATS] total={stats['total']}, 👍={stats['rating_3']}, 👎={stats['rating_1']}")
+    # Логирование без эмодзи для совместимости с Windows
+    try:
+        print(f"[APP STATS] total={stats['total']}, good={stats['rating_3']}, bad={stats['rating_1']}")
+    except:
+        pass
     return stats
 
 # =============================================================================
 # 🎨 Настройка страницы
 # =============================================================================
 st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚡")
+
+# =============================================================================
+# 🔐 Инициализация session_state (ОБЯЗАТЕЛЬНО перед любым использованием)
+# =============================================================================
+if "admin_logged_in" not in st.session_state:
+    st.session_state.admin_logged_in = False
+
+# Безопасное получение значения (защита от race conditions)
+def is_admin_logged() -> bool:
+    return st.session_state.get("admin_logged_in", False)
 
 # =============================================================================
 # 🎨 CSS стили
@@ -148,7 +162,7 @@ with st.sidebar:
     st.subheader("⚙️ В разработке")
     st.caption("🚧 Ведутся работы по внедрению")
     st.divider()
-    if st.session_state.admin_logged_in:
+    if is_admin_logged():
         st.success("🔓 Админка: вход выполнен")
         if st.button("🚪 Выйти"):
             st.session_state.admin_logged_in = False
@@ -165,12 +179,6 @@ RegulaAI<br>
 </div>
 """, unsafe_allow_html=True)
 st.divider()
-
-# =============================================================================
-# 🔐 Админка: проверка пароля
-# =============================================================================
-if "admin_logged_in" not in st.session_state:
-    st.session_state.admin_logged_in = False
 
 # =============================================================================
 # 📊 Данные для примеров (кэширование)
@@ -704,7 +712,7 @@ elif main_choice == "📊 Прогноз потребления":
 elif main_choice == "🛠 Админка":
     st.header("🛠 Панель администратора")
 
-    if not st.session_state.admin_logged_in:
+    if not is_admin_logged():
         st.warning("🔒 Требуется вход администратора")
         password = st.text_input("Пароль", type="password")
         if st.button("🔓 Войти"):
