@@ -38,7 +38,14 @@ except ImportError as e:
     print(f"[WARN] Не удалось загрузить умный чанкер: {e}")
     print("[INFO] Будет использоваться стандартное разбиение")
     CHUNKER_AVAILABLE = False
+        # Определяем заглушки для совместимости
+    def detect_doc_type(filepath: str, config_file: str = None) -> str:
+        """Заглушка: возвращает unknown, если чанкер недоступен"""
+        return "unknown"
 
+    def extract_metadata_from_filename(filepath: str, config_file: str = None) -> dict:
+        """Заглушка: возвращает пустой dict, если чанкер недоступен"""
+        return {}
 # =============================================================================
 # Функции для работы с метаданными
 # =============================================================================

@@ -9,6 +9,69 @@ class LegalDocumentChunker:
         self.max_chunk_chars = max_chunk_chars
         self.neighbor_radius = neighbor_radius
 
+def detect_doc_type(filepath: str, config_file: str = None) -> str:
+    """
+    Определяет тип документа по имени файла.
+
+    Args:
+        filepath: Путь к файлу
+        config_file: Путь к конфигурационному файлу (не используется в базовой версии)
+
+    Returns:
+        Строка с типом документа ('npa', 'fas', 'court', 'methodics' или 'unknown')
+    """
+    filename = os.path.basename(filepath).lower()
+
+    if any(kw in filename for kw in ['приказ', 'фз', 'постановление', 'распоряжение']):
+        return 'npa'
+    elif any(kw in filename for kw in ['фас', 'предписание', 'решение фас']):
+        return 'fas'
+    elif any(kw in filename for kw in ['суд', 'арбитраж', 'апелляция', 'кассация']):
+        return 'court'
+    elif any(kw in filename for kw in ['методич', 'разъясн', 'письмо']):
+        return 'methodics'
+
+    return 'unknown'
+
+
+def extract_metadata_from_filename(filepath: str, config_file: str = None) -> dict:
+    """
+    Извлекает метаданные из имени файла.
+
+    Args:
+        filepath: Путь к файлу
+        config_file: Путь к конфигурационному файлу (не используется в базовой версии)
+
+    Returns:
+        Словарь с метаданными (doc_number, doc_date и т.д.)
+    """
+    filename = os.path.basename(filepath)
+    metadata = {}
+
+    # Попытка извлечь номер документа (паттерны типа №123, № 123, от 12.03.2024)
+    number_match = re.search(r'№\s*(\d+[а-яА-Я]?)', filename)
+    if number_match:
+        metadata['doc_number'] = number_match.group(1)
+
+    # Попытка извлечь дату (паттерны 12.03.2024, 12-03-2024, 2024-03-12)
+    date_patterns = [
+        r'(\d{2})\.(\d{2})\.(\d{4})',
+        r'(\d{2})-(\d{2})-(\d{4})',
+        r'(\d{4})-(\d{2})-(\d{2})'
+    ]
+
+    for pattern in date_patterns:
+        date_match = re.search(pattern, filename)
+        if date_match:
+            groups = date_match.groups()
+            if len(groups[0]) == 4:  # YYYY-MM-DD
+                metadata['doc_date'] = f"{groups[2]}.{groups[1]}.{groups[0]}"
+            else:  # DD.MM.YYYY или DD-MM-YYYY
+                metadata['doc_date'] = f"{groups[0]}.{groups[1]}.{groups[2]}"
+            break
+
+    return metadata
+
     def chunk_text(self, text: str, doc_id: str, metadata: Dict = None) -> List[Dict]:
         if metadata is None:
             metadata = {}
