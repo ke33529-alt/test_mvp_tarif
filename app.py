@@ -65,6 +65,7 @@ def get_live_answer_stats(days: int = 7):
                     (stats["rating_3"] * 3 + stats["rating_2"] * 2 + stats["rating_1"] * 1) / stats["total"],
                     2
                 )
+    
 
     # Логирование без эмодзи для совместимости с Windows
     try:

@@ -38,7 +38,7 @@ except ImportError as e:
     print(f"[WARN] Не удалось загрузить умный чанкер: {e}")
     print("[INFO] Будет использоваться стандартное разбиение")
     CHUNKER_AVAILABLE = False
-        # Определяем заглушки для совместимости
+    # Определяем заглушки для совместимости
     def detect_doc_type(filepath: str, config_file: str = None) -> str:
         """Заглушка: возвращает unknown, если чанкер недоступен"""
         return "unknown"
