@@ -148,7 +148,7 @@ def index_file(file_path, category="npa"):
             doc_id = f"{os.path.basename(file_path)}_{i}"
             collection.upsert(
                 ids=[doc_id],
-                documents=[chunk['content']],
+                documents=[chunk['text']],
                 metadatas=[{
                     "filename": chunk['metadata'].get('filename', ''),
                     "filepath": chunk['metadata'].get('filepath', ''),
@@ -305,7 +305,7 @@ def rebuild_index():
         
         # Создаём/пересоздаём базу
         vectorstore = Chroma.from_documents(
-            documents=[type('obj', (object,), {'page_content': c['content'], 'metadata': c['metadata']})() for c in chunks],
+            documents=[type('obj', (object,), {'page_content': c['text'], 'metadata': c['metadata']})() for c in chunks],
             embedding=embeddings,
             persist_directory=VECTOR_DB_DIR
         )
