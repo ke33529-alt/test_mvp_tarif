@@ -5,6 +5,9 @@ import json
 from datetime import datetime
 import traceback
 
+# Добавляем корень проекта в путь для корректного импорта модуля core
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # =============================================================================
 # Настройки
 # =============================================================================
@@ -38,6 +41,7 @@ except ImportError as e:
     print(f"[WARN] Не удалось загрузить умный чанкер: {e}")
     print("[INFO] Будет использоваться стандартное разбиение")
     CHUNKER_AVAILABLE = False
+    
     # Определяем заглушки для совместимости
     def detect_doc_type(filepath: str, config_file: str = None) -> str:
         """Заглушка: возвращает unknown, если чанкер недоступен"""
@@ -46,6 +50,7 @@ except ImportError as e:
     def extract_metadata_from_filename(filepath: str, config_file: str = None) -> dict:
         """Заглушка: возвращает пустой dict, если чанкер недоступен"""
         return {}
+
 # =============================================================================
 # Функции для работы с метаданными
 # =============================================================================
@@ -55,7 +60,7 @@ def load_metadata():
         try:
             with open(METADATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
+        except Exception:
             return {}
     return {}
 
@@ -109,11 +114,13 @@ def index_file(file_path, category="npa"):
         
         docs = loader.load()
         
-        # ← УМНОЕ ЧАНКОВАНИЕ: загружаем конфиг и создаём чанкер
+        # ← УМНОЕ ЧАНКОВАНИЕ: создаём чанкер
+        chunker = None
         if CHUNKER_AVAILABLE:
-            chunker = LegalDocumentChunker(patterns_file=CONFIG_FILE)
-        else:
-            chunker = None
+            try:
+                chunker = LegalDocumentChunker()
+            except Exception as e:
+                print(f"[WARN] Ошибка инициализации чанкера: {e}")
         
         chunks = []
         for doc in docs:
@@ -129,13 +136,15 @@ def index_file(file_path, category="npa"):
             base_metadata.update(file_metadata)
             
             if chunker:
+                # Умный чанкер возвращает список словарей с ключом 'text'
                 doc_chunks = chunker.chunk_by_structure(doc.page_content, base_metadata)
                 chunks.extend(doc_chunks)
             else:
+                # Стандартное разбиение
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50, length_function=len)
                 sub_chunks = text_splitter.split_text(doc.page_content)
                 chunks.extend([{
-                    'content': chunk,
+                    'text': chunk,  # Используем ключ 'text' для единообразия
                     'metadata': base_metadata
                 } for chunk in sub_chunks])
         
@@ -144,26 +153,32 @@ def index_file(file_path, category="npa"):
         
         client, collection = initialize_db()
         
+        # Пакетная вставка для ускорения
+        ids = []
+        documents = []
+        metadatas = []
+        
         for i, chunk in enumerate(chunks):
-            doc_id = f"{os.path.basename(file_path)}_{i}"
-            collection.upsert(
-                ids=[doc_id],
-                documents=[chunk['text']],
-                metadatas=[{
-                    "filename": chunk['metadata'].get('filename', ''),
-                    "filepath": chunk['metadata'].get('filepath', ''),
-                    "category": chunk['metadata'].get('category', ''),
-                    "doc_type": chunk['metadata'].get('doc_type', ''),
-                    "doc_number": chunk['metadata'].get('doc_number', ''),
-                    "doc_date": chunk['metadata'].get('doc_date', ''),
-                    "struct_type": chunk['metadata'].get('struct_type', ''),
-                    "struct_text": chunk['metadata'].get('struct_text', ''),
-                    "article": chunk['metadata'].get('article', ''),
-                    "paragraph": chunk['metadata'].get('paragraph', ''),
-                    "chunk_index": i,
-                    "indexed_at": datetime.now().isoformat()
-                }]
-            )
+            doc_id = f"{os.path.basename(file_path)}_{i}_{datetime.now().timestamp()}"
+            ids.append(doc_id)
+            documents.append(chunk['text'])  # Ключ 'text'
+            metadatas.append({
+                "filename": chunk['metadata'].get('filename', ''),
+                "filepath": chunk['metadata'].get('filepath', ''),
+                "category": chunk['metadata'].get('category', ''),
+                "doc_type": chunk['metadata'].get('doc_type', ''),
+                "doc_number": chunk['metadata'].get('doc_number', ''),
+                "doc_date": chunk['metadata'].get('doc_date', ''),
+                "struct_type": chunk['metadata'].get('struct_type', ''),
+                "struct_text": chunk['metadata'].get('struct_text', ''),
+                "article": chunk['metadata'].get('article', ''),
+                "paragraph": chunk['metadata'].get('paragraph', ''),
+                "chunk_index": i,
+                "indexed_at": datetime.now().isoformat()
+            })
+        
+        if ids:
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
         
         return {"status": "success", "chunks": len(chunks)}
     
@@ -222,13 +237,17 @@ def rebuild_index():
     # Загружаем метаданные
     metadata = load_metadata()
     
-    # ← УМНОЕ ЧАНКОВАНИЕ: загружаем конфиг и создаём чанкер
+    # ← УМНОЕ ЧАНКОВАНИЕ: создаём чанкер
+    chunker = None
     if CHUNKER_AVAILABLE:
-        chunker = LegalDocumentChunker(patterns_file=CONFIG_FILE)
-        print(f"[CONFIG] Конфигурация загружена: {CONFIG_FILE}")
-        print(f"[CONFIG] Размер чанка: {chunker.chunk_size}, Перекрытие: {chunker.chunk_overlap}")
+        try:
+            chunker = LegalDocumentChunker()
+            print(f"[CONFIG] Умный чанкер инициализирован")
+            print(f"[CONFIG] Размер чанка: {chunker.max_chunk_chars} символов")
+        except Exception as e:
+            print(f"[WARN] Ошибка инициализации чанкера: {e}")
+            chunker = None
     else:
-        chunker = None
         print("[WARN] Умный чанкер недоступен, используется стандартное разбиение")
     
     # Собираем документы
@@ -237,7 +256,17 @@ def rebuild_index():
     
     print("[DOCS] Сканирование документов...")
     
-    for filename in os.listdir(RAW_DIR):
+    # Проверяем наличие файлов
+    if not os.path.exists(RAW_DIR):
+        print(f"[ERROR] Папка не найдена: {RAW_DIR}")
+        return False
+        
+    files_list = os.listdir(RAW_DIR)
+    if not files_list:
+        print(f"[WARN] Папка пуста: {RAW_DIR}")
+        # Продолжаем, но предупреждаем
+    
+    for filename in files_list:
         if filename.startswith('.'):
             continue
         
@@ -287,7 +316,7 @@ def rebuild_index():
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50, length_function=len)
             sub_chunks = text_splitter.split_text(doc.page_content)
             chunks.extend([{
-                'content': chunk,
+                'text': chunk,  # Ключ 'text'
                 'metadata': base_metadata
             } for chunk in sub_chunks])
     
@@ -304,8 +333,14 @@ def rebuild_index():
         )
         
         # Создаём/пересоздаём базу
+        # Преобразуем наши словари в объекты, совместимые с LangChain
+        langchain_docs = []
+        for c in chunks:
+            from langchain.schema import Document
+            langchain_docs.append(Document(page_content=c['text'], metadata=c['metadata']))
+        
         vectorstore = Chroma.from_documents(
-            documents=[type('obj', (object,), {'page_content': c['text'], 'metadata': c['metadata']})() for c in chunks],
+            documents=langchain_docs,
             embedding=embeddings,
             persist_directory=VECTOR_DB_DIR
         )
@@ -315,6 +350,7 @@ def rebuild_index():
         
     except Exception as e:
         print(f"[ERROR] Ошибка создания эмбеддингов: {e}")
+        traceback.print_exc()
         return False
     
     # Обновляем метаданные

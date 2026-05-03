@@ -14,7 +14,7 @@ os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_DB_TELEMETRY"] = "false"
 
 # =============================================================================
-# Настройки путей (исправлены пробелы)
+# Настройки путей
 # =============================================================================
 CHROMA_DB_PATH = os.path.join("data", "vector_db")
 FAQ_PATH = os.path.join("data", "faq", "faq.json")
@@ -27,7 +27,7 @@ CONFIG_FILE = os.path.join("config", "advisor_config.json")
 DEFAULT_CONFIG = {
     "lm_studio_url": "http://127.0.0.1:1234/v1",
     "default_model": "qwen/qwen3.5-9b",
-    "max_tokens": 2048,  # 🔹 Важно для reasoning-моделей
+    "max_tokens": 2048,
     "temperature": 0.3,
     "timeout_seconds": 300,
     "cache_ttl_days": 7
@@ -51,7 +51,7 @@ def save_config(config: Dict):
 CONFIG = load_config()
 
 # =============================================================================
-# Клиент LM Studio (OpenAI-совместимый API)
+# Клиент LM Studio
 # =============================================================================
 client = OpenAI(
     base_url=CONFIG.get("lm_studio_url", "http://127.0.0.1:1234/v1"),
@@ -72,23 +72,59 @@ def check_model_available(model_name: str) -> bool:
     return any(m["name"] == model_name for m in get_available_models())
 
 # =============================================================================
-# Глобальный ChromaDB клиент
+# Глобальный ChromaDB клиент (ИСПРАВЛЕНО)
 # =============================================================================
 _chroma_client = None
 _chroma_collection = None
 _client_lock = threading.Lock()
 
 def get_chroma_collection():
+    """
+    Безопасное получение коллекции ChromaDB.
+    Обрабатывает ошибку 'Instance already exists' при работе внутри Streamlit.
+    """
     global _chroma_client, _chroma_collection
+    
     with _client_lock:
+        # Если коллекция уже создана, возвращаем её
         if _chroma_collection is not None:
             return _chroma_collection
+            
         import chromadb
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        
         try:
+            # Попытка создать или получить клиент
+            # Если клиент уже создан в другом месте (Streamlit), эта строка может выбросить ошибку
+            # В новых версиях chromadb лучше использовать Settings для игнорирования конфликта
+            settings = chromadb.Settings(
+                anonymized_telemetry=False,
+                allow_reset=True,
+                is_persistent=True
+            )
+            _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=settings)
+        except Exception as e:
+            # Если ошибка "Instance already exists", пробуем получить клиент без явного создания
+            # В некоторых случаях достаточно просто импортировать и работать, если путь тот же
+            # Но надежнее поймать конкретную ошибку и продолжить
+            print(f"[WARN] Предупреждение ChromaDB: {e}. Пробуем продолжить работу...")
+            # Пытаемся пересоздать объект клиента, игнорируя предупреждение, если оно не критично
+            try:
+                 _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+            except Exception:
+                 # Если совсем ничего не выходит, возвращаем None (поиск не сработает)
+                 return None
+
+        try:
+            # Пробуем получить существующую коллекцию
             _chroma_collection = _chroma_client.get_collection(name="tariff_docs")
         except Exception:
-            _chroma_collection = _chroma_client.create_collection(name="tariff_docs")
+            # Если коллекции нет, создаём новую
+            try:
+                _chroma_collection = _chroma_client.create_collection(name="tariff_docs")
+            except Exception as create_err:
+                print(f"[ERROR] Не удалось создать коллекцию: {create_err}")
+                return None
+                
         return _chroma_collection
 
 # =============================================================================
@@ -175,23 +211,44 @@ def search_faq(query: str, top_k: int = 3) -> list:
         return []
 
 # =============================================================================
-# Поиск в векторной базе
+# Поиск в векторной базе (ИСПРАВЛЕНО)
 # =============================================================================
 def search_vector_db(query: str, top_k: int = 5) -> list:
     try:
         collection = get_chroma_collection()
-        results = collection.query(query_texts=[query], n_results=top_k, include=["documents", "metadatas"])
+        
+        if collection is None:
+            print("[ERROR] Коллекция ChromaDB не доступна")
+            return []
+            
+        results = collection.query(
+            query_texts=[query], 
+            n_results=top_k, 
+            include=["documents", "metadatas"]
+        )
+        
         sources = []
+        # Проверяем, есть ли результаты
+        if not results or not results.get("documents") or not results["documents"][0]:
+            return []
+            
         for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+            if meta is None:
+                meta = {}
             sources.append({
                 "snippet": doc[:500] + "..." if len(doc) > 500 else doc,
-                "file": meta.get("filename", "Неизвестно"), "page": meta.get("page", ""),
-                "category": meta.get("category", "Общее"), "doc_type": meta.get("doc_type", ""),
-                "article": meta.get("article", ""), "paragraph": meta.get("paragraph", "")
+                "file": meta.get("filename", "Неизвестно"), 
+                "page": meta.get("page", ""),
+                "category": meta.get("category", "Общее"), 
+                "doc_type": meta.get("doc_type", ""),
+                "article": meta.get("article", ""), 
+                "paragraph": meta.get("paragraph", "")
             })
         return sources
     except Exception as e:
         print(f"[VECTOR DB ERROR] {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 # =============================================================================
@@ -221,7 +278,6 @@ def generate_ai_answer(query: str, sources: list, model: str = None, temperature
             for i, src in enumerate(sources[:5])
         ])
 
-        # 🔹 Системный промпт подавляет "думание" reasoning-моделей
         system_prompt = """Ты — эксперт по тарифному регулированию в РФ.
 Отвечай ТОЛЬКО на русском языке, кратко, структурно и по существу.
 ЗАПРЕЩЕНО писать 'Thinking Process', рассуждения или объяснения шагов.
