@@ -91,37 +91,144 @@ def get_loader(file_path):
 # =============================================================================
 # 🆕 НОВЫЕ ФУНКЦИИ ДЛЯ СОВМЕСТИМОСТИ С APP.PY
 # =============================================================================
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+def get_embedding_function():
+    """Возвращает embedding function с единой моделью для всего проекта"""
+    from chromadb.utils import embedding_functions
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBEDDING_MODEL
+    )
+
 def initialize_db():
-    """Инициализирует базу данных ChromaDB (для совместимости с app.py)"""
+    """Инициализирует базу данных ChromaDB с правильной embedding function"""
     import chromadb
     os.makedirs(VECTOR_DB_DIR, exist_ok=True)
     client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+    ef = get_embedding_function()
     try:
-        collection = client.get_collection(name="tariff_docs")
+        collection = client.get_collection(name="tariff_docs", embedding_function=ef)
     except Exception:
-        collection = client.create_collection(name="tariff_docs")
+        collection = client.create_collection(name="tariff_docs", embedding_function=ef)
     return client, collection
 
+def load_chunking_settings() -> dict:
+    """Загружает настройки чанкования из конфига"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                return cfg.get("chunking_settings", {})
+        except Exception:
+            pass
+    return {}
+
+def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> list:
+    """Разбивает текст на чанки согласно настройкам режима"""
+    mode = settings.get("chunking_mode", "structural")
+    overlap = settings.get("chunk_overlap", 0)
+    min_len = settings.get("min_chunk_length", 50)
+
+    # ── Режим 1: умный структурный чанкер ───────────────────────────────────
+    if mode == "structural" and chunker:
+        chunks = chunker.chunk_by_structure(text, base_metadata)
+        # Применяем перекрытие если задано
+        if overlap > 0:
+            chunks = _apply_overlap(chunks, overlap)
+        return [c for c in chunks if len(c.get('text', '')) >= min_len]
+
+    # ── Режим 2: по разделителю ──────────────────────────────────────────────
+    elif mode == "separator":
+        separator = settings.get("separator", "&&")
+        max_len = settings.get("max_chunk_length", 2000)
+        parts = text.split(separator)
+        raw_chunks = []
+        for part in parts:
+            part = part.strip()
+            if len(part) < min_len:
+                continue
+            # Если кусок слишком длинный — дробим дополнительно
+            if len(part) > max_len:
+                sub = _split_fixed(part, max_len, overlap)
+                raw_chunks.extend(sub)
+            else:
+                raw_chunks.append(part)
+        # Применяем перекрытие
+        if overlap > 0:
+            raw_chunks = _apply_overlap_texts(raw_chunks, overlap)
+        return [{'text': t, 'metadata': base_metadata} for t in raw_chunks if len(t) >= min_len]
+
+    # ── Режим 3: фиксированная длина ─────────────────────────────────────────
+    elif mode == "fixed":
+        fixed_len = settings.get("fixed_chunk_length", 1000)
+        parts = _split_fixed(text, fixed_len, overlap)
+        return [{'text': t, 'metadata': base_metadata} for t in parts if len(t) >= min_len]
+
+    # ── Fallback: стандартный RecursiveCharacterTextSplitter ─────────────────
+    else:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.get("max_chunk_length", 500),
+            chunk_overlap=overlap,
+            length_function=len
+        )
+        parts = text_splitter.split_text(text)
+        return [{'text': t, 'metadata': base_metadata} for t in parts if len(t) >= min_len]
+
+def _split_fixed(text: str, size: int, overlap: int = 0) -> list:
+    """Разбивает текст на куски фиксированного размера с перекрытием"""
+    if overlap >= size:
+        overlap = 0
+    chunks = []
+    step = size - overlap
+    for i in range(0, len(text), step):
+        chunk = text[i:i + size]
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+def _apply_overlap(chunks: list, overlap: int) -> list:
+    """Добавляет перекрытие к структурным чанкам (словари с ключом 'text')"""
+    result = []
+    for i, chunk in enumerate(chunks):
+        if i > 0 and overlap > 0:
+            prev_text = chunks[i-1].get('text', '')
+            suffix = prev_text[-overlap:] if len(prev_text) > overlap else prev_text
+            chunk = dict(chunk)
+            chunk['text'] = suffix + chunk.get('text', '')
+        result.append(chunk)
+    return result
+
+def _apply_overlap_texts(texts: list, overlap: int) -> list:
+    """Добавляет перекрытие к списку строк"""
+    result = []
+    for i, text in enumerate(texts):
+        if i > 0 and overlap > 0:
+            prev = texts[i-1]
+            suffix = prev[-overlap:] if len(prev) > overlap else prev
+            text = suffix + text
+        result.append(text)
+    return result
+
 def index_file(file_path, category="npa"):
-    """Индексирует один файл (для совместимости с app.py) — С УМНЫМ ЧАНКОВАНИЕМ"""
+    """Индексирует один файл с учётом настроек чанкования"""
     try:
         if not LANGCHAIN_AVAILABLE:
             return {"status": "error", "message": "LangChain не установлен"}
-        
+
         loader = get_loader(file_path)
         if loader is None:
             return {"status": "error", "message": "Неподдерживаемый формат"}
-        
+
         docs = loader.load()
-        
-        # ← УМНОЕ ЧАНКОВАНИЕ: создаём чанкер
+        settings = load_chunking_settings()
+
         chunker = None
         if CHUNKER_AVAILABLE:
             try:
                 chunker = LegalDocumentChunker()
             except Exception as e:
                 print(f"[WARN] Ошибка инициализации чанкера: {e}")
-        
+
         chunks = []
         for doc in docs:
             base_metadata = {
@@ -131,37 +238,22 @@ def index_file(file_path, category="npa"):
                 'doc_type': detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
                 'indexed_at': datetime.now().isoformat()
             }
-            
             file_metadata = extract_metadata_from_filename(doc.metadata.get('source', ''), CONFIG_FILE)
             base_metadata.update(file_metadata)
-            
-            if chunker:
-                # Умный чанкер возвращает список словарей с ключом 'text'
-                doc_chunks = chunker.chunk_by_structure(doc.page_content, base_metadata)
-                chunks.extend(doc_chunks)
-            else:
-                # Стандартное разбиение
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50, length_function=len)
-                sub_chunks = text_splitter.split_text(doc.page_content)
-                chunks.extend([{
-                    'text': chunk,  # Используем ключ 'text' для единообразия
-                    'metadata': base_metadata
-                } for chunk in sub_chunks])
-        
+
+            doc_chunks = apply_chunking(doc.page_content, base_metadata, settings, chunker)
+            chunks.extend(doc_chunks)
+
         if not chunks:
-            return {"status": "error", "message": "Пустой файл"}
-        
+            return {"status": "error", "message": "Пустой файл или нет чанков после разбивки"}
+
         client, collection = initialize_db()
-        
-        # Пакетная вставка для ускорения
-        ids = []
-        documents = []
-        metadatas = []
-        
+
+        ids, documents, metadatas = [], [], []
         for i, chunk in enumerate(chunks):
             doc_id = f"{os.path.basename(file_path)}_{i}_{datetime.now().timestamp()}"
             ids.append(doc_id)
-            documents.append(chunk['text'])  # Ключ 'text'
+            documents.append(chunk['text'])
             metadatas.append({
                 "filename": chunk['metadata'].get('filename', ''),
                 "filepath": chunk['metadata'].get('filepath', ''),
@@ -176,12 +268,17 @@ def index_file(file_path, category="npa"):
                 "chunk_index": i,
                 "indexed_at": datetime.now().isoformat()
             })
-        
-        if ids:
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-        
+
+        BATCH = 100
+        for start in range(0, len(ids), BATCH):
+            collection.upsert(
+                ids=ids[start:start+BATCH],
+                documents=documents[start:start+BATCH],
+                metadatas=metadatas[start:start+BATCH]
+            )
+
         return {"status": "success", "chunks": len(chunks)}
-    
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -212,10 +309,37 @@ def get_index_stats():
 def clear_index():
     """Очищает индекс (для совместимости с app.py)"""
     try:
-        client, collection = initialize_db()
+        import chromadb
+        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
         client.delete_collection(name="tariff_docs")
-        client.create_collection(name="tariff_docs")
+        ef = get_embedding_function()
+        client.create_collection(name="tariff_docs", embedding_function=ef)
         return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def remove_file_from_index(filename: str):
+    """Удаляет все чанки файла из индекса по имени файла"""
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+        ef = get_embedding_function()
+        try:
+            collection = client.get_collection(name="tariff_docs", embedding_function=ef)
+        except Exception:
+            return {"status": "ok", "message": "Коллекция не существует, нечего удалять"}
+
+        # Получаем все ID чанков с этим именем файла
+        results = collection.get(
+            where={"filename": os.path.basename(filename)},
+            include=[]
+        )
+        ids_to_delete = results.get("ids", [])
+
+        if ids_to_delete:
+            collection.delete(ids=ids_to_delete)
+            return {"status": "success", "deleted": len(ids_to_delete)}
+        return {"status": "success", "deleted": 0}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -322,32 +446,48 @@ def rebuild_index():
     
     print(f"[CHUNKS] Всего чанков: {len(chunks)}")
     
-    # Создаём эмбеддинги и векторную базу
-    print("[EMBED] Создание эмбеддингов (это может занять время)...")
+    print("[EMBED] Создание эмбеддингов и сохранение в базу...")
     
     try:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
-        )
-        
-        # Создаём/пересоздаём базу
-        # Преобразуем наши словари в объекты, совместимые с LangChain
-        langchain_docs = []
-        for c in chunks:
-            from langchain.schema import Document
-            langchain_docs.append(Document(page_content=c['text'], metadata=c['metadata']))
-        
-        vectorstore = Chroma.from_documents(
-            documents=langchain_docs,
-            embedding=embeddings,
-            persist_directory=VECTOR_DB_DIR
-        )
-        vectorstore.persist()
-        
+        client, collection = initialize_db()
+
+        # Пакетная вставка
+        ids = []
+        documents_list = []
+        metadatas_list = []
+
+        for i, chunk in enumerate(chunks):
+            source = chunk['metadata'].get('filepath', '')
+            fname = os.path.basename(source) if source else f"doc_{i}"
+            doc_id = f"{fname}_{i}_{datetime.now().timestamp()}"
+            ids.append(doc_id)
+            documents_list.append(chunk['text'])
+            metadatas_list.append({
+                "filename": chunk['metadata'].get('filename', ''),
+                "filepath": chunk['metadata'].get('filepath', ''),
+                "category": chunk['metadata'].get('category', ''),
+                "doc_type": chunk['metadata'].get('doc_type', ''),
+                "doc_number": chunk['metadata'].get('doc_number', ''),
+                "doc_date": chunk['metadata'].get('doc_date', ''),
+                "struct_type": chunk['metadata'].get('struct_type', ''),
+                "struct_text": chunk['metadata'].get('struct_text', ''),
+                "article": chunk['metadata'].get('article', ''),
+                "paragraph": chunk['metadata'].get('paragraph', ''),
+                "chunk_index": i,
+                "indexed_at": datetime.now().isoformat()
+            })
+
+        # Вставляем батчами по 100
+        BATCH = 100
+        for start in range(0, len(ids), BATCH):
+            collection.upsert(
+                ids=ids[start:start+BATCH],
+                documents=documents_list[start:start+BATCH],
+                metadatas=metadatas_list[start:start+BATCH]
+            )
+
         print("[OK] Векторная база сохранена")
-        
+
     except Exception as e:
         print(f"[ERROR] Ошибка создания эмбеддингов: {e}")
         traceback.print_exc()
@@ -379,9 +519,9 @@ def get_chunks_by_file(limit_per_file: int = 10) -> dict:
     try:
         import chromadb
         client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
-        
+        ef = get_embedding_function()
         try:
-            collection = client.get_collection(name="tariff_docs")
+            collection = client.get_collection(name="tariff_docs", embedding_function=ef)
         except Exception:
             return {"status": "error", "message": "Индекс не существует"}
         
@@ -439,9 +579,9 @@ def get_chunk_stats() -> dict:
     try:
         import chromadb
         client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
-        
+        ef = get_embedding_function()
         try:
-            collection = client.get_collection(name="tariff_docs")
+            collection = client.get_collection(name="tariff_docs", embedding_function=ef)
             count = collection.count()
         except Exception:
             return {"status": "error", "message": "Индекс не существует"}

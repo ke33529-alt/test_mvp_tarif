@@ -5,6 +5,10 @@ import pandas as pd
 from datetime import datetime
 import json
 
+# Подавляем баг телеметрии ChromaDB (capture() takes 1 positional argument but 3 were given)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_TELEMETRY", "False")
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import TEST_FILES_DIR
@@ -85,6 +89,9 @@ st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚡")
 if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
 
+if "show_landing" not in st.session_state:
+    st.session_state.show_landing = True
+
 # Безопасное получение значения (защита от race conditions)
 def is_admin_logged() -> bool:
     return st.session_state.get("admin_logged_in", False)
@@ -122,52 +129,249 @@ h1, h2, h3 { color: #343a40; }
     border-left: 4px solid #1976d2;
     border-radius: 0 6px 6px 0;
 }
+
+/* ── Логотип-кнопка в сайдбаре ── */
+.sidebar-logo button {
+    background: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0.3rem 0 !important;
+    width: auto !important;
+    font-size: 1.25rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.02em !important;
+    background: linear-gradient(90deg, #3498db, #063971) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    cursor: pointer !important;
+    transition: opacity 0.15s !important;
+}
+.sidebar-logo button:hover {
+    opacity: 0.75 !important;
+    background-color: transparent !important;
+}
+
+/* ── Лендинг: плитки продуктов ── */
+.landing-tile button {
+    min-height: 120px !important;
+    text-align: left !important;
+    white-space: pre-line !important;
+    background: #ffffff !important;
+    color: #1a3a5c !important;
+    border: 1.5px solid #dde6f0 !important;
+    border-radius: 14px !important;
+    padding: 1.2rem 1.4rem !important;
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    line-height: 1.5 !important;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.05) !important;
+    transition: all 0.18s ease !important;
+}
+.landing-tile button:hover {
+    border-color: #3498db !important;
+    background: #f3f8ff !important;
+    box-shadow: 0 6px 20px rgba(52,152,219,0.15) !important;
+    transform: translateY(-3px) !important;
+    color: #063971 !important;
+}
+.landing-tile-desc {
+    font-size: 0.78rem !important;
+    color: #8a97a8 !important;
+    margin-top: 0.1rem !important;
+    margin-bottom: 1rem !important;
+    padding: 0 0.25rem !important;
+    line-height: 1.4 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
 #  Боковое меню
 # =============================================================================
+
+# Списки продуктов
+_ACTIVE_PRODUCTS = [
+    "🤝 Советчик",
+    "📸 AI-Сканер документов",
+    "🔍 Анализатор заявок",
+    "🔮 Предсказание решения регулятора",
+    "📋 Робот-протокольщик",
+    "🛠 Админка",
+]
+
+_DEV_PRODUCTS = [
+    "⚖️ Позиция ФАС",
+    "🔍 Поиск прецедентов",
+    "👥 Сверка численности",
+    "🏭 Проверка амортизации",
+    "📤 Экспорт ФГИС",
+    "📝 Пояснительная записка",
+    "📊 Калькулятор рисков",
+    "📝 Робот-жалобщик",
+    "🔄 Трекер изменений законов",
+    "📊 Расчетный лист",
+    "🔮 Прогнозист тарифов",
+    "🌐 Сравнение с аналогами в регионе",
+    "🎓 Режим обучения для новичков",
+    "🗂️ Наведение порядка в документах",
+    "🗓️ Планировщик тарифной кампании",
+    "📊 Прогноз потребления",
+]
+
+_PRODUCT_DESCRIPTIONS = {
+    "🤝 Советчик": "Ответы на вопросы по нормативной базе тарифного регулирования с опорой на актуальные НПА",
+    "📸 AI-Сканер документов": "Автоматическое распознавание и структурирование загружаемых документов",
+    "🔍 Анализатор заявок": "Проверка тарифных заявок на полноту комплекта и соответствие требованиям регулятора",
+    "🔮 Предсказание решения регулятора": "Оценка вероятности одобрения заявки на основе исторических данных",
+    "📋 Робот-протокольщик": "Автоматическое составление и форматирование протоколов заседаний",
+    "🛠 Админка": "Управление системой: промпты, статистика, обратная связь",
+}
+
+# Инициализация выбора
+if "main_choice" not in st.session_state:
+    st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
+
+def _on_active_select():
+    st.session_state.main_choice = st.session_state._sidebar_active
+
+def _on_dev_select():
+    st.session_state.main_choice = st.session_state._sidebar_dev
+
 with st.sidebar:
+    # Логотип — клик возвращает на лендинг
+    st.markdown('<div class="sidebar-logo">', unsafe_allow_html=True)
+    if st.button("⚡ REGULA.AI", key="sidebar_home_btn"):
+        st.session_state.show_landing = True
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
     st.title("🧭 Меню")
-    st.subheader("📌 Доступно (21/21)")
-    main_choice = st.radio(
-        "Раздел",
-        [
-            "🔍 Анализатор заявок",
-            "🤝 Советчик",
-            "⚖️ Позиция ФАС",
-            "🔍 Поиск прецедентов",
-            "👥 Сверка численности",
-            "🏭 Проверка амортизации",
-            "📤 Экспорт ФГИС",
-            "📝 Пояснительная записка",
-            "📊 Калькулятор рисков",
-            "📝 Робот-жалобщик",
-            "🔄 Трекер изменений законов",
-            "📊 Расчетный лист",
-            "📸 AI-Сканер документов",
-            "📋 Робот-протокольщик",
-            "🔮 Предсказание решения регулятора",
-            "🔮 Прогнозист тарифов",
-            "🌐 Сравнение с аналогами в регионе",
-            "🎓 Режим обучения для новичков",
-            "🗂️ Наведение порядка в документах",
-            "🗓️ Планировщик тарифной кампании",
-            "📊 Прогноз потребления",
-            "🛠 Админка"
-        ],
-        index=0
+
+    # --- Запущенные продукты ---
+    st.markdown("**✅ Запущено**")
+    _active_idx = (
+        _ACTIVE_PRODUCTS.index(st.session_state.main_choice)
+        if st.session_state.main_choice in _ACTIVE_PRODUCTS else None
     )
+    st.radio(
+        "active", _ACTIVE_PRODUCTS,
+        index=_active_idx,
+        key="_sidebar_active",
+        label_visibility="collapsed",
+        on_change=_on_active_select
+    )
+
+    # --- В разработке ---
     st.divider()
-    st.subheader("⚙️ В разработке")
-    st.caption("🚧 Ведутся работы по внедрению")
+    _dev_expanded = st.session_state.main_choice in _DEV_PRODUCTS
+    with st.expander("🚧 В разработке", expanded=_dev_expanded):
+        st.caption("Эти продукты находятся в стадии разработки и будут доступны позже.")
+        _dev_idx = (
+            _DEV_PRODUCTS.index(st.session_state.main_choice)
+            if st.session_state.main_choice in _DEV_PRODUCTS else None
+        )
+        st.radio(
+            "dev", _DEV_PRODUCTS,
+            index=_dev_idx,
+            key="_sidebar_dev",
+            label_visibility="collapsed",
+            on_change=_on_dev_select
+        )
+
     st.divider()
     if is_admin_logged():
         st.success("🔓 Админка: вход выполнен")
         if st.button("🚪 Выйти"):
             st.session_state.admin_logged_in = False
             st.rerun()
+
+main_choice = st.session_state.main_choice
+
+# =============================================================================
+# 🏠 Посадочная страница
+# =============================================================================
+if st.session_state.show_landing:
+    # Скрываем сайдбар на лендинге
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
+    .block-container { padding-top: 2rem !important; max-width: 1100px !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Заголовок
+    st.markdown("""
+    <div style="text-align:center; padding: 2.5rem 0 1rem;">
+        <div style="font-size:3rem; font-weight:900; letter-spacing:-0.02em;
+                    background: linear-gradient(100deg, #3498db 0%, #063971 100%);
+                    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                    margin-bottom:0.5rem;">
+            ⚡ REGULA.AI
+        </div>
+        <div style="font-size:1.05rem; color:#6b7a90; font-weight:400; max-width:560px; margin:0 auto; line-height:1.6;">
+            ИИ-система поддержки принятия решений<br>в области тарифного регулирования
+        </div>
+        <div style="margin-top:0.8rem; font-size:0.82rem; color:#aab4c0; letter-spacing:0.04em;">
+            🔹 21 продукт &nbsp;·&nbsp; 🔹 2025–2026 &nbsp;·&nbsp; 🔹 Россия
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #e8ecf2;margin:1rem 0 2rem;'>", unsafe_allow_html=True)
+
+    st.markdown("#### ✅ Запущенные продукты")
+    st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+
+    _cols_per_row = 3
+    _products = _ACTIVE_PRODUCTS
+    for _row_start in range(0, len(_products), _cols_per_row):
+        _row_items = _products[_row_start : _row_start + _cols_per_row]
+        _cols = st.columns(_cols_per_row, gap="medium")
+        for _ci, _product in enumerate(_row_items):
+            with _cols[_ci]:
+                _desc = _PRODUCT_DESCRIPTIONS.get(_product, "")
+                st.markdown('<div class="landing-tile">', unsafe_allow_html=True)
+                if st.button(_product, key=f"landing_tile_{_product}", use_container_width=True):
+                    st.session_state.main_choice = _product
+                    st.session_state.show_landing = False
+                    st.rerun()
+                st.markdown(f'<div class="landing-tile-desc">{_desc}</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    st.stop()
+
+# =============================================================================
+# 🚧 Диалог "В разработке"
+# =============================================================================
+@st.dialog("🚧 Продукт в разработке")
+def show_dev_dialog(product_name: str):
+    st.markdown(f"### {product_name}")
+    st.markdown("""
+Этот продукт **находится в активной разработке** и пока не готов к полноценному использованию.
+
+В интерфейсе представлен **прототип решения** — демонстрация концепции и будущего функционала.
+Данные и результаты носят ознакомительный характер и не могут использоваться для принятия решений.
+
+> 💡 Если у вас есть пожелания к функциональности этого модуля — свяжитесь с командой разработки.
+    """)
+    st.divider()
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("✅ Понятно, продолжить", type="primary", use_container_width=True):
+            st.session_state._dev_dialog_confirmed = product_name
+            st.rerun()
+    with col2:
+        if st.button("← Вернуться", use_container_width=True):
+            st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
+            st.session_state._dev_dialog_confirmed = None
+            st.rerun()
+
+# Показываем диалог при первом входе в продукт из раздела "В разработке"
+if main_choice in _DEV_PRODUCTS:
+    if st.session_state.get("_dev_dialog_confirmed") != main_choice:
+        show_dev_dialog(main_choice)
+else:
+    st.session_state._dev_dialog_confirmed = None
 
 # =============================================================================
 # 🎯 Заголовок системы
@@ -288,7 +492,7 @@ elif main_choice == "🤝 Советчик":
     if "query_times" not in st.session_state:
         st.session_state.query_times = []
     if "advisor_model" not in st.session_state:
-        st.session_state.advisor_model = "phi3"  # Модель по умолчанию
+        st.session_state.advisor_model = "qwen/qwen3.5-9b"  # Модель по умолчанию (LM Studio)
 
     # Проверка векторной базы
     vector_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vector_db")
@@ -315,22 +519,23 @@ elif main_choice == "🤝 Советчик":
                 try:
                     from core.advisor import get_available_models
                     available_models = get_available_models()
-                    model_names = [m["name"] for m in available_models] if available_models else ["phi3", "llama3.2"]
+                    model_names = [m["name"] for m in available_models] if available_models else ["qwen/qwen3.5-9b"]
                     selected_model = st.selectbox(
                         "🤖 Модель для ответов",
                         options=model_names,
                         index=model_names.index(st.session_state.advisor_model) if st.session_state.advisor_model in model_names else 0,
                         key="advisor_model_select",
-                        help="phi3 быстрее для 4GB VRAM, llama3.2 качественнее но требует больше памяти"
+                        help="Список моделей загружается из LM Studio (127.0.0.1:1234). Убедитесь, что сервер запущен."
                     )
                     st.session_state.advisor_model = selected_model
                     st.caption(f"✅ Доступные модели: {', '.join(model_names)}")
                 except:
                     st.session_state.advisor_model = st.selectbox(
                         "🤖 Модель для ответов",
-                        options=["phi3", "llama3.2"],
+                        options=["qwen/qwen3.5-9b"],
                         index=0,
-                        key="advisor_model_select"
+                        key="advisor_model_select",
+                        help="Не удалось подключиться к LM Studio. Проверьте, что сервер запущен на 127.0.0.1:1234."
                     )
 
                 # Переключатель режима тестирования чанков
@@ -727,7 +932,7 @@ elif main_choice == "🛠 Админка":
         # ✅ Определяем admin_subtab ПЕРЕД использованием
         admin_subtab = st.radio(
             "Раздел админки",
-            ["📈 Аналитика ИИ", "📚 Документы", "📊 Просмотр чанков", "⚙️ Настройки чанкования", "📝 Отзывы", "⚙️ Настройки"],
+            ["📈 Аналитика ИИ", "📚 Документы", "⚙️ Настройки чанкования", "📝 Промпты", "📝 Отзывы", "⚙️ Настройки"],
             horizontal=True
         )
 
@@ -791,153 +996,356 @@ elif main_choice == "🛠 Админка":
                 st.error(f"Ошибка загрузки статистики: {e}")
 
         elif admin_subtab == "📚 Документы":
-            st.header("📚 Управление документами базы знаний")
-            doc_category = st.selectbox(
-                "Категория документов",
-                ["📜 Общие НПА", "⚖️ Документы ФАС", "🏛️ Судебная практика", "📋 Методички и разъяснения"],
-                key="doc_cat_select"
-            )
-            category_folders = {
+            st.header("📚 База знаний — документы")
+
+            SPHERES = [
+                "🔥 Теплоснабжение",
+                "💧 Водоснабжение/водоотведение",
+                "🗑️ Обращение с ТКО",
+                "🔵 Газ",
+                "⚡ Электрика",
+                "📁 Иные сферы",
+            ]
+            CATEGORY_FOLDERS = {
                 "📜 Общие НПА": "npa",
                 "⚖️ Документы ФАС": "fas",
                 "🏛️ Судебная практика": "court",
-                "📋 Методички и разъяснения": "methodics"
+                "📋 Методички и разъяснения": "methodics",
             }
-            selected_folder = category_folders.get(doc_category, "npa")
-            base_path = os.path.join("data", "raw", selected_folder)
-            st.info(f"📁 Папка: `{base_path}`")
+            SPHERES_FILE = os.path.join("config", "doc_spheres.json")
 
-            if not os.path.exists(base_path):
-                os.makedirs(base_path, exist_ok=True)
-                st.success(f"✅ Папка создана: {base_path}")
+            def load_spheres_map() -> dict:
+                if os.path.exists(SPHERES_FILE):
+                    try:
+                        with open(SPHERES_FILE, "r", encoding="utf-8") as f:
+                            return json.load(f)
+                    except Exception:
+                        pass
+                return {}
 
-            st.subheader("📄 Файлы в категории")
-            if os.path.exists(base_path):
-                files = os.listdir(base_path)
-                if files:
-                    for f in files:
-                        file_path = os.path.join(base_path, f)
-                        file_size = os.path.getsize(file_path)
-                        col1, col2, col3 = st.columns([4, 1, 1])
-                        with col1:
-                            st.write(f"📄 {f} ({file_size / 1024:.1f} КБ)")
-                        with col2:
-                            if st.button("🗑 Удалить", key=f"del_{f}_{selected_folder}"):
-                                os.remove(file_path)
-                                st.success(f"✅ {f} удалён")
-                                st.rerun()
-                        with col3:
-                            if st.button("🔄 Индексировать", key=f"reindex_{f}_{selected_folder}"):
+            def save_spheres_map(m: dict):
+                os.makedirs(os.path.dirname(SPHERES_FILE), exist_ok=True)
+                with open(SPHERES_FILE, "w", encoding="utf-8") as f:
+                    json.dump(m, f, ensure_ascii=False, indent=2)
+
+            spheres_map = load_spheres_map()
+
+            # ── Загрузка файлов ──────────────────────────────────────────────
+            st.subheader("📤 Загрузить документы")
+            col_up1, col_up2 = st.columns([3, 1])
+            with col_up1:
+                upload_category = st.selectbox(
+                    "Категория для загрузки",
+                    list(CATEGORY_FOLDERS.keys()),
+                    key="upload_cat_select"
+                )
+            with col_up2:
+                upload_spheres = st.multiselect(
+                    "Сферы",
+                    SPHERES,
+                    key="upload_spheres_select",
+                    placeholder="Выберите..."
+                )
+
+            uploaded = st.file_uploader(
+                "Перетащите файлы или выберите с компьютера",
+                type=["pdf", "txt", "docx", "xlsx"],
+                accept_multiple_files=True,
+                key="doc_uploader",
+                label_visibility="collapsed"
+            )
+
+            if uploaded:
+                dest_folder = CATEGORY_FOLDERS[upload_category]
+                dest_path = os.path.join("data", "raw", dest_folder)
+                os.makedirs(dest_path, exist_ok=True)
+                if st.button(f"💾 Сохранить и индексировать ({len(uploaded)} файл(ов))", type="primary", key="save_upload_btn"):
+                    progress = st.progress(0)
+                    for i, uf in enumerate(uploaded):
+                        file_path = os.path.join(dest_path, uf.name)
+                        with open(file_path, "wb") as f:
+                            f.write(uf.getbuffer())
+                        if upload_spheres:
+                            spheres_map[uf.name] = upload_spheres
+                            save_spheres_map(spheres_map)
+                        try:
+                            from core.indexer import index_file
+                            result = index_file(file_path, dest_folder)
+                            chunks = result.get("chunks", 0)
+                        except Exception:
+                            chunks = 0
+                        progress.progress((i + 1) / len(uploaded))
+                    st.success(f"✅ Загружено и проиндексировано: {len(uploaded)} файл(ов)")
+                    st.rerun()
+
+            st.divider()
+
+            # ── Фильтры ──────────────────────────────────────────────────────
+            st.subheader("📋 Список документов")
+            fc1, fc2, fc3 = st.columns([2, 2, 3])
+            with fc1:
+                filter_cat = st.selectbox(
+                    "Категория",
+                    ["— Все —"] + list(CATEGORY_FOLDERS.keys()),
+                    key="filter_cat"
+                )
+            with fc2:
+                filter_sphere = st.selectbox(
+                    "Сфера",
+                    ["— Все —"] + SPHERES,
+                    key="filter_sphere"
+                )
+            with fc3:
+                filter_name = st.text_input("🔍 Поиск по имени файла", placeholder="Введите часть названия...", key="filter_name")
+
+            # ── Запрашиваем статус индексации из ChromaDB один раз ──────────
+            _chroma_index = {}  # fname -> {"chunks": N, "indexed_at": "2025-..."}
+            try:
+                import chromadb as _chromadb
+                _vector_db_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "data", "vector_db"
+                )
+                _chroma_client = _chromadb.PersistentClient(path=_vector_db_path)
+                _collection = _chroma_client.get_collection(name="tariff_docs")
+                _results = _collection.get(include=["metadatas"])
+                for meta in _results["metadatas"]:
+                    fn = meta.get("filename", "")
+                    if not fn:
+                        continue
+                    if fn not in _chroma_index:
+                        _chroma_index[fn] = {
+                            "chunks": 0,
+                            "indexed_at": meta.get("indexed_at", "")[:10] if meta.get("indexed_at") else "—"
+                        }
+                    _chroma_index[fn]["chunks"] += 1
+            except Exception:
+                pass  # база пуста или не найдена — покажем "не индексирован"
+
+            # ── Собираем все файлы ───────────────────────────────────────────
+            all_files = []
+            cats_to_show = (
+                {filter_cat: CATEGORY_FOLDERS[filter_cat]}
+                if filter_cat != "— Все —"
+                else CATEGORY_FOLDERS
+            )
+            for cat_label, folder in cats_to_show.items():
+                folder_path = os.path.join("data", "raw", folder)
+                if not os.path.exists(folder_path):
+                    continue
+                for fname in sorted(os.listdir(folder_path)):
+                    fpath = os.path.join(folder_path, fname)
+                    if not os.path.isfile(fpath) or fname.endswith(".indexed") or fname.startswith("."):
+                        continue
+                    ext = os.path.splitext(fname)[1].upper().lstrip(".") or "—"
+                    size_kb = os.path.getsize(fpath) / 1024
+                    file_spheres = spheres_map.get(fname, [])
+                    chroma_info = _chroma_index.get(fname, {})
+                    chunks_count = chroma_info.get("chunks", 0)
+                    indexed_at = chroma_info.get("indexed_at", "—") if chunks_count > 0 else "—"
+                    all_files.append({
+                        "fname": fname,
+                        "fpath": fpath,
+                        "folder": folder,
+                        "cat_label": cat_label,
+                        "ext": ext,
+                        "size_kb": size_kb,
+                        "indexed_at": indexed_at,
+                        "chunks_count": chunks_count,
+                        "spheres": file_spheres,
+                    })
+
+            # Фильтр по сфере и имени
+            if filter_sphere != "— Все —":
+                all_files = [f for f in all_files if filter_sphere in f["spheres"]]
+            if filter_name.strip():
+                all_files = [f for f in all_files if filter_name.lower() in f["fname"].lower()]
+
+            if not all_files:
+                st.info("📭 Документов не найдено. Загрузите файлы выше.")
+            else:
+                st.caption(f"Найдено документов: **{len(all_files)}**")
+
+                # ── Заголовок таблицы ────────────────────────────────────────
+                hc = st.columns([1, 4, 2, 3, 2, 1, 1, 1, 1])
+                for col, label in zip(hc, ["Формат", "Наименование", "Категория", "Сферы", "Дата индексации", "📥", "🔄", "📤", "🗑️"]):
+                    col.markdown(f"**{label}**")
+                with st.container():
+                    _, _, _, _, _, c1, c2, c3, c4 = st.columns([1, 4, 2, 3, 2, 1, 1, 1, 1])
+                    c1.caption("скачать")
+                    c2.caption("индекс")
+                    c3.caption("из индекса")
+                    c4.caption("удалить файл")
+                st.divider()
+
+                # ── Строки ───────────────────────────────────────────────────
+                EXT_ICONS = {"PDF": "📕", "TXT": "📄", "DOCX": "📘", "XLSX": "📗"}
+
+                for fi in all_files:
+                    row = st.columns([1, 4, 2, 3, 2, 1, 1, 1, 1])
+                    icon = EXT_ICONS.get(fi["ext"], "📄")
+
+                    with row[0]:
+                        st.markdown(f"{icon} `{fi['ext']}`")
+                    with row[1]:
+                        st.markdown(f"**{fi['fname']}**")
+                        st.caption(f"{fi['size_kb']:.1f} КБ")
+                    with row[2]:
+                        st.caption(fi["cat_label"])
+                    with row[3]:
+                        new_spheres = st.multiselect(
+                            "сферы",
+                            SPHERES,
+                            default=fi["spheres"],
+                            key=f"spheres_{fi['fname']}_{fi['folder']}",
+                            label_visibility="collapsed"
+                        )
+                        if new_spheres != fi["spheres"]:
+                            spheres_map[fi["fname"]] = new_spheres
+                            save_spheres_map(spheres_map)
+                    with row[4]:
+                        if fi["chunks_count"] > 0:
+                            st.markdown(f"✅ {fi['indexed_at']}")
+                            st.caption(f"{fi['chunks_count']} чанков")
+                        else:
+                            st.caption("⬜ не индексирован")
+
+                    # 📥 Скачать
+                    with row[5]:
+                        with open(fi["fpath"], "rb") as f:
+                            st.download_button(
+                                "📥",
+                                data=f.read(),
+                                file_name=fi["fname"],
+                                key=f"dl_{fi['fname']}_{fi['folder']}",
+                                use_container_width=True,
+                                help="Скачать файл"
+                            )
+
+                    # 🔄 Индексировать файл (переиндексация — сначала удаляем старые чанки)
+                    with row[6]:
+                        if st.button("🔄", key=f"idx_{fi['fname']}_{fi['folder']}", use_container_width=True, help="Индексировать файл (если уже был — старые чанки заменяются)"):
+                            with st.spinner(f"Индексация {fi['fname']}..."):
                                 try:
-                                    from core.indexer import index_file
-                                    result = index_file(file_path, selected_folder)
+                                    from core.indexer import remove_file_from_index, index_file
+                                    # Безопасное удаление — не падаем если файла не было в индексе
+                                    try:
+                                        remove_file_from_index(fi["fname"])
+                                    except Exception:
+                                        pass
+                                    result = index_file(fi["fpath"], fi["folder"])
                                     if result["status"] == "success":
-                                        st.success(f"✅ {f}: {result.get('chunks', 0)} чанков")
+                                        st.success(f"✅ {result.get('chunks', 0)} чанков")
                                     else:
                                         st.error(f"❌ {result.get('message', '')}")
                                 except Exception as e:
-                                    st.error(f"❌ Ошибка: {str(e)}")
-                else:
-                    st.info("📭 В этой категории пока нет файлов")
+                                    st.error(f"❌ {str(e)}")
+                            st.rerun()
+
+                    # 📤 Удалить только из индекса (файл остаётся)
+                    with row[7]:
+                        if st.button("📤", key=f"rmidx_{fi['fname']}_{fi['folder']}", use_container_width=True, help="Удалить из индекса (файл останется в папке)"):
+                            st.session_state[f"_confirm_rmidx_{fi['fname']}"] = True
+
+                    # 🗑️ Удалить файл из папки
+                    with row[8]:
+                        if st.button("🗑️", key=f"del_{fi['fname']}_{fi['folder']}", use_container_width=True, help="Удалить файл из папки (и из индекса)"):
+                            st.session_state[f"_confirm_del_{fi['fname']}"] = True
+
+                    # Диалог: удалить только из индекса
+                    if st.session_state.get(f"_confirm_rmidx_{fi['fname']}"):
+                        @st.dialog(f"📤 Удалить «{fi['fname']}» из индекса?")
+                        def _confirm_rmidx(fname=fi["fname"], fpath=fi["fpath"]):
+                            st.info("Файл **останется в папке**, но его чанки будут удалены из векторной базы. Вы сможете переиндексировать его позже.")
+                            ca, cb = st.columns(2)
+                            with ca:
+                                if st.button("📤 Да, удалить из индекса", type="primary", use_container_width=True, key=f"conf_rmidx_{fname}"):
+                                    try:
+                                        from core.indexer import remove_file_from_index
+                                        remove_file_from_index(fname)
+                                    except Exception:
+                                        pass
+                                    st.session_state.pop(f"_confirm_rmidx_{fname}", None)
+                                    st.rerun()
+                            with cb:
+                                if st.button("← Отмена", use_container_width=True, key=f"cancel_rmidx_{fname}"):
+                                    st.session_state.pop(f"_confirm_rmidx_{fname}", None)
+                                    st.rerun()
+                        _confirm_rmidx()
+
+                    # Диалог: удалить файл полностью
+                    if st.session_state.get(f"_confirm_del_{fi['fname']}"):
+                        @st.dialog(f"🗑️ Удалить файл «{fi['fname']}»?")
+                        def _confirm_delete(fpath=fi["fpath"], fname=fi["fname"]):
+                            st.warning("Файл будет **удалён из папки** и из индекса чанков. Восстановить будет невозможно.")
+                            ca, cb = st.columns(2)
+                            with ca:
+                                if st.button("🗑️ Да, удалить", type="primary", use_container_width=True, key=f"conf_del_{fname}"):
+                                    try:
+                                        from core.indexer import remove_file_from_index
+                                        remove_file_from_index(fname)
+                                    except Exception:
+                                        pass
+                                    os.remove(fpath)
+                                    spheres_map.pop(fname, None)
+                                    save_spheres_map(spheres_map)
+                                    st.session_state.pop(f"_confirm_del_{fname}", None)
+                                    st.rerun()
+                            with cb:
+                                if st.button("← Отмена", use_container_width=True, key=f"cancel_del_{fname}"):
+                                    st.session_state.pop(f"_confirm_del_{fname}", None)
+                                    st.rerun()
+                        _confirm_delete()
+
+                    st.divider()
+
+            # ── Массовые операции (вертикальный стек) ───────────────────────
+            st.divider()
+            st.subheader("⚙️ Массовые операции")
+
+            # 1. Переиндексировать категорию
+            reindex_cat = st.selectbox(
+                "Категория для переиндексации",
+                list(CATEGORY_FOLDERS.keys()),
+                key="reindex_cat_select"
+            )
+            if st.button("🚀 Переиндексировать категорию", type="primary", use_container_width=True, key="reindex_cat_btn"):
+                with st.spinner("⏳ Индексация..."):
+                    try:
+                        from core.indexer import index_category
+                        result = index_category(CATEGORY_FOLDERS[reindex_cat])
+                        if result["status"] == "success":
+                            st.success(f"✅ Проиндексировано файлов: {len(result['files'])}")
+                        else:
+                            st.error(f"❌ {result.get('message', '')}")
+                    except Exception as e:
+                        st.error(f"❌ {str(e)}")
 
             st.divider()
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🚀 Переиндексировать категорию", type="primary", use_container_width=True):
-                    with st.spinner("⏳ Индексация..."):
-                        try:
-                            from core.indexer import index_category
-                            result = index_category(selected_folder)
-                            if result["status"] == "success":
-                                st.success(f"✅ Проиндексировано файлов: {len(result['files'])}")
-                            else:
-                                st.error(f"❌ Ошибка: {result.get('message', '')}")
-                        except Exception as e:
-                            st.error(f"❌ Ошибка: {str(e)}")
-            with col2:
-                if st.button("🗑️ Очистить весь индекс", type="secondary", use_container_width=True):
-                    try:
-                        from core.indexer import clear_index
-                        result = clear_index()
-                        if result["status"] == "success":
-                            st.success("✅ Индекс очищен")
-                        else:
-                            st.error(f"❌ Ошибка: {result.get('message', '')}")
-                    except Exception as e:
-                        st.error(f"❌ Ошибка: {str(e)}")
 
-        elif admin_subtab == "📊 Просмотр чанков":
-            st.header("📊 Просмотр чанков векторной базы")
-            # Общая статистика
-            try:
-                from core.indexer import get_chunk_stats, get_chunks_by_file
-                stats = get_chunk_stats()
-                if stats["status"] == "success":
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Всего чанков", stats["total_chunks"])
-                    col2.metric("Файлов в индексе", len(stats.get("doc_types", {})))
-                    col3.metric("Категорий", len(stats.get("categories", {})))
+            # 2. Очистить весь индекс
+            if st.button("🗑️ Очистить весь индекс", type="secondary", use_container_width=True, key="clear_index_btn"):
+                st.session_state._confirm_clear_index = True
 
-                    # Распределение по типам документов
-                    if stats.get("doc_types"):
-                        st.subheader("📁 По типам документов")
-                        doc_df = pd.DataFrame({
-                            "Тип документа": list(stats["doc_types"].keys()),
-                            "Чанков": list(stats["doc_types"].values())
-                        })
-                        st.bar_chart(doc_df.set_index("Тип документа"))
+            if st.session_state.get("_confirm_clear_index"):
+                @st.dialog("🗑️ Очистить весь индекс?")
+                def _confirm_clear():
+                    st.warning("Все чанки будут удалены из векторной базы. Файлы останутся на диске.")
+                    ca, cb = st.columns(2)
+                    with ca:
+                        if st.button("🗑️ Да, очистить", type="primary", use_container_width=True, key="conf_clear_idx"):
+                            try:
+                                from core.indexer import clear_index
+                                clear_index()
+                            except Exception:
+                                pass
+                            st.session_state._confirm_clear_index = False
+                            st.rerun()
+                    with cb:
+                        if st.button("← Отмена", use_container_width=True, key="cancel_clear_idx"):
+                            st.session_state._confirm_clear_index = False
+                            st.rerun()
+                _confirm_clear()
 
-                    # Распределение по категориям
-                    if stats.get("categories"):
-                        st.subheader("📂 По категориям")
-                        cat_df = pd.DataFrame({
-                            "Категория": list(stats["categories"].keys()),
-                            "Чанков": list(stats["categories"].values())
-                        })
-                        st.bar_chart(cat_df.set_index("Категория"))
-
-                    # Список файлов с чанками
-                    st.divider()
-                    st.subheader("📄 Файлы и их чанки")
-                    chunks_data = get_chunks_by_file(limit_per_file=5)
-                    if chunks_data["status"] == "success":
-                        for file_idx, file_info in enumerate(chunks_data["files"]):
-                            file_key = f"file_{file_idx}"
-                            st.markdown(f"### 📁 {file_info['filename']}")
-                            # Метаданные файла
-                            col1, col2, col3, col4 = st.columns(4)
-                            col1.metric("Чанков", file_info['total_chunks'])
-                            col2.write(f"**Тип:** {file_info.get('doc_type', '—')}")
-                            col3.write(f"**Номер:** {file_info.get('doc_number', '—')}")
-                            col4.write(f"**Дата:** {file_info.get('doc_date', '—')}")
-                            st.divider()
-
-                            # Список чанков (без вложенных expanders!)
-                            st.caption(f"Показано первые {len(file_info['chunks'])} из {file_info['total_chunks']} чанков:")
-                            for chunk_idx, chunk in enumerate(file_info["chunks"], 1):
-                                chunk_key = f"{file_key}_chunk_{chunk_idx}"
-                                with st.container():
-                                    show_chunk = st.checkbox(f"Чанк #{chunk_idx}", key=f"{chunk_key}_toggle", value=False)
-                                    if show_chunk:
-                                        st.markdown("**Содержимое:**")
-                                        st.code(chunk["content"][:1000] + ("..." if len(chunk["content"]) > 1000 else ""), language="text")
-                                        st.markdown("**Метаданные:**")
-                                        meta = chunk["metadata"]
-                                        meta_cols = st.columns(2)
-                                        if meta.get("struct_type"):
-                                            meta_cols[0].write(f"- Структура: {meta['struct_type']} → {meta.get('struct_text', '')}")
-                                        if meta.get("article"):
-                                            meta_cols[0].write(f"- Статья: {meta['article']}")
-                                        if meta.get("paragraph"):
-                                            meta_cols[1].write(f"- Пункт: {meta['paragraph']}")
-                                        if meta.get("category"):
-                                            meta_cols[1].write(f"- Категория: {meta['category']}")
-                                        st.divider()
-                    else:
-                        st.error(f"❌ Ошибка: {chunks_data.get('message', '')}")
-            except Exception as e:
-                st.error(f"❌ Ошибка загрузки: {type(e).__name__}: {str(e)}")
-                st.info("💡 Убедитесь, что векторная база проиндексирована")
 
         elif admin_subtab == "⚙️ Настройки чанкования":
             st.header("⚙️ Настройки чанкования документов")
@@ -980,11 +1388,12 @@ elif main_choice == "🛠 Админка":
                 }
 
             # Вкладки для разных типов настроек
-            tab1, tab2, tab3, tab4 = st.tabs([
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📐 Структурные паттерны",
                 "🏷️ Типы документов",
                 "📋 Метаданные",
-                "⚙️ Параметры чанкования"
+                "⚙️ Параметры чанкования",
+                "🔍 Просмотр и тест чанков"
             ])
 
             with tab1:
@@ -1087,50 +1496,108 @@ elif main_choice == "🛠 Админка":
 
             with tab4:
                 st.subheader("Параметры чанкования")
-                st.caption("Настройки разделителя и размеров чанков")
                 settings = config.get("chunking_settings", {})
 
-                # ← ГЛАВНОЕ: Разделитель чанков
-                separator = st.text_input(
-                    "📍 Разделитель чанков",
-                    value=settings.get("separator", "###"),
-                    key="chunk_separator",
-                    help="Символ или текст, который разделяет чанки в документе. Например: ### или & или -"
+                # ── Режим чанкования ─────────────────────────────────────────
+                st.markdown("#### 🔀 Режим чанкования")
+                chunking_mode = st.radio(
+                    "Выберите способ разбивки документов на чанки",
+                    options=["structural", "separator", "fixed"],
+                    format_func=lambda x: {
+                        "structural": "🧠 Умный (по структуре документа — разделы, статьи, пункты)",
+                        "separator":  "✂️ По разделителю (указываете маркер конца чанка)",
+                        "fixed":      "📏 Фиксированная длина (разбивка строго по количеству символов)",
+                    }[x],
+                    index=["structural", "separator", "fixed"].index(
+                        settings.get("chunking_mode", "structural")
+                    ),
+                    key="chunking_mode_radio"
                 )
-                st.info(f"💡 Пример использования: Разместите '{separator}' между смысловыми блоками в документе")
 
                 st.divider()
-                min_chunk = st.slider(
-                    "Минимальная длина чанка (символов)",
-                    10, 500,
-                    settings.get("min_chunk_length", 50),
-                    key="min_chunk",
-                    help="Чанки короче этого значения будут пропущены"
-                )
-                max_chunk = st.slider(
-                    "Максимальная длина чанка (символов)",
-                    500, 5000,
-                    settings.get("max_chunk_length", 2000),
-                    key="max_chunk",
-                    help="Если чанк длиннее — система найдёт безопасную границу (точка, запятая, перенос)"
-                )
-                st.divider()
 
+                # ── Параметры в зависимости от режима ───────────────────────
+                separator = settings.get("separator", "&&")
+                fixed_length = settings.get("fixed_chunk_length", 1000)
+                min_chunk = settings.get("min_chunk_length", 50)
+                max_chunk = settings.get("max_chunk_length", 2000)
+                chunk_overlap = settings.get("chunk_overlap", 0)
+
+                if chunking_mode == "structural":
+                    st.info("🧠 Чанкер автоматически определяет границы по структуре документа: разделы, статьи, пункты, подпункты. Оптимально для НПА и методических документов.")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        min_chunk = st.slider("Минимальная длина чанка (симв.)", 10, 500, settings.get("min_chunk_length", 50), key="min_chunk_s", help="Чанки короче будут пропущены")
+                    with col2:
+                        max_chunk = st.slider("Максимальная длина чанка (симв.)", 200, 5000, settings.get("max_chunk_length", 2000), key="max_chunk_s", help="При превышении чанк будет разбит по безопасной границе")
+
+                elif chunking_mode == "separator":
+                    st.info("✂️ Документ будет разбит по указанному маркеру. Разместите маркер в исходном документе там, где должен заканчиваться чанк.")
+                    separator = st.text_input(
+                        "Маркер конца чанка",
+                        value=settings.get("separator", "&&"),
+                        key="chunk_separator_input",
+                        help="Например: && или ### или --- . Регистр важен."
+                    )
+                    st.caption(f"Пример: вставьте `{separator}` в конец нужного абзаца в документе — система разрежет там.")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        min_chunk = st.slider("Минимальная длина чанка (симв.)", 10, 500, settings.get("min_chunk_length", 50), key="min_chunk_sep")
+                    with col2:
+                        max_chunk = st.slider("Максимальная длина чанка (симв.)", 200, 5000, settings.get("max_chunk_length", 2000), key="max_chunk_sep", help="Если чанк длиннее — будет разбит дополнительно")
+
+                elif chunking_mode == "fixed":
+                    st.info("📏 Документ разбивается строго по количеству символов. Простой и предсказуемый режим, но может разрезать предложения.")
+                    fixed_length = st.slider(
+                        "Длина чанка (символов)",
+                        100, 5000,
+                        settings.get("fixed_chunk_length", 1000),
+                        step=50,
+                        key="fixed_chunk_length_slider",
+                        help="Каждый чанк будет содержать ровно столько символов (кроме последнего)"
+                    )
+                    st.caption(f"При длине документа 10 000 симв. получится ~{10000 // fixed_length} чанков")
+
+                # ── Перекрытие — общее для всех режимов ─────────────────────
+                st.divider()
+                st.markdown("#### 🔁 Перекрытие между чанками")
+                chunk_overlap = st.slider(
+                    "Перекрытие (символов)",
+                    0, 500,
+                    settings.get("chunk_overlap", 0),
+                    step=10,
+                    key="chunk_overlap_slider",
+                    help="Сколько символов из конца предыдущего чанка будет повторено в начале следующего. 0 = без перекрытия."
+                )
+                if chunk_overlap > 0:
+                    st.caption(f"💡 Последние {chunk_overlap} симв. каждого чанка будут дублированы в начале следующего — улучшает поиск на границах смысловых блоков.")
+                else:
+                    st.caption("Перекрытие отключено.")
+
+                if chunking_mode == "fixed" and chunk_overlap >= fixed_length:
+                    st.error(f"⚠️ Перекрытие ({chunk_overlap}) не может быть больше длины чанка ({fixed_length})")
+
+                # ── Сохранение ───────────────────────────────────────────────
+                st.divider()
                 if st.button("💾 Сохранить параметры", key="save_settings", use_container_width=True, type="primary"):
-                    config["chunking_settings"] = {
-                        "separator": separator,
-                        "min_chunk_length": min_chunk,
-                        "max_chunk_length": max_chunk,
-                        "chunk_overlap": 0
-                    }
-                    os.makedirs(os.path.dirname(config_file), exist_ok=True)
-                    with open(config_file, 'w', encoding='utf-8') as f:
-                        json.dump(config, f, ensure_ascii=False, indent=2)
-                    st.success("✅ Параметры сохранены!")
-                    st.info("🔄 Перезапустите индексацию для применения изменений")
-                    st.rerun()
+                    if chunking_mode == "fixed" and chunk_overlap >= fixed_length:
+                        st.error("❌ Исправьте ошибки перед сохранением")
+                    else:
+                        config["chunking_settings"] = {
+                            "chunking_mode": chunking_mode,
+                            "separator": separator,
+                            "fixed_chunk_length": fixed_length,
+                            "min_chunk_length": min_chunk,
+                            "max_chunk_length": max_chunk,
+                            "chunk_overlap": chunk_overlap,
+                        }
+                        os.makedirs(os.path.dirname(config_file), exist_ok=True)
+                        with open(config_file, 'w', encoding='utf-8') as f:
+                            json.dump(config, f, ensure_ascii=False, indent=2)
+                        st.success("✅ Параметры сохранены!")
+                        st.warning("🔄 Примените изменения: переиндексируйте документы в разделе «Документы»")
+                        st.rerun()
 
-                # Кнопка сброса
                 st.divider()
                 col1, col2 = st.columns([3, 1])
                 with col1:
@@ -1142,6 +1609,348 @@ elif main_choice == "🛠 Админка":
                         st.success("✅ Конфигурация удалена")
                         st.info("🔄 При следующем запуске будут использованы настройки по умолчанию")
                         st.rerun()
+
+            with tab5:
+                st.subheader("🔍 Просмотр и тест чанков")
+
+                try:
+                    from core.indexer import get_chunk_stats, get_chunks_by_file
+                    import chromadb
+
+                    # --- Статистика базы ---
+                    stats = get_chunk_stats()
+                    if stats["status"] == "success" and stats.get("total_chunks", 0) > 0:
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Всего чанков", stats["total_chunks"])
+                        col2.metric("Файлов в индексе", len(stats.get("doc_types", {})))
+                        col3.metric("Категорий", len(stats.get("categories", {})))
+
+                        doc_types = {k: v for k, v in stats.get("doc_types", {}).items() if v > 0}
+                        if doc_types:
+                            with st.expander("📊 Распределение по типам документов", expanded=False):
+                                doc_df = pd.DataFrame({
+                                    "Тип документа": list(doc_types.keys()),
+                                    "Чанков": list(doc_types.values())
+                                })
+                                st.bar_chart(doc_df.set_index("Тип документа"))
+
+                        categories = {k: v for k, v in stats.get("categories", {}).items() if v > 0}
+                        if categories:
+                            with st.expander("📂 Распределение по категориям", expanded=False):
+                                cat_df = pd.DataFrame({
+                                    "Категория": list(categories.keys()),
+                                    "Чанков": list(categories.values())
+                                })
+                                st.bar_chart(cat_df.set_index("Категория"))
+                    else:
+                        st.warning("⚠️ Векторная база пуста — проиндексируйте документы")
+
+                    st.divider()
+
+                    # --- Тест-запрос (Вариант 5) ---
+                    st.subheader("🧪 Тест-запрос к векторной базе")
+                    st.caption("Введите запрос и посмотрите какие чанки вернёт система — без LLM, только поиск")
+
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        test_query = st.text_input(
+                            "Тестовый запрос",
+                            placeholder="Например: расходы на ремонт основных средств",
+                            key="test_query_input"
+                        )
+                    with col2:
+                        test_top_k = st.number_input("Топ-K", min_value=1, max_value=20, value=5, key="test_top_k")
+
+                    if st.button("🔎 Найти чанки", key="test_search_btn", type="primary", use_container_width=False):
+                        if test_query.strip():
+                            with st.spinner("Ищем релевантные чанки..."):
+                                try:
+                                    vector_db_path = os.path.join(
+                                        os.path.dirname(os.path.abspath(__file__)), "data", "vector_db"
+                                    )
+                                    chroma_client = chromadb.PersistentClient(path=vector_db_path)
+                                    collection = chroma_client.get_collection(name="tariff_docs")
+
+                                    results = collection.query(
+                                        query_texts=[test_query],
+                                        n_results=int(test_top_k),
+                                        include=["documents", "metadatas", "distances"]
+                                    )
+
+                                    docs = results["documents"][0]
+                                    metas = results["metadatas"][0]
+                                    distances = results["distances"][0]
+
+                                    if docs:
+                                        st.success(f"✅ Найдено {len(docs)} чанков")
+                                        st.divider()
+
+                                        for i, (doc, meta, dist) in enumerate(zip(docs, metas, distances), 1):
+                                            # Переводим distance в score релевантности (0–100%)
+                                            score = max(0, round((1 - dist) * 100, 1))
+                                            score_color = "🟢" if score >= 70 else "🟡" if score >= 40 else "🔴"
+
+                                            col_a, col_b = st.columns([5, 1])
+                                            with col_a:
+                                                st.markdown(f"**#{i} · {meta.get('filename', '—')}** · {meta.get('category', '—')}")
+                                            with col_b:
+                                                st.markdown(f"{score_color} **{score}%**")
+
+                                            # Подсветка слов запроса в тексте чанка
+                                            highlighted = doc
+                                            for word in test_query.split():
+                                                if len(word) > 3:
+                                                    highlighted = highlighted.replace(
+                                                        word, f"**{word}**"
+                                                    )
+
+                                            with st.expander(f"📄 Текст чанка #{i} ({len(doc)} симв.)", expanded=(i == 1)):
+                                                st.markdown(highlighted[:1500] + ("..." if len(doc) > 1500 else ""))
+                                                st.divider()
+                                                meta_col1, meta_col2 = st.columns(2)
+                                                meta_col1.caption(f"🗂 Тип: {meta.get('doc_type', '—')}")
+                                                meta_col1.caption(f"📑 Структура: {meta.get('struct_type', '—')}")
+                                                meta_col2.caption(f"📏 Дистанция: {round(dist, 4)}")
+                                                meta_col2.caption(f"📄 Страница: {meta.get('page', '—')}")
+
+                                            st.write("")
+                                    else:
+                                        st.warning("🔍 Ничего не найдено. Попробуйте другой запрос.")
+
+                                except Exception as e:
+                                    st.error(f"❌ Ошибка поиска: {type(e).__name__}: {str(e)}")
+                        else:
+                            st.warning("⚠️ Введите запрос")
+
+                    st.divider()
+
+                    # --- Просмотр чанков по файлам ---
+                    st.subheader("📄 Чанки по файлам")
+                    chunks_data = get_chunks_by_file(limit_per_file=5)
+                    if chunks_data["status"] == "success" and chunks_data["files"]:
+                        # Выбор файла через selectbox вместо рендера всего сразу
+                        file_names = [f["filename"] for f in chunks_data["files"]]
+                        selected_file = st.selectbox("Выберите файл", file_names, key="chunk_file_select")
+                        file_info = next((f for f in chunks_data["files"] if f["filename"] == selected_file), None)
+
+                        if file_info:
+                            col1, col2, col3, col4 = st.columns(4)
+                            col1.metric("Чанков", file_info["total_chunks"])
+                            col2.write(f"**Тип:** {file_info.get('doc_type', '—')}")
+                            col3.write(f"**Номер:** {file_info.get('doc_number', '—')}")
+                            col4.write(f"**Дата:** {file_info.get('doc_date', '—')}")
+
+                            st.caption(f"Показаны первые {len(file_info['chunks'])} из {file_info['total_chunks']} чанков:")
+                            for chunk_idx, chunk in enumerate(file_info["chunks"], 1):
+                                with st.expander(f"Чанк #{chunk_idx} · {len(chunk['content'])} симв.", expanded=False):
+                                    st.code(chunk["content"][:1000] + ("..." if len(chunk["content"]) > 1000 else ""), language="text")
+                                    meta = chunk["metadata"]
+                                    meta_cols = st.columns(2)
+                                    if meta.get("struct_type"):
+                                        meta_cols[0].caption(f"Структура: {meta['struct_type']} → {meta.get('struct_text', '')}")
+                                    if meta.get("article"):
+                                        meta_cols[0].caption(f"Статья: {meta['article']}")
+                                    if meta.get("paragraph"):
+                                        meta_cols[1].caption(f"Пункт: {meta['paragraph']}")
+                                    if meta.get("category"):
+                                        meta_cols[1].caption(f"Категория: {meta['category']}")
+                    else:
+                        st.info("📭 Нет проиндексированных файлов")
+
+                except Exception as e:
+                    st.error(f"❌ Ошибка загрузки: {type(e).__name__}: {str(e)}")
+                    st.info("💡 Убедитесь, что векторная база проиндексирована")
+
+        elif admin_subtab == "📝 Промпты":
+            st.header("📝 Управление промптами")
+            st.info("💡 Изменения применяются сразу — без перезапуска приложения. Кэш LLM автоматически сбрасывается при сохранении.")
+
+            PROMPTS_FILE = os.path.join("config", "prompts.json")
+
+            DEFAULT_PROMPTS = {
+                "advisor_system": (
+                    "Ты — эксперт по тарифному регулированию в РФ.\n"
+                    "Отвечай ТОЛЬКО на русском языке, кратко, структурно и по существу.\n"
+                    "ЗАПРЕЩЕНО писать 'Thinking Process', рассуждения или объяснения шагов.\n"
+                    "Отвечай сразу итоговым ответом: списком, таблицей или чётким утверждением.\n"
+                    "Основывайся на предоставленном контексте и законодательстве РФ, преимущественно на RAG.\n"
+                    "Если информации в базе знаний недостаточно — честно скажи об этом. Не выдумывай факты. "
+                    "Всегда в конце благодари за интересный вопрос (или укажи, что вопрос был сложный)\n"
+                    "Если в ответе есть сравнение данных, списки расходов, тарифные ставки или параметры, "
+                    "сметы или расчеты — ОБЯЗАТЕЛЬНО оформи их в виде Markdown-таблицы.\n"
+                    "Пример:\n| Параметр | Значение | Ед. изм. |\n|---|---|---|\n| Тариф | 100.50 | руб./Гкал |"
+                ),
+                "advisor_user": (
+                    "Вопрос пользователя: {query}\n\n"
+                    "Контекст из документов:\n{context}\n\n"
+                    "Ответ:"
+                ),
+            }
+
+            # Загрузка текущих промптов
+            if os.path.exists(PROMPTS_FILE):
+                try:
+                    with open(PROMPTS_FILE, 'r', encoding='utf-8') as f:
+                        current_prompts = {**DEFAULT_PROMPTS, **json.load(f)}
+                except Exception:
+                    current_prompts = dict(DEFAULT_PROMPTS)
+            else:
+                current_prompts = dict(DEFAULT_PROMPTS)
+
+            # --- Советчик ---
+            st.subheader("🤝 Советчик")
+
+            with st.expander("ℹ️ Доступные переменные", expanded=False):
+                st.markdown("""
+**Системный промпт** — переменных нет, это инструкция для роли ИИ.
+
+**Пользовательский промпт** — обязательные переменные:
+- `{query}` — вопрос пользователя
+- `{context}` — найденные чанки из векторной базы
+                """)
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.caption("📊 Текущий промпт загружен из: " + ("📁 prompts.json" if os.path.exists(PROMPTS_FILE) else "⚙️ дефолтных настроек"))
+            with col2:
+                is_modified = current_prompts.get("advisor_system") != DEFAULT_PROMPTS["advisor_system"] or \
+                              current_prompts.get("advisor_user") != DEFAULT_PROMPTS["advisor_user"]
+                if is_modified:
+                    st.warning("✏️ Промпты изменены относительно дефолтных")
+                else:
+                    st.success("✅ Используются дефолтные промпты")
+
+            st.divider()
+
+            new_system = st.text_area(
+                "🧠 Системный промпт (роль и правила ИИ)",
+                value=current_prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"]),
+                height=280,
+                key="prompt_advisor_system",
+                help="Определяет поведение, тон и формат ответов ИИ"
+            )
+
+            st.divider()
+
+            new_user = st.text_area(
+                "💬 Шаблон пользовательского промпта",
+                value=current_prompts.get("advisor_user", DEFAULT_PROMPTS["advisor_user"]),
+                height=120,
+                key="prompt_advisor_user",
+                help="Шаблон запроса к LLM. Обязательно используйте {query} и {context}"
+            )
+
+            # Валидация переменных
+            if "{query}" not in new_user or "{context}" not in new_user:
+                st.error("⚠️ Пользовательский промпт должен содержать {query} и {context}")
+            else:
+                st.caption("✅ Переменные {query} и {context} присутствуют")
+
+            st.divider()
+            col1, col2, col3 = st.columns([2, 2, 1])
+
+            with col1:
+                if st.button("💾 Сохранить промпты", type="primary", use_container_width=True, key="save_prompts_btn"):
+                    if "{query}" in new_user and "{context}" in new_user:
+                        os.makedirs(os.path.dirname(PROMPTS_FILE), exist_ok=True)
+                        prompts_to_save = {
+                            **current_prompts,
+                            "advisor_system": new_system,
+                            "advisor_user": new_user,
+                            "updated_at": datetime.now().isoformat()
+                        }
+                        with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
+                            json.dump(prompts_to_save, f, ensure_ascii=False, indent=2)
+                        # Сбрасываем кэш LLM, чтобы старые ответы не применялись с новым промптом
+                        try:
+                            from core.advisor import _llm_cache, save_llm_cache
+                            _llm_cache.clear()
+                            save_llm_cache()
+                            st.success("✅ Промпты сохранены. Кэш LLM сброшен — изменения активны.")
+                        except Exception:
+                            st.success("✅ Промпты сохранены.")
+                        st.rerun()
+                    else:
+                        st.error("❌ Исправьте ошибки перед сохранением")
+
+            with col2:
+                if st.button("🔄 Сбросить к дефолтным", use_container_width=True, key="reset_prompts_btn"):
+                    st.session_state._confirm_reset_prompts = True
+
+                # Диалог подтверждения сброса
+                @st.dialog("⚠️ Сброс промптов")
+                def confirm_reset_prompts_dialog():
+                    st.warning("**Все изменения будут сброшены** — системный и пользовательский промпты вернутся к дефолтным значениям.")
+                    st.caption("Это действие нельзя отменить. Рекомендуем сначала скачать текущий вариант.")
+
+                    # Кнопка скачать прямо в диалоге
+                    backup_json = json.dumps({
+                        "advisor_system": new_system,
+                        "advisor_user": new_user,
+                        "saved_at": datetime.now().isoformat()
+                    }, ensure_ascii=False, indent=2)
+                    st.download_button(
+                        "📥 Скачать текущий промпт перед сбросом",
+                        data=backup_json.encode("utf-8"),
+                        file_name=f"prompts_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                        key="dialog_download_prompts_btn"
+                    )
+
+                    st.divider()
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("🗑️ Да, сбросить", type="primary", use_container_width=True, key="dialog_confirm_reset"):
+                            if os.path.exists(PROMPTS_FILE):
+                                try:
+                                    with open(PROMPTS_FILE, 'r', encoding='utf-8') as f:
+                                        saved = json.load(f)
+                                    saved.pop("advisor_system", None)
+                                    saved.pop("advisor_user", None)
+                                    with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
+                                        json.dump(saved, f, ensure_ascii=False, indent=2)
+                                except Exception:
+                                    pass
+                            st.session_state._confirm_reset_prompts = False
+                            st.rerun()
+                    with col_b:
+                        if st.button("← Отмена", use_container_width=True, key="dialog_cancel_reset"):
+                            st.session_state._confirm_reset_prompts = False
+                            st.rerun()
+
+                if st.session_state.get("_confirm_reset_prompts"):
+                    confirm_reset_prompts_dialog()
+
+            with col3:
+                # Кнопка скачать текущие промпты как JSON
+                prompts_json = json.dumps({
+                    "advisor_system": new_system,
+                    "advisor_user": new_user
+                }, ensure_ascii=False, indent=2)
+                st.download_button(
+                    "📥 Скачать",
+                    data=prompts_json.encode("utf-8"),
+                    file_name="prompts_backup.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="download_prompts_btn"
+                )
+
+            # --- Предпросмотр ---
+            st.divider()
+            with st.expander("🔍 Предпросмотр промпта с тестовыми данными", expanded=False):
+                test_q = st.text_input("Тестовый вопрос", value="Какие расходы на ремонт можно включать в тариф?", key="prompt_preview_q")
+                test_ctx = st.text_area("Тестовый контекст (имитация чанка)", value="[1] нпа_123.txt (стр. 5): Расходы на ремонт основных средств включаются в тариф при наличии дефектной ведомости...", height=80, key="prompt_preview_ctx")
+                if st.button("👁️ Показать итоговый промпт", key="preview_prompt_btn"):
+                    try:
+                        rendered = new_user.format(query=test_q, context=test_ctx)
+                        st.markdown("**Системный промпт:**")
+                        st.code(new_system, language="text")
+                        st.markdown("**Пользовательский промпт (после подстановки):**")
+                        st.code(rendered, language="text")
+                    except KeyError as e:
+                        st.error(f"❌ Неизвестная переменная в промпте: {e}")
 
         elif admin_subtab == "📝 Отзывы":
             st.header("📝 Отзывы пользователей")
@@ -1164,4 +1973,4 @@ elif main_choice == "🛠 Админка":
 # 🚀 Запуск
 # =============================================================================
 if __name__ == "__main__":
-    pass 
+    pass

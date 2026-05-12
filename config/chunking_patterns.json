@@ -19,8 +19,11 @@
     "doc_year": "(\\d{4})"
   },
   "chunking_settings": {
-    "chunk_size": 701,
-    "chunk_overlap": 50,
-    "min_chunk_length": 81
+    "chunking_mode": "fixed",
+    "separator": "&&",
+    "fixed_chunk_length": 3000,
+    "min_chunk_length": 81,
+    "max_chunk_length": 2000,
+    "chunk_overlap": 500
   }
 }
