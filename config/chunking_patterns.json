@@ -21,7 +21,7 @@
   "chunking_settings": {
     "chunking_mode": "fixed",
     "separator": "&&",
-    "fixed_chunk_length": 3000,
+    "fixed_chunk_length": 500,
     "min_chunk_length": 81,
     "max_chunk_length": 2000,
     "chunk_overlap": 500
