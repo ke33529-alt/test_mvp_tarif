@@ -393,8 +393,20 @@ elif main_choice == "🤝 Советчик":
     with st.expander("⚙️ Настройки", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
-            top_k       = st.slider("Количество источников", 1, 10, 5, key="top_k_slider")
+            top_k       = st.slider("Количество источников (топ-K)", 1, 10, 5, key="top_k_slider",
+                help="Сколько чанков передаётся LLM после реранкинга")
             temperature = st.slider("Креативность ответа", 0.0, 1.0, 0.3, 0.1, key="temp_slider")
+            neighbor_radius = st.slider(
+                "Соседних чанков с каждой стороны", 0, 5,
+                st.session_state.get("neighbor_radius", 2),
+                key="neighbor_radius_slider",
+                help="Для каждого найденного чанка подтягивается N соседей слева и справа. "
+                     "0 — только сам чанк. 2 — чанк + 2 слева + 2 справа = 5 чанков контекста. "
+                     "Больше — шире контекст, но LLM может потеряться."
+            )
+            st.session_state.neighbor_radius = neighbor_radius
+            if neighbor_radius > 0:
+                st.caption(f"Каждый результат даёт {1 + neighbor_radius * 2} чанков контекста")
         with col2:
             try:
                 from core.advisor import get_available_models
@@ -881,6 +893,10 @@ elif main_choice == "🛠 Админка":
                         except Exception: pass
                         progress.progress((i+1)/len(uploaded))
                     st.success(f"✅ Загружено и проиндексировано: {len(uploaded)} файл(ов)")
+                    try:
+                        from core.advisor import invalidate_hybrid_retriever
+                        invalidate_hybrid_retriever()
+                    except Exception: pass
                     st.rerun()
 
             st.divider()
@@ -948,9 +964,10 @@ elif main_choice == "🛠 Админка":
                             spheres_map[fi["fname"]] = new_spheres
                             save_spheres_map(spheres_map)
                     with row[4]:
-                        if fi["chunks_count"] > 0:
+                        live_chunks = st.session_state.get(f"chunks_{fi['fname']}", fi["chunks_count"])
+                        if live_chunks > 0:
                             st.markdown(f"✅ {fi['indexed_at']}")
-                            st.caption(f"{fi['chunks_count']} чанков")
+                            st.caption(f"{live_chunks} чанков")
                         else:
                             st.caption("⬜ не индексирован")
                     with row[5]:
@@ -958,16 +975,30 @@ elif main_choice == "🛠 Админка":
                             st.download_button("📥", data=f.read(), file_name=fi["fname"],
                                                key=f"dl_{fi['fname']}_{fi['folder']}", use_container_width=True)
                     with row[6]:
-                        if st.button("🔄", key=f"idx_{fi['fname']}_{fi['folder']}", use_container_width=True):
+                        if st.button("🔄", key=f"idx_{fi['fname']}_{fi['folder']}", use_container_width=True, help="Переиндексировать"):
                             with st.spinner(f"Индексация {fi['fname']}..."):
                                 try:
                                     from core.indexer import remove_file_from_index, index_file
+                                    # Сначала удаляем старые чанки
+                                    old_chunks = fi["chunks_count"]
                                     try: remove_file_from_index(fi["fname"])
                                     except Exception: pass
                                     res = index_file(fi["fpath"], fi["folder"])
-                                    if res["status"] == "success": st.success(f"✅ {res.get('chunks',0)} чанков")
-                                    else: st.error(f"❌ {res.get('message','')}")
-                                except Exception as e: st.error(f"❌ {e}")
+                                    if res["status"] == "success":
+                                        new_chunks = res.get("chunks", 0)
+                                        # Обновляем счётчик в session_state без rerun
+                                        st.session_state[f"chunks_{fi['fname']}"] = new_chunks
+                                        try:
+                                            from core.advisor import invalidate_hybrid_retriever
+                                            invalidate_hybrid_retriever()
+                                        except Exception: pass
+                                        delta = new_chunks - old_chunks
+                                        delta_str = f"+{delta}" if delta >= 0 else str(delta)
+                                        st.toast(f"✅ {fi['fname']}: {new_chunks} чанков ({delta_str})", icon="📥")
+                                    else:
+                                        st.toast(f"❌ {res.get('message','Ошибка индексации')}", icon="🚨")
+                                except Exception as e:
+                                    st.toast(f"❌ {e}", icon="🚨")
                             st.rerun()
                     with row[7]:
                         if st.button("📤", key=f"rmidx_{fi['fname']}_{fi['folder']}", use_container_width=True):
@@ -983,11 +1014,19 @@ elif main_choice == "🛠 Админка":
                             ca, cb = st.columns(2)
                             with ca:
                                 if st.button("📤 Да", type="primary", use_container_width=True, key=f"conf_rmidx_{fname}"):
+                                    removed = 0
                                     try:
                                         from core.indexer import remove_file_from_index
+                                        removed = _chroma_index.get(fname, {}).get("chunks", 0)
                                         remove_file_from_index(fname)
                                     except Exception: pass
+                                    try:
+                                        from core.advisor import invalidate_hybrid_retriever
+                                        invalidate_hybrid_retriever()
+                                    except Exception: pass
                                     st.session_state.pop(f"_confirm_rmidx_{fname}", None)
+                                    st.session_state[f"chunks_{fname}"] = 0
+                                    st.toast(f"📤 {fname}: удалено {removed} чанков из индекса", icon="📤")
                                     st.rerun()
                             with cb:
                                 if st.button("← Отмена", use_container_width=True, key=f"cancel_rmidx_{fname}"):
@@ -1002,14 +1041,21 @@ elif main_choice == "🛠 Админка":
                             ca, cb = st.columns(2)
                             with ca:
                                 if st.button("🗑️ Да", type="primary", use_container_width=True, key=f"conf_del_{fname}"):
+                                    removed = 0
                                     try:
                                         from core.indexer import remove_file_from_index
+                                        removed = _chroma_index.get(fname, {}).get("chunks", 0)
                                         remove_file_from_index(fname)
                                     except Exception: pass
                                     os.remove(fpath)
                                     spheres_map.pop(fname, None)
                                     save_spheres_map(spheres_map)
+                                    try:
+                                        from core.advisor import invalidate_hybrid_retriever
+                                        invalidate_hybrid_retriever()
+                                    except Exception: pass
                                     st.session_state.pop(f"_confirm_del_{fname}", None)
+                                    st.toast(f"🗑️ {fname} удалён ({removed} чанков)", icon="🗑️")
                                     st.rerun()
                             with cb:
                                 if st.button("← Отмена", use_container_width=True, key=f"cancel_del_{fname}"):
@@ -1026,7 +1072,12 @@ elif main_choice == "🛠 Админка":
                         try:
                             from core.indexer import index_category
                             res = index_category(CATEGORY_FOLDERS[reindex_cat])
-                            if res["status"] == "success": st.success(f"✅ Файлов: {len(res['files'])}")
+                            if res["status"] == "success":
+                                st.success(f"✅ Файлов: {len(res['files'])}")
+                                try:
+                                    from core.advisor import invalidate_hybrid_retriever
+                                    invalidate_hybrid_retriever()
+                                except Exception: pass
                             else: st.error(f"❌ {res.get('message','')}")
                         except Exception as e: st.error(f"❌ {e}")
                 st.divider()
@@ -1042,6 +1093,10 @@ elif main_choice == "🛠 Админка":
                                 try:
                                     from core.indexer import clear_index
                                     clear_index()
+                                except Exception: pass
+                                try:
+                                    from core.advisor import invalidate_hybrid_retriever
+                                    invalidate_hybrid_retriever()
                                 except Exception: pass
                                 st.session_state._confirm_clear_index = False
                                 st.rerun()
@@ -1066,53 +1121,7 @@ elif main_choice == "🛠 Админка":
                     "metadata_patterns":{"doc_number":r"(\d+[А-Я]?-\d+[А-Я]?)","doc_date":r"(\d{2}\.\d{2}\.\d{4})","doc_year":r"(\d{4})"},
                     "chunking_settings":{"chunk_size":500,"chunk_overlap":50,"min_chunk_length":100},
                 }
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📐 Структурные паттерны","🏷️ Типы документов","📋 Метаданные","⚙️ Параметры чанкования","🔍 Просмотр и тест чанков"])
-            with tab1:
-                st.subheader("Структурные паттерны")
-                patterns = config.get("patterns",{})
-                new_patterns = {}
-                for key, label in [("section","Раздел/Глава"),("article","Статья"),("paragraph","Пункт"),("subparagraph","Подпункт")]:
-                    new_patterns[key] = st.text_input(f"{label} ({key})", value=patterns.get(key,""), key=f"pattern_{key}")
-                if st.button("💾 Сохранить паттерны", key="save_patterns", use_container_width=True):
-                    config["patterns"] = new_patterns
-                    with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                    st.success("✅ Сохранено!")
-                    st.rerun()
-            with tab2:
-                st.subheader("Типы документов")
-                doc_types = config.get("doc_types",{})
-                if doc_types:
-                    cols = st.columns(2)
-                    for i,(k,v) in enumerate(doc_types.items()):
-                        with cols[i%2]: st.text(f"{k} → {v}")
-                    st.divider()
-                col1,col2,col3 = st.columns(3)
-                with col1: new_keyword  = st.text_input("Ключевое слово", key="new_keyword")
-                with col2: new_doc_type = st.text_input("Тип документа",  key="new_doc_type")
-                with col3:
-                    if st.button("➕ Добавить", key="add_doc_type", use_container_width=True):
-                        if new_keyword and new_doc_type:
-                            doc_types[new_keyword] = new_doc_type
-                            config["doc_types"] = doc_types
-                            with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                            st.success(f"✅ Добавлено"); st.rerun()
-                if doc_types:
-                    st.divider()
-                    del_kw = st.selectbox("Удалить", list(doc_types.keys()), key="delete_doc_type")
-                    if st.button("🗑️ Удалить", key="confirm_delete_doc_type", use_container_width=True):
-                        del doc_types[del_kw]; config["doc_types"] = doc_types
-                        with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                        st.success("✅ Удалено"); st.rerun()
-            with tab3:
-                st.subheader("Паттерны метаданных")
-                metadata_patterns = config.get("metadata_patterns",{})
-                new_metadata = {}
-                for key,label in [("doc_number","Номер документа"),("doc_date","Дата документа"),("doc_year","Год")]:
-                    new_metadata[key] = st.text_input(f"{label} ({key})", value=metadata_patterns.get(key,""), key=f"meta_{key}")
-                if st.button("💾 Сохранить метаданные", key="save_metadata", use_container_width=True):
-                    config["metadata_patterns"] = new_metadata
-                    with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                    st.success("✅ Сохранено!"); st.rerun()
+            tab4, tab5 = st.tabs(["⚙️ Параметры чанкования","🔍 Просмотр и тест чанков"])
             with tab4:
                 st.subheader("Параметры чанкования")
                 settings = config.get("chunking_settings",{})
@@ -1122,15 +1131,19 @@ elif main_choice == "🛠 Админка":
                     index=["structural","separator","fixed"].index(settings.get("chunking_mode","structural")),
                     key="chunking_mode_radio")
                 st.divider()
-                separator    = settings.get("separator","&&")
-                fixed_length = settings.get("fixed_chunk_length",1000)
-                min_chunk    = settings.get("min_chunk_length",50)
-                max_chunk    = settings.get("max_chunk_length",2000)
-                chunk_overlap= settings.get("chunk_overlap",0)
+                separator      = settings.get("separator","&&")
+                fixed_length   = settings.get("fixed_chunk_length",1000)
+                min_chunk      = settings.get("min_chunk_length", 80)
+                max_chunk      = settings.get("max_chunk_length", 900)
+                chunk_overlap  = settings.get("chunk_overlap", 150)
                 if chunking_mode == "structural":
                     col1,col2 = st.columns(2)
-                    with col1: min_chunk = st.slider("Мин. длина чанка",10,500,min_chunk,key="min_chunk_s")
-                    with col2: max_chunk = st.slider("Макс. длина чанка",200,5000,max_chunk,key="max_chunk_s")
+                    with col1:
+                        min_chunk = st.slider("Мин. длина чанка (симв.)", 10, 500, min_chunk, key="min_chunk_s",
+                            help="Чанки короче этого значения отфильтровываются как мусор (заголовки, пустые строки)")
+                    with col2:
+                        max_chunk = st.slider("Макс. длина чанка (симв.)", 200, 5000, max_chunk, key="max_chunk_s",
+                            help="Рекомендуется 800–1000 для нормативных документов. Один пункт НПА — ~600–900 символов")
                 elif chunking_mode == "separator":
                     separator = st.text_input("Маркер конца чанка", value=separator, key="chunk_separator_input")
                     col1,col2 = st.columns(2)
@@ -1139,81 +1152,215 @@ elif main_choice == "🛠 Админка":
                 elif chunking_mode == "fixed":
                     fixed_length = st.slider("Длина чанка (символов)",100,5000,fixed_length,step=50,key="fixed_chunk_length_slider")
                 st.divider()
-                chunk_overlap = st.slider("Перекрытие (символов)",0,500,chunk_overlap,step=10,key="chunk_overlap_slider")
+                chunk_overlap = st.slider("Перекрытие (символов)", 0, 500, chunk_overlap, step=10, key="chunk_overlap_slider",
+                    help="Сколько символов из конца предыдущего чанка добавляется в начало следующего. Рекомендуется 100–200")
+                st.divider()
+                st.subheader("🔒 Границы разрезания")
+                no_cut_word = st.toggle(
+                    "Не резать в середине слова",
+                    value=settings.get("no_cut_word", True), key="no_cut_word",
+                    help="Чанк всегда заканчивается на границе слова. Если лимит достигнут внутри слова — откатываемся до предыдущего пробела."
+                )
+                no_cut_sentence = st.toggle(
+                    "Не резать в середине предложения",
+                    value=settings.get("no_cut_sentence", True), key="no_cut_sentence",
+                    help="Чанк заканчивается на знаке препинания (. ! ?). Рекомендуется для нормативных текстов — сохраняет юридически значимые формулировки целиком."
+                )
+                no_cut_paragraph = st.toggle(
+                    "Не резать в середине абзаца",
+                    value=settings.get("no_cut_paragraph", False), key="no_cut_paragraph",
+                    help="Чанк заканчивается только на пустой строке (границе абзаца). Может давать чанки разного размера, зато каждый абзац НПА остаётся нетронутым."
+                )
+                if no_cut_paragraph:
+                    st.info("ℹ️ При включённом режиме 'не резать абзац' параметр макс. длины становится мягким ограничением — абзац целиком важнее размера.")
                 st.divider()
                 if st.button("💾 Сохранить параметры", key="save_settings", use_container_width=True, type="primary"):
                     config["chunking_settings"] = {
-                        "chunking_mode":chunking_mode,"separator":separator,
-                        "fixed_chunk_length":fixed_length,"min_chunk_length":min_chunk,
-                        "max_chunk_length":max_chunk,"chunk_overlap":chunk_overlap,
+                        "chunking_mode":      chunking_mode,
+                        "separator":          separator,
+                        "fixed_chunk_length": fixed_length,
+                        "min_chunk_length":   min_chunk,
+                        "max_chunk_length":   max_chunk,
+                        "chunk_overlap":      chunk_overlap,
+                        "no_cut_word":        no_cut_word,
+                        "no_cut_sentence":    no_cut_sentence,
+                        "no_cut_paragraph":   no_cut_paragraph,
                     }
                     with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                    st.success("✅ Сохранено!")
-                    st.warning("🔄 Переиндексируйте документы для применения изменений")
+                    st.toast("✅ Параметры сохранены. Переиндексируйте документы.", icon="💾")
                     st.rerun()
                 if st.button("🔄 Сбросить к умолчаниям", key="reset_config", use_container_width=True):
                     if os.path.exists(config_file): os.remove(config_file)
-                    st.success("✅ Конфигурация удалена"); st.rerun()
+                    st.toast("✅ Конфигурация сброшена", icon="🔄")
+                    st.rerun()
             with tab5:
-                st.subheader("🔍 Просмотр и тест чанков")
+                st.subheader("🔍 Просмотр чанков")
                 try:
-                    from core.indexer import get_chunk_stats, get_chunks_by_file
-                    import chromadb
-                    stats = get_chunk_stats()
-                    if stats["status"] == "success" and stats.get("total_chunks",0) > 0:
-                        col1,col2,col3 = st.columns(3)
-                        col1.metric("Всего чанков", stats["total_chunks"])
-                        col2.metric("Файлов в индексе", len(stats.get("doc_types",{})))
-                        col3.metric("Категорий", len(stats.get("categories",{})))
-                        doc_types = {k:v for k,v in stats.get("doc_types",{}).items() if v>0}
-                        if doc_types:
-                            with st.expander("📊 По типам документов"):
-                                st.bar_chart(pd.DataFrame({"Тип":list(doc_types.keys()),"Чанков":list(doc_types.values())}).set_index("Тип"))
+                    import chromadb as _cdb
+                    _vdb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vector_db")
+                    _cli = _cdb.PersistentClient(path=_vdb_path)
+                    try:
+                        _col = _cli.get_collection(name="tariff_docs")
+                        _all = _col.get(include=["documents", "metadatas"])
+                        _raw_docs  = _all.get("documents", [])
+                        _raw_metas = _all.get("metadatas", [])
+                        _raw_ids   = _all.get("ids", [])
+                    except Exception:
+                        _raw_docs = []
+                        _raw_metas = []
+                        _raw_ids = []
+
+                    if not _raw_docs:
+                        st.warning("⚠️ Векторная база пуста — проиндексируйте документы")
                     else:
-                        st.warning("⚠️ Векторная база пуста")
-                    st.divider()
-                    st.subheader("🧪 Тест-запрос")
-                    col1,col2 = st.columns([4,1])
-                    with col1: test_query = st.text_input("Тестовый запрос", placeholder="расходы на ремонт основных средств", key="test_query_input")
-                    with col2: test_top_k = st.number_input("Топ-K",min_value=1,max_value=20,value=5,key="test_top_k")
-                    if st.button("🔎 Найти чанки", key="test_search_btn", type="primary"):
-                        if test_query.strip():
-                            with st.spinner("Ищем..."):
-                                try:
-                                    from core.advisor import search_vector_db as _svdb
-                                    test_sources = _svdb(test_query, top_k=int(test_top_k))
-                                    if test_sources:
-                                        st.success(f"✅ Найдено {len(test_sources)} чанков")
-                                        for i,src in enumerate(test_sources,1):
-                                            score = max(0, round((1-src.get("distance",1))*100,1))
-                                            sc = "🟢" if score>=70 else "🟡" if score>=40 else "🔴"
-                                            with st.expander(f"#{i} · {src['file']} · {sc} {score}%", expanded=(i==1)):
-                                                st.markdown(src["snippet"][:1500])
-                                                st.caption(f"Дистанция: {src['distance']} · Чанк: {src.get('chunk_index','')}")
-                                    else:
-                                        st.warning("🔍 Ничего не найдено.")
-                                except Exception as e:
-                                    st.error(f"❌ {type(e).__name__}: {e}")
-                        else:
-                            st.warning("⚠️ Введите запрос")
-                    st.divider()
-                    st.subheader("📄 Чанки по файлам")
-                    chunks_data = get_chunks_by_file(limit_per_file=5)
-                    if chunks_data["status"] == "success" and chunks_data["files"]:
-                        file_names    = [f["filename"] for f in chunks_data["files"]]
-                        selected_file = st.selectbox("Выберите файл", file_names, key="chunk_file_select")
-                        file_info     = next((f for f in chunks_data["files"] if f["filename"]==selected_file), None)
-                        if file_info:
-                            col1,col2,col3,col4 = st.columns(4)
-                            col1.metric("Чанков",    file_info["total_chunks"])
-                            col2.write(f"**Тип:** {file_info.get('doc_type','—')}")
-                            col3.write(f"**Номер:** {file_info.get('doc_number','—')}")
-                            col4.write(f"**Дата:** {file_info.get('doc_date','—')}")
-                            for ci,chunk in enumerate(file_info["chunks"],1):
-                                with st.expander(f"Чанк #{ci} · {len(chunk['content'])} симв."):
-                                    st.code(chunk["content"][:1000]+("..." if len(chunk["content"])>1000 else ""), language="text")
-                    else:
-                        st.info("📭 Нет проиндексированных файлов")
+                        # ── Группировка по файлам ────────────────────────────
+                        _fdict: dict = {}
+                        for _did, _doc, _meta in zip(_raw_ids, _raw_docs, _raw_metas):
+                            if _meta is None:
+                                _meta = {}
+                            _fn = _meta.get("filename", "Неизвестно")
+                            if _fn not in _fdict:
+                                _fdict[_fn] = {
+                                    "doc_type":   _meta.get("doc_type",   "—"),
+                                    "doc_number": _meta.get("doc_number", "—"),
+                                    "doc_date":   _meta.get("doc_date",   "—"),
+                                    "chunks": [],
+                                }
+                            _fdict[_fn]["chunks"].append({
+                                "id":       _did,
+                                "content":  _doc,          # полный текст, без обрезки
+                                "metadata": _meta,
+                            })
+                        # Сортируем чанки внутри файла по chunk_index
+                        for _fn in _fdict:
+                            _fdict[_fn]["chunks"].sort(
+                                key=lambda c: int(c["metadata"].get("chunk_index", 0))
+                            )
+
+                        # ── Статистика ───────────────────────────────────────
+                        _sc1, _sc2 = st.columns(2)
+                        _sc1.metric("Всего чанков", len(_raw_docs))
+                        _sc2.metric("Файлов", len(_fdict))
+                        st.divider()
+
+                        # ── Выбор файла ──────────────────────────────────────
+                        _fnames = sorted(_fdict.keys())
+                        _sel_file = st.selectbox(
+                            "📄 Документ",
+                            _fnames,
+                            format_func=lambda x: f"{x}  ({len(_fdict[x]['chunks'])} чанков)",
+                            key="cv_file_sel",
+                        )
+                        _fi = _fdict[_sel_file]
+                        _chunks = _fi["chunks"]
+                        _total  = len(_chunks)
+
+                        _mc = st.columns(4)
+                        _mc[0].metric("Чанков", _total)
+                        _mc[1].caption(f"**Тип:** {_fi['doc_type']}")
+                        _mc[2].caption(f"**Номер:** {_fi['doc_number']}")
+                        _mc[3].caption(f"**Дата:** {_fi['doc_date']}")
+                        st.divider()
+
+                        # ── Выбор чанка ─────────────────────────────────────
+                        # cv_chunk_idx — единственный источник истины.
+                        # selectbox рендерится БЕЗ key, чтобы не было конфликта
+                        # между его внутренним состоянием и нашей переменной.
+                        if "cv_chunk_idx" not in st.session_state:
+                            st.session_state["cv_chunk_idx"] = 0
+                        if st.session_state.get("cv_last_file") != _sel_file:
+                            st.session_state["cv_chunk_idx"] = 0
+                            st.session_state["cv_last_file"] = _sel_file
+                        _cidx = min(st.session_state["cv_chunk_idx"], _total - 1)
+
+                        def _clabel(i):
+                            _c = _chunks[i]
+                            _ci = _c["metadata"].get("chunk_index", i)
+                            _prev = _c["content"][:80].replace("\n", " ")
+                            return f"#{_ci}  ·  {_prev}…"
+
+                        # selectbox — без key, index задаётся из cv_chunk_idx
+                        _sel_i = st.selectbox(
+                            "🔢 Чанк",
+                            options=list(range(_total)),
+                            index=_cidx,
+                            format_func=_clabel,
+                        )
+                        # Если пользователь выбрал вручную — синхронизируем и перезапускаем
+                        if _sel_i != _cidx:
+                            st.session_state["cv_chunk_idx"] = _sel_i
+                            st.rerun()
+
+                        # Кнопки навигации
+                        _nb1, _nb2, _nb3 = st.columns([1, 6, 1])
+                        with _nb1:
+                            if st.button("◀", disabled=(_cidx == 0), key="cv_prev", use_container_width=True):
+                                st.session_state["cv_chunk_idx"] = _cidx - 1
+                                st.rerun()
+                        with _nb2:
+                            st.caption(f"Чанк {_cidx + 1} из {_total}")
+                        with _nb3:
+                            if st.button("▶", disabled=(_cidx >= _total - 1), key="cv_next", use_container_width=True):
+                                st.session_state["cv_chunk_idx"] = _cidx + 1
+                                st.rerun()
+
+                        # ── Полное содержимое ────────────────────────────────
+                        _chunk   = _chunks[_cidx]
+                        _content = _chunk["content"]
+                        _meta    = _chunk["metadata"]
+
+                        st.text_area(
+                            f"Содержимое  ·  {len(_content)} символов",
+                            value=_content,
+                            height=max(150, min(520, len(_content) // 2)),
+                            disabled=True,
+                        )
+
+                        # ── Метаданные чанка ─────────────────────────────────
+                        with st.expander("🏷️ Метаданные чанка", expanded=False):
+                            _mf = st.columns(2)
+                            _mfields = [
+                                ("chunk_index", _meta.get("chunk_index", "—")),
+                                ("struct_type",  _meta.get("struct_type",  "—")),
+                                ("struct_text",  _meta.get("struct_text",  "—")),
+                                ("article",      _meta.get("article",      "—")),
+                                ("paragraph",    _meta.get("paragraph",    "—")),
+                                ("category",     _meta.get("category",     "—")),
+                                ("doc_type",     _meta.get("doc_type",     "—")),
+                                ("id",           _chunk["id"]),
+                            ]
+                            for _j, (_k, _v) in enumerate(_mfields):
+                                _mf[_j % 2].caption(f"**{_k}:** {_v}")
+
+                        # ── Тест-запрос (вспомогательный) ───────────────────
+                        st.divider()
+                        st.subheader("🧪 Тест-запрос к базе")
+                        _tq_c1, _tq_c2 = st.columns([4, 1])
+                        with _tq_c1:
+                            test_query = st.text_input("Запрос", placeholder="расходы на ремонт основных средств", key="test_query_input")
+                        with _tq_c2:
+                            test_top_k = st.number_input("Топ-K", min_value=1, max_value=20, value=5, key="test_top_k")
+                        if st.button("🔎 Найти чанки", key="test_search_btn", type="primary"):
+                            if test_query.strip():
+                                with st.spinner("Ищем..."):
+                                    try:
+                                        from core.advisor import search_vector_db as _svdb
+                                        test_sources = _svdb(test_query, top_k=int(test_top_k))
+                                        if test_sources:
+                                            st.success(f"✅ Найдено {len(test_sources)} чанков")
+                                            for _ti, _src in enumerate(test_sources, 1):
+                                                _score = max(0, round((1 - _src.get("distance", 1)) * 100, 1))
+                                                _sc = "🟢" if _score >= 70 else "🟡" if _score >= 40 else "🔴"
+                                                with st.expander(f"#{_ti} · {_src['file']} · {_sc} {_score}%", expanded=(_ti == 1)):
+                                                    st.text_area("", _src["snippet"], height=200, disabled=True, key=f"tsr_{_ti}")
+                                                    st.caption(f"Дистанция: {_src['distance']} · Чанк: {_src.get('chunk_index', '')}")
+                                        else:
+                                            st.warning("🔍 Ничего не найдено.")
+                                    except Exception as _te:
+                                        st.error(f"❌ {type(_te).__name__}: {_te}")
+                            else:
+                                st.warning("⚠️ Введите запрос")
+
                 except Exception as e:
                     st.error(f"❌ {type(e).__name__}: {e}")
 

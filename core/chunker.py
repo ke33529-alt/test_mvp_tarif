@@ -77,8 +77,34 @@ class LegalDocumentChunker:
         current_len = 0
         chunk_idx = 0
 
+        # ── Предобработка: удаляем мусорные строки до разбивки на чанки ──
+        _JUNK_SUBSTRINGS = [
+            "консультантплюс",
+            "www.consultant.ru",
+            "документ предоставлен",
+        ]
+        def _is_junk_line(line: str) -> bool:
+            """Возвращает True, если строка — мусор (колонтитул, разделитель)."""
+            s = line.strip().lower()
+            if not s:
+                return True
+            # Строка только из дефисов, подчёркиваний, пробелов, звёздочек
+            if set(s) <= set("-–—_= *\t\n"):
+                return True
+            if any(p in s for p in _JUNK_SUBSTRINGS):
+                return True
+            return False
+
         for sent in sentences:
             sent = sent.strip()
+            if not sent:
+                continue
+            # Пропускаем мусорные строки (колонтитулы, разделители)
+            if _is_junk_line(sent):
+                continue
+            # Если предложение многострочное — фильтруем каждую строку
+            _clean_lines = [l for l in sent.splitlines() if not _is_junk_line(l)]
+            sent = " ".join(_clean_lines).strip()
             if not sent:
                 continue
 
@@ -90,18 +116,21 @@ class LegalDocumentChunker:
                 temp = sent
                 while len(temp) > self.max_chunk_chars:
                     split_at = temp.rfind(' ', 0, self.max_chunk_chars)
-                    if split_at == -1:
+                    # Защита от зависания: если пробел в позиции 0 или не найден —
+                    # режем жёстко по лимиту, чтобы temp гарантированно уменьшался
+                    if split_at <= 0:
                         split_at = self.max_chunk_chars
                     parts.append(temp[:split_at].strip())
                     temp = temp[split_at:].strip()
                 if temp:
                     parts.append(temp)
                 for part in parts:
-                    chunks.append({
-                        "text": part,
-                        "metadata": {**metadata, "doc_id": doc_id, "chunk_index": chunk_idx}
-                    })
-                    chunk_idx += 1
+                    if part:  # пропускаем пустые фрагменты
+                        chunks.append({
+                            "text": part,
+                            "metadata": {**metadata, "doc_id": doc_id, "chunk_index": chunk_idx}
+                        })
+                        chunk_idx += 1
                 continue
 
             # Если добавление превысит лимит → сохраняем текущий чанк

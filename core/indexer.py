@@ -132,10 +132,13 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
     # ── Режим 1: умный структурный чанкер ───────────────────────────────────
     if mode == "structural" and chunker:
         chunks = chunker.chunk_by_structure(text, base_metadata)
-        # Применяем перекрытие если задано
         if overlap > 0:
             chunks = _apply_overlap(chunks, overlap)
-        return [c for c in chunks if len(c.get('text', '')) >= min_len]
+        chunks = [c for c in chunks if len(c.get('text', '')) >= min_len]
+        if len(chunks) > MAX_CHUNKS_PER_FILE:
+            print(f"[WARN] Структурный чанкер: {len(chunks)} чанков — обрезаем до {MAX_CHUNKS_PER_FILE}")
+            chunks = chunks[:MAX_CHUNKS_PER_FILE]
+        return chunks
 
     # ── Режим 2: по разделителю ──────────────────────────────────────────────
     elif mode == "separator":
@@ -147,13 +150,11 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
             part = part.strip()
             if len(part) < min_len:
                 continue
-            # Если кусок слишком длинный — дробим дополнительно
             if len(part) > max_len:
-                sub = _split_fixed(part, max_len, overlap)
+                sub = _split_fixed(part, max_len, overlap, settings)
                 raw_chunks.extend(sub)
             else:
                 raw_chunks.append(part)
-        # Применяем перекрытие
         if overlap > 0:
             raw_chunks = _apply_overlap_texts(raw_chunks, overlap)
         return [{'text': t, 'metadata': base_metadata} for t in raw_chunks if len(t) >= min_len]
@@ -161,7 +162,7 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
     # ── Режим 3: фиксированная длина ─────────────────────────────────────────
     elif mode == "fixed":
         fixed_len = settings.get("fixed_chunk_length", 1000)
-        parts = _split_fixed(text, fixed_len, overlap)
+        parts = _split_fixed(text, fixed_len, overlap, settings)
         return [{'text': t, 'metadata': base_metadata} for t in parts if len(t) >= min_len]
 
     # ── Fallback: стандартный RecursiveCharacterTextSplitter ─────────────────
@@ -174,16 +175,87 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
         parts = text_splitter.split_text(text)
         return [{'text': t, 'metadata': base_metadata} for t in parts if len(t) >= min_len]
 
-def _split_fixed(text: str, size: int, overlap: int = 0) -> list:
-    """Разбивает текст на куски фиксированного размера с перекрытием"""
+def _snap_to_boundary(text: str, start: int, end: int, settings: dict) -> int:
+    """
+    Возвращает позицию обрезки в диапазоне [start+1 .. end].
+    ГАРАНТИРУЕТ продвижение минимум на 1 символ от start.
+
+    no_cut_paragraph → ищет \\n\\n в окне [start .. end]
+    no_cut_sentence  → ищет . ! ? в окне [start .. end]
+    no_cut_word      → ищет пробел в окне [start .. end]
+    """
+    if end >= len(text):
+        return len(text)
+
+    # Минимальное продвижение — половина окна, чтобы не застрять
+    min_end = start + max(1, (end - start) // 2)
+
+    slice_ = text[start:end]
+
+    if settings.get("no_cut_paragraph", False):
+        pos = slice_.rfind("\n\n")
+        if pos > 0:
+            candidate = start + pos + 2
+            if candidate > min_end:
+                return candidate
+
+    if settings.get("no_cut_sentence", True):
+        best = -1
+        for punct in (".", "!", "?"):
+            pos = slice_.rfind(punct)
+            if pos > best:
+                best = pos
+        if best > 0:
+            candidate = start + best + 1
+            if candidate > min_end:
+                return candidate
+
+    if settings.get("no_cut_word", True):
+        pos = slice_.rfind(" ")
+        if pos > 0:
+            candidate = start + pos + 1
+            if candidate > min_end:
+                return candidate
+
+    # Граница не найдена в «хорошей» зоне — режем жёстко по end
+    return end
+
+
+MAX_CHUNKS_PER_FILE = 2000   # жёсткий лимит: защита от утечки памяти
+
+
+def _split_fixed(text: str, size: int, overlap: int = 0, settings: dict = None) -> list:
+    """Разбивает текст на куски с умными границами. Гарантирует завершение."""
+    if settings is None:
+        settings = {}
     if overlap >= size:
         overlap = 0
+
     chunks = []
-    step = size - overlap
-    for i in range(0, len(text), step):
-        chunk = text[i:i + size]
+    pos = 0
+    while pos < len(text) and len(chunks) < MAX_CHUNKS_PER_FILE:
+        end = min(pos + size, len(text))
+        end = _snap_to_boundary(text, pos, end, settings)
+
+        # Гарантируем продвижение: если end не ушёл вперёд — форсируем
+        if end <= pos:
+            end = min(pos + size, len(text))
+
+        chunk = text[pos:end].strip()
         if chunk:
             chunks.append(chunk)
+
+        # Если достигли конца файла — выходим. Без этого при overlap>0
+        # pos зависает на (len(text) - overlap) и цикл крутится до лимита 2000.
+        if end >= len(text):
+            break
+
+        pos = max(end - overlap, end - size + 1) if overlap else end
+
+    if len(chunks) >= MAX_CHUNKS_PER_FILE:
+        print(f"[WARN] _split_fixed: достигнут лимит {MAX_CHUNKS_PER_FILE} чанков, "
+              f"остаток текста ({len(text) - pos} симв.) пропущен")
+
     return chunks
 
 def _apply_overlap(chunks: list, overlap: int) -> list:
@@ -225,10 +297,19 @@ def index_file(file_path, category="npa"):
         chunker = None
         if CHUNKER_AVAILABLE:
             try:
-                chunker = LegalDocumentChunker()
+                chunker = LegalDocumentChunker(
+                    max_chunk_chars=settings.get("max_chunk_length", 900),
+                    neighbor_radius=settings.get("neighbor_radius", 2),
+                )
+                print(f"[CONFIG] Чанкер: max={chunker.max_chunk_chars} симв., "
+                      f"radius={chunker.neighbor_radius}, "
+                      f"overlap={settings.get('chunk_overlap', 0)}")
             except Exception as e:
                 print(f"[WARN] Ошибка инициализации чанкера: {e}")
-
+        print(f"[DIAG] === НАСТРОЙКИ ЧАНКОВАНИЯ ===")
+        print(f"[DIAG] mode={settings.get('chunking_mode','structural')} | max={settings.get('max_chunk_length',900)} | min={settings.get('min_chunk_length',50)} | overlap={settings.get('chunk_overlap',0)}")
+        print(f"[DIAG] no_cut_word={settings.get('no_cut_word',True)} | no_cut_sentence={settings.get('no_cut_sentence',True)} | no_cut_paragraph={settings.get('no_cut_paragraph',False)}")
+        print(f"[DIAG] Документов от загрузчика: {len(docs)}")
         chunks = []
         for doc in docs:
             base_metadata = {
@@ -242,6 +323,10 @@ def index_file(file_path, category="npa"):
             base_metadata.update(file_metadata)
 
             doc_chunks = apply_chunking(doc.page_content, base_metadata, settings, chunker)
+            print(f"[DIAG] Документ: {len(doc.page_content)} симв. → {len(doc_chunks)} чанков")
+            if doc_chunks:
+                print(f"[DIAG] Первый чанк ({len(doc_chunks[0]['text'])} симв.): {repr(doc_chunks[0]['text'][:120])}")
+                print(f"[DIAG] Последний чанк ({len(doc_chunks[-1]['text'])} симв.): {repr(doc_chunks[-1]['text'][:120])}")
             chunks.extend(doc_chunks)
 
         if not chunks:
@@ -251,7 +336,7 @@ def index_file(file_path, category="npa"):
 
         ids, documents, metadatas = [], [], []
         for i, chunk in enumerate(chunks):
-            doc_id = f"{os.path.basename(file_path)}_{i}_{datetime.now().timestamp()}"
+            doc_id = f"{os.path.basename(file_path)}_{i}"
             ids.append(doc_id)
             documents.append(chunk['text'])
             metadatas.append({
@@ -365,9 +450,15 @@ def rebuild_index():
     chunker = None
     if CHUNKER_AVAILABLE:
         try:
-            chunker = LegalDocumentChunker()
+            settings_for_rebuild = load_chunking_settings()
+            chunker = LegalDocumentChunker(
+                max_chunk_chars=settings_for_rebuild.get("max_chunk_length", 900),
+                neighbor_radius=settings_for_rebuild.get("neighbor_radius", 2),
+            )
             print(f"[CONFIG] Умный чанкер инициализирован")
             print(f"[CONFIG] Размер чанка: {chunker.max_chunk_chars} символов")
+            print(f"[CONFIG] Радиус соседей: {chunker.neighbor_radius}")
+            print(f"[CONFIG] Перекрытие: {settings_for_rebuild.get('chunk_overlap', 0)} символов")
         except Exception as e:
             print(f"[WARN] Ошибка инициализации чанкера: {e}")
             chunker = None
@@ -459,7 +550,7 @@ def rebuild_index():
         for i, chunk in enumerate(chunks):
             source = chunk['metadata'].get('filepath', '')
             fname = os.path.basename(source) if source else f"doc_{i}"
-            doc_id = f"{fname}_{i}_{datetime.now().timestamp()}"
+            doc_id = f"{fname}_{i}"
             ids.append(doc_id)
             documents_list.append(chunk['text'])
             metadatas_list.append({

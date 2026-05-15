@@ -11,6 +11,17 @@ from typing import Optional, List, Dict
 from openai import OpenAI
 
 # =============================================================================
+# Исправление кодировки консоли на Windows (cp1252 → utf-8)
+# Без этого print() падает с UnicodeEncodeError на символах →, ✅, ⚡ и т.п.
+# =============================================================================
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+# =============================================================================
 # Отключение телеметрии ChromaDB
 # =============================================================================
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
@@ -145,8 +156,6 @@ def get_st_model():
         try:
             from sentence_transformers import SentenceTransformer
             model = SentenceTransformer(EMBEDDING_MODEL)
-            # Прогрев: transformers-сканирование ~150 модулей происходит
-            # здесь один раз, а не при каждом запросе пользователя
             model.encode(["прогрев"], normalize_embeddings=True)
             sys.modules[_ST_MODEL_KEY] = model
             print(f"[EMBED] Готово за {time.perf_counter()-t0:.1f} сек. Далее ~0.1 сек/запрос.")
@@ -204,6 +213,283 @@ def get_chroma_collection():
 
         print(f"[CHROMA] Готово за {time.perf_counter()-t0:.2f} сек ({_chroma_collection.count()} чанков)")
         return _chroma_collection
+
+
+# =============================================================================
+# [NEW] HybridRetriever — BM25 + векторный поиск + RRF fusion
+#
+# Индекс BM25 строится из ChromaDB при первом обращении и хранится
+# как синглтон в sys.modules — так же, как модель эмбеддингов.
+# При переиндексации достаточно вызвать invalidate_hybrid_retriever().
+# =============================================================================
+_HYBRID_RETRIEVER_KEY = "__regula_ai_hybrid_retriever__"
+_hybrid_lock          = threading.Lock()
+
+# rank_bm25 подключается с graceful degradation: если не установлен,
+# search_vector_db автоматически падает на чистый векторный поиск.
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+    print("[HYBRID] rank_bm25 не установлен. Запустите: pip install rank_bm25")
+    print("[HYBRID] Будет использоваться только векторный поиск.")
+
+
+class HybridRetriever:
+    """BM25 + векторный поиск с Reciprocal Rank Fusion."""
+
+    def __init__(self, collection):
+        self.collection = collection
+        self.all_docs:  list = []
+        self.all_ids:   list = []
+        self.all_meta:  list = []
+        self.bm25 = None
+        self._build_index()
+
+    def _tokenize(self, text: str) -> list:
+        """Простая токенизация: буквы/цифры, нижний регистр."""
+        return re.findall(r'\w+', text.lower())
+
+    def _build_index(self):
+        t0 = time.perf_counter()
+        try:
+            result = self.collection.get(include=["documents", "metadatas"])
+            self.all_docs  = result["documents"]
+            self.all_ids   = result["ids"]
+            self.all_meta  = result["metadatas"]
+
+            if BM25_AVAILABLE and self.all_docs:
+                tokenized   = [self._tokenize(doc) for doc in self.all_docs]
+                self.bm25   = BM25Okapi(tokenized)
+                print(f"[HYBRID] BM25-индекс построен: {len(self.all_docs)} чанков "
+                      f"за {time.perf_counter()-t0:.2f} сек")
+            else:
+                print(f"[HYBRID] BM25 недоступен, работаем без него.")
+        except Exception as e:
+            print(f"[HYBRID ERROR] Ошибка построения индекса: {e}")
+
+    # ------------------------------------------------------------------
+    # Основной метод поиска
+    # ------------------------------------------------------------------
+    def search(self, query: str, top_k: int = 20) -> list:
+        """
+        Возвращает список кандидатов, отсортированных по RRF-score.
+        Каждый кандидат: {"id", "doc", "meta", "score", "in_vector", "in_bm25"}
+        """
+        vector_hits = self._vector_search(query, top_k)
+        bm25_hits   = self._bm25_search(query, top_k) if self.bm25 else {}
+        return self._rrf_merge(vector_hits, bm25_hits)
+
+    def _vector_search(self, query: str, top_k: int) -> dict:
+        """Возвращает {id: {"doc", "meta", "vector_rank"}}"""
+        try:
+            embedding = embed_query(query)
+            if embedding is not None:
+                results = self.collection.query(
+                    query_embeddings=embedding,
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+            else:
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+
+            hits = {}
+            for rank, (id_, doc, meta) in enumerate(zip(
+                results["ids"][0],
+                results["documents"][0],
+                results["metadatas"][0],
+            )):
+                hits[id_] = {"doc": doc, "meta": meta or {}, "vector_rank": rank}
+            return hits
+        except Exception as e:
+            print(f"[HYBRID] Ошибка векторного поиска: {e}")
+            return {}
+
+    def _bm25_search(self, query: str, top_k: int) -> dict:
+        """Возвращает {id: {"doc", "meta", "bm25_rank"}}"""
+        try:
+            tokens     = self._tokenize(query)
+            scores     = self.bm25.get_scores(tokens)
+            top_idx    = sorted(range(len(scores)),
+                                key=lambda i: scores[i], reverse=True)[:top_k]
+            return {
+                self.all_ids[i]: {
+                    "doc":      self.all_docs[i],
+                    "meta":     self.all_meta[i] or {},
+                    "bm25_rank": rank,
+                }
+                for rank, i in enumerate(top_idx)
+                if scores[i] > 0   # отфильтровываем нулевые совпадения
+            }
+        except Exception as e:
+            print(f"[HYBRID] Ошибка BM25: {e}")
+            return {}
+
+    @staticmethod
+    def _rrf_merge(vector_hits: dict, bm25_hits: dict, k: int = 60) -> list:
+        """
+        Reciprocal Rank Fusion:
+        score = 1/(k + rank_vector + 1) + 1/(k + rank_bm25 + 1)
+        """
+        all_ids = set(vector_hits) | set(bm25_hits)
+        scored  = []
+        for id_ in all_ids:
+            score = 0.0
+            if id_ in vector_hits:
+                score += 1.0 / (k + vector_hits[id_]["vector_rank"] + 1)
+            if id_ in bm25_hits:
+                score += 1.0 / (k + bm25_hits[id_]["bm25_rank"] + 1)
+            source = vector_hits.get(id_) or bm25_hits.get(id_)
+            scored.append({
+                "id":        id_,
+                "doc":       source["doc"],
+                "meta":      source["meta"],
+                "score":     score,
+                "in_vector": id_ in vector_hits,
+                "in_bm25":   id_ in bm25_hits,
+            })
+        return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+def get_hybrid_retriever() -> Optional[HybridRetriever]:
+    """Синглтон HybridRetriever. Перестраивает индекс, если коллекция изменилась."""
+    if not BM25_AVAILABLE:
+        return None
+
+    existing = sys.modules.get(_HYBRID_RETRIEVER_KEY)
+    collection = get_chroma_collection()
+    if collection is None:
+        return None
+
+    current_count = collection.count()
+
+    # Если синглтон есть и размер базы не изменился — возвращаем
+    if existing is not None:
+        if getattr(existing, "_collection_count", -1) == current_count:
+            return existing
+
+    with _hybrid_lock:
+        # Двойная проверка после блокировки
+        existing = sys.modules.get(_HYBRID_RETRIEVER_KEY)
+        if existing is not None and getattr(existing, "_collection_count", -1) == current_count:
+            return existing
+
+        retriever = HybridRetriever(collection)
+        retriever._collection_count = current_count
+        sys.modules[_HYBRID_RETRIEVER_KEY] = retriever
+        return retriever
+
+
+def invalidate_hybrid_retriever():
+    """Принудительно сбрасывает BM25-индекс (вызывать после переиндексации)."""
+    sys.modules.pop(_HYBRID_RETRIEVER_KEY, None)
+    print("[HYBRID] Индекс сброшен. Будет перестроен при следующем запросе.")
+
+
+# =============================================================================
+# [NEW] Reranker — CrossEncoder для финального ранжирования топ-K
+#
+# Модель mmarco-mMiniLMv2 обучена на русскоязычных данных (MS MARCO RU),
+# ms-marco-MiniLM-L-6-v2 быстрее, но хуже на кириллице.
+# Модель выбирается автоматически; при ошибке загрузки reranking отключается.
+# =============================================================================
+_RERANKER_KEY  = "__regula_ai_reranker__"
+_reranker_lock = threading.Lock()
+
+# Приоритет: скорость → качество → отключение
+# L-6 (6 слоёв) ~в 2 раза быстрее L-12; для нормативных запросов разница
+# в качестве несущественна, а выигрыш по времени — 3-8 сек на CPU.
+_RERANKER_MODELS = [
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",          # быстро, ~3-5 сек на CPU
+    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",   # качественнее, но медленнее
+]
+
+
+class Reranker:
+    """CrossEncoder для ранжирования финального списка кандидатов."""
+
+    def __init__(self, model_name: str):
+        from sentence_transformers import CrossEncoder
+        t0 = time.perf_counter()
+        self.model      = CrossEncoder(model_name)
+        self.model_name = model_name
+        # Прогрев
+        self.model.predict([("тест", "тест прогрев")])
+        print(f"[RERANKER] Загружен {model_name} за {time.perf_counter()-t0:.1f} сек")
+
+    def rerank(self, query: str, candidates: list, top_n: int = 5) -> list:
+        if not candidates:
+            return candidates
+        t0 = time.perf_counter()
+        # Обрезаем текст до 350 символов: CrossEncoder обрабатывает каждый
+        # символ через BERT — 800 симв. vs 350 симв. даёт ~2x ускорение
+        # без потери качества ранжирования (структура нормативного текста
+        # раскрывается в первых предложениях).
+        pairs  = [(query, c["doc"][:350]) for c in candidates]
+        scores = self.model.predict(pairs)
+        for candidate, score in zip(candidates, scores):
+            candidate["rerank_score"] = float(score)
+        result = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:top_n]
+        print(f"[RERANKER] {len(candidates)} -> {top_n} кандидатов за {time.perf_counter()-t0:.2f} сек")
+        return result
+
+
+def get_reranker() -> Optional[Reranker]:
+    """Синглтон Reranker с автовыбором модели."""
+    existing = sys.modules.get(_RERANKER_KEY)
+    if existing is not None:
+        return existing
+
+    with _reranker_lock:
+        existing = sys.modules.get(_RERANKER_KEY)
+        if existing is not None:
+            return existing
+
+        for model_name in _RERANKER_MODELS:
+            try:
+                reranker = Reranker(model_name)
+                sys.modules[_RERANKER_KEY] = reranker
+                return reranker
+            except Exception as e:
+                print(f"[RERANKER] Не удалось загрузить {model_name}: {e}")
+
+        print("[RERANKER] Все модели недоступны. Reranking отключён.")
+        # Ставим заглушку-None, чтобы не пытаться снова на каждом запросе
+        sys.modules[_RERANKER_KEY] = False
+        return None
+
+
+# =============================================================================
+# Предзагрузка моделей в фоне при старте
+#
+# Embedding-модель и CrossEncoder грузятся ~12-30 сек каждая.
+# Запускаем их в daemon-потоке сразу при импорте модуля, чтобы к моменту
+# первого запроса пользователя они уже были в памяти.
+# Если пользователь задал вопрос раньше — get_st_model() и get_reranker()
+# дождутся завершения через _st_lock / _reranker_lock (thread-safe).
+# =============================================================================
+def _preload_models_background():
+    try:
+        get_st_model()
+    except Exception as e:
+        print(f"[PRELOAD] Ошибка embedding: {e}")
+    try:
+        get_reranker()
+    except Exception as e:
+        print(f"[PRELOAD] Ошибка reranker: {e}")
+    print("[PRELOAD] Модели готовы.")
+
+
+threading.Thread(
+    target=_preload_models_background,
+    daemon=True,
+    name="model-preload",
+).start()
 
 
 # =============================================================================
@@ -295,16 +581,263 @@ def search_faq(query: str, top_k: int = 3) -> list:
 
 
 # =============================================================================
-# Векторный поиск
+# Вспомогательные функции пайплайна поиска
+# =============================================================================
+
+def _load_neighbor_radius() -> int:
+    """
+    Читает neighbor_radius из Streamlit session_state (задаётся в UI советчика).
+    Fallback: конфиг файл → дефолт 2.
+    """
+    # session_state доступен только внутри Streamlit-процесса
+    try:
+        import streamlit as st
+        val = st.session_state.get("neighbor_radius")
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+    # Fallback: читаем из конфига (для скриптов вне Streamlit)
+    try:
+        cfg = os.path.join("config", "chunking_patterns.json")
+        if os.path.exists(cfg):
+            with open(cfg, "r", encoding="utf-8") as f:
+                return int(json.load(f).get("chunking_settings", {}).get("neighbor_radius", 2))
+    except Exception:
+        pass
+    return 2
+
+
+def _fetch_neighbors(top_candidates: list, collection, radius: int) -> dict:
+    """
+    Для каждого кандидата из top_candidates подтягивает соседние чанки
+    одним батч-запросом к ChromaDB.
+
+    Возвращает словарь:
+        (doc_id, chunk_index) → склеенный текст [сосед_л ... ЦЕЛЬ ... сосед_п]
+
+    ВАЖНО: вызывается ПОСЛЕ реранкинга — реранкер уже отработал на коротких
+    оригинальных чанках. Соседи нужны только для промпта LLM.
+    """
+    if radius == 0 or not top_candidates or collection is None:
+        return {}
+
+    t0 = time.perf_counter()
+
+    # Собираем уникальные doc_id всех победителей
+    doc_ids = list({
+        (c.get("meta") or {}).get("doc_id")
+        or (c.get("meta") or {}).get("filename", "unknown")
+        for c in top_candidates
+    })
+
+    # Один батч-запрос — все чанки из этих документов
+    try:
+        if len(doc_ids) == 1:
+            batch = collection.get(
+                where={"doc_id": doc_ids[0]},
+                include=["documents", "metadatas"],
+            )
+        else:
+            batch = collection.get(
+                where={"doc_id": {"$in": doc_ids}},
+                include=["documents", "metadatas"],
+            )
+    except Exception as e:
+        print(f"[NEIGHBORS] Батч-запрос не удался: {e}")
+        return {}
+
+    # Строим chunk_map: (doc_id, chunk_index) → text
+    chunk_map: dict = {}
+    for doc, meta in zip(batch.get("documents", []), batch.get("metadatas", [])):
+        if not meta:
+            continue
+        did  = meta.get("doc_id") or meta.get("filename", "unknown")
+        cidx = int(meta.get("chunk_index", 0))
+        chunk_map[(did, cidx)] = doc
+
+    # Склеиваем контекст для каждого победителя
+    result = {}
+    for c in top_candidates:
+        meta   = c.get("meta") or {}
+        doc_id = meta.get("doc_id") or meta.get("filename", "unknown")
+        cidx   = int(meta.get("chunk_index", 0))
+
+        parts = []
+        for offset in range(-radius, radius + 1):
+            text = chunk_map.get((doc_id, cidx + offset))
+            if text:
+                parts.append(text)
+
+        result[(doc_id, cidx)] = "\n\n".join(parts) if parts else c.get("doc", "")
+
+    n_expanded = sum(1 for v in result.values() if "\n\n" in v)
+    print(f"[NEIGHBORS] radius={radius}, расширено {n_expanded}/{len(top_candidates)} "
+          f"за {time.perf_counter()-t0:.3f} сек")
+    return result
+
+
+# =============================================================================
+# Пайплайн поиска: синонимы → гибридный поиск → реранкинг → соседи
+#
+#  Шаг 1. QueryExpander расширяет запрос синонимами (ФОТ → фонд оплаты труда…)
+#  Шаг 2. HybridRetriever: BM25 + vector по всем вариантам запроса → RRF
+#  Шаг 3. CrossEncoder реранкирует кандидатов по ОРИГИНАЛЬНОМУ короткому тексту
+#         (не по соседям — иначе будет медленно и точность снизится)
+#  Шаг 4. _fetch_neighbors: для топ-K победителей подтягиваем N соседей
+#         одним батч-запросом — LLM получает полный контекст вокруг чанка
+#  Шаг 5. Fallback: если rank_bm25 не установлен — чистый векторный поиск
+#
+# Интерфейс не изменён: query + top_k → list[dict] с теми же полями.
 # =============================================================================
 def search_vector_db(query: str, top_k: int = 5) -> list:
     t0 = time.perf_counter()
+
+    retriever = get_hybrid_retriever()
+
+    if retriever is not None:
+
+        # ── Шаг 1: расширяем запрос синонимами ──────────────────────────────
+        # Берём только варианты с реальными заменами аббревиатур/синонимов.
+        # Суффикс "тарифное регулирование" из query_expander намеренно
+        # отсекаем — он добавляет шум когда вопрос уже про конкретный пункт.
+        try:
+            from core.query_expander import QueryExpander
+            expander = QueryExpander()
+            raw_variants = expander.expand(query)
+            # Оставляем только варианты где реально что-то заменилось
+            # (отличаются от исходного) и не содержат дописанных суффиксов
+            synonym_variants = [
+                v for v in raw_variants
+                if v != query and not v.endswith("тарифное регулирование")
+            ]
+        except Exception:
+            synonym_variants = []
+
+        # Оригинальный запрос первым, синонимы — после, максимум 3 варианта
+        unique_variants = [query] + synonym_variants[:2]
+
+        if len(unique_variants) > 1:
+            print(f"[SYNONYMS] {len(unique_variants)} вариантов: {unique_variants}")
+
+        # ── Шаг 2: гибридный поиск по всем вариантам ────────────────────────
+        # Для каждого варианта запроса делаем поиск и собираем кандидатов.
+        # Один кандидат может встретиться в нескольких вариантах — берём
+        # лучший (максимальный) RRF-score.
+        merged: dict = {}   # id → candidate dict
+        for variant in unique_variants:
+            for c in retriever.search(variant, top_k=top_k * 2):
+                cid = c["id"]
+                if cid not in merged or c["score"] > merged[cid]["score"]:
+                    merged[cid] = c
+
+        candidates = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+        t1 = time.perf_counter()
+        n_overlap = sum(1 for c in candidates if c['in_vector'] and c['in_bm25'])
+        print(f"[TIMING] hybrid_search ({len(unique_variants)} вар.): {t1-t0:.3f} сек "
+              f"({len(candidates)} уникальных кандидатов, "
+              f"vector+bm25={n_overlap} общих)")
+
+        # Если BM25 и вектор не пересекаются совсем — BM25 добавляет шум
+        if n_overlap == 0:
+            candidates = [c for c in candidates if c['in_vector']]
+            print("[HYBRID] Нет пересечений — только векторные результаты")
+
+        # ── Шаг 3: CrossEncoder реранкинг на КОРОТКОМ оригинальном тексте ───
+        reranker = get_reranker()
+        if reranker and candidates:
+            candidates = reranker.rerank(query, candidates, top_n=top_k)
+        else:
+            candidates = candidates[:top_k]
+
+        # ── Шаг 4: подтягиваем соседей ПОСЛЕ реранкинга ─────────────────────
+        radius     = _load_neighbor_radius()
+        collection = get_chroma_collection()
+        neighbors  = _fetch_neighbors(candidates, collection, radius)
+
+        # ── Шаг 5: форматируем в стандартный формат sources ─────────────────
+        sources = []
+        for c in candidates:
+            meta   = c.get("meta") or {}
+            doc_id = meta.get("doc_id") or meta.get("filename", "unknown")
+            cidx   = int(meta.get("chunk_index", 0))
+
+            # snippet = расширенный контекст (с соседями) если есть,
+            # иначе — оригинальный чанк
+            snippet = neighbors.get((doc_id, cidx), c.get("doc", ""))
+
+            pseudo_dist = round(max(0.0, 1.0 - c.get("score", 0.5) * 60), 3)
+            sources.append({
+                "snippet":      snippet[:2000] + ("..." if len(snippet) > 2000 else ""),
+                "file":         meta.get("filename", "Неизвестно"),
+                "page":         meta.get("page", ""),
+                "category":     meta.get("category", "Общее"),
+                "doc_type":     meta.get("doc_type", ""),
+                "article":      meta.get("article", ""),
+                "chunk_index":  meta.get("chunk_index", ""),
+                "distance":     pseudo_dist,
+            })
+
+        print(f"[TIMING] search_vector_db итого: {time.perf_counter()-t0:.3f} сек")
+        return sources
+
+    # ── Fallback: чистый векторный поиск ────────────────────────────────────
+    print("[TIMING] Fallback — чистый векторный поиск (rank_bm25 не установлен)")
+    return _pure_vector_search(query, top_k, t0)
+
+
+def _is_valid_answer(text: str) -> bool:
+    """Проверяет что ответ не сломан (петля, пустой, слишком короткий)."""
+    if not text or len(text.strip()) < 20:
+        return False
+    # Петля: один токен повторяется много раз
+    words = text.split()
+    if len(words) > 10:
+        for i in range(len(words) - 10):
+            if len(set(words[i:i+10])) <= 2:
+                return False
+    return True
+
+
+def _build_context(sources: list, max_chars: int = 3000) -> str:
+    """
+    Собирает контекст из источников с жёстким ограничением суммарного размера.
+
+    max_chars подобран под qwen3.5-9b (4096 токенов ≈ ~12 000 символов,
+    из которых ~6000 оставляем на системный промпт + вопрос + ответ).
+    При radius=2 один snippet = ~4500 симв., бюджет позволяет 1-2 источника
+    полностью или 3-5 источников с обрезкой — в зависимости от top_k.
+    """
+    parts = []
+    budget = max_chars
+    for i, src in enumerate(sources, 1):
+        if budget <= 0:
+            break
+        art     = f", пункт {src['article']}" if src.get('article') else ""
+        header  = f"[{i}] {src['file']}{art}:\n"
+        snippet = src.get("snippet", "")
+        # Если этот источник не влезает целиком — обрезаем, но не пропускаем
+        available = budget - len(header)
+        if available <= 100:
+            break
+        if len(snippet) > available:
+            snippet = snippet[:available] + "..."
+        parts.append(header + snippet)
+        budget -= len(header) + len(snippet)
+    return "\n\n---\n\n".join(parts)
+
+
+
+    """Оригинальный векторный поиск. Используется как fallback."""
+    if t0 is None:
+        t0 = time.perf_counter()
 
     collection = get_chroma_collection()
     if collection is None:
         return []
 
-    t1 = time.perf_counter()
+    t1        = time.perf_counter()
     embedding = embed_query(query)
     print(f"[TIMING] embed_query: {time.perf_counter()-t1:.3f} сек")
 
@@ -325,7 +858,7 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
         print(f"[VECTOR DB ERROR] {e}")
         return []
 
-    print(f"[TIMING] search_vector_db итого: {time.perf_counter()-t0:.3f} сек")
+    print(f"[TIMING] search_vector_db (pure vector) итого: {time.perf_counter()-t0:.3f} сек")
 
     if not results or not results.get("documents") or not results["documents"][0]:
         return []
@@ -387,19 +920,20 @@ def stream_ai_answer(
     with _cache_lock:
         if cache_key in _llm_cache:
             cached = _llm_cache[cache_key]
-            if datetime.now().timestamp() - cached.get("timestamp", 0) < 604800:
+            answer = cached.get("answer", "")
+            fresh  = datetime.now().timestamp() - cached.get("timestamp", 0) < 604800
+            if fresh and _is_valid_answer(answer):
                 print(f"[CACHE HIT stream] {model}")
-                yield cached["answer"]
+                yield answer
                 return
+            elif not _is_valid_answer(answer):
+                print(f"[CACHE] Сломанный ответ в кэше — удаляем, генерируем заново")
+                del _llm_cache[cache_key]
 
     # Строим промпт (та же логика что в generate_ai_answer)
     try:
         prompts = load_prompts()
-        context_parts = []
-        for i, src in enumerate(sources[:6], 1):
-            art = f", пункт {src['article']}" if src.get('article') else ""
-            context_parts.append(f"[{i}] {src['file']}{art}:\n{src['snippet']}")
-        context = "\n\n---\n\n".join(context_parts)
+        context = _build_context(sources)
 
         system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
         user_content  = prompts.get("advisor_user",   DEFAULT_PROMPTS["advisor_user"]).format(
@@ -410,7 +944,6 @@ def stream_ai_answer(
         extra_body = {}
         if is_qwen3:
             user_content = "/no_think\n\n" + user_content
-            # Пробуем все известные способы отключить thinking в LM Studio
             extra_body = {
                 "enable_thinking": False,
                 "chat_template_kwargs": {"enable_thinking": False},
@@ -425,17 +958,23 @@ def stream_ai_answer(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            frequency_penalty=1.2,   # штраф за повторения — предотвращает "CL CL CL..."
             stream=True,
         )
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        print(f"[LLM stream] {model} | max_tokens={max_tokens}")
+        print(f"[LLM stream] {model} | max_tokens={max_tokens} | "
+              f"промпт ~{len(system_prompt)+len(user_content)} симв. / "
+              f"~{(len(system_prompt)+len(user_content))//4} токенов (оценка)")
         t0 = time.perf_counter()
 
-        full_text    = ""
-        buf          = ""     # буфер для обнаружения <think>-тегов
-        in_think     = False  # флаг: сейчас внутри <think>...</think>
+        full_text  = ""
+        buf        = ""
+        in_think   = False
+        # Детектор петли: если один токен повторяется >20 раз подряд — обрываем
+        last_token = ""
+        repeat_cnt = 0
 
         response = client.chat.completions.create(**kwargs)
 
@@ -443,6 +982,22 @@ def stream_ai_answer(
             delta = chunk.choices[0].delta.content
             if not delta:
                 continue
+
+            # Проверяем петлю
+            stripped = delta.strip()
+            if stripped and stripped == last_token:
+                repeat_cnt += 1
+                if repeat_cnt >= 20:
+                    full_text += "\n\n⚠️ [Генерация прервана: модель зациклилась. " \
+                                 "Попробуйте переформулировать вопрос или уменьшить " \
+                                 "радиус соседних чанков в настройках.]"
+                    yield "\n\n⚠️ [Генерация прервана: модель зациклилась. " \
+                          "Попробуйте переформулировать вопрос или уменьшить " \
+                          "радиус соседних чанков в настройках.]"
+                    break
+            else:
+                last_token = stripped
+                repeat_cnt = 0
 
             full_text += delta
             buf       += delta
@@ -455,13 +1010,13 @@ def stream_ai_answer(
                         in_think = False
                         buf = buf[end + len("</think>"):]
                     else:
-                        buf = ""   # думаем — ничего не выводим
+                        buf = ""
                         break
                 else:
                     start = buf.find("<think>")
                     if start >= 0:
                         if start > 0:
-                            yield buf[:start]   # текст до тега
+                            yield buf[:start]
                         in_think = True
                         buf = buf[start + len("<think>"):]
                     else:
@@ -471,16 +1026,24 @@ def stream_ai_answer(
 
         print(f"[LLM stream] готово за {time.perf_counter()-t0:.2f} сек")
 
-        # Сохраняем в кэш очищенный ответ
         answer = strip_thinking_blocks(full_text)
-        with _cache_lock:
-            _llm_cache[cache_key] = {
-                "answer":    answer,
-                "timestamp": datetime.now().timestamp(),
-                "query":     query,
-                "model":     model,
-            }
-            save_llm_cache()
+
+        # Не кэшируем сломанные ответы (петли, пустые, слишком короткие)
+        is_broken = (
+            not answer.strip()
+            or len(answer) < 20
+            or answer.count("CL ") > 10
+            or "зациклилась" in answer
+        )
+        if not is_broken:
+            with _cache_lock:
+                _llm_cache[cache_key] = {
+                    "answer":    answer,
+                    "timestamp": datetime.now().timestamp(),
+                    "query":     query,
+                    "model":     model,
+                }
+                save_llm_cache()
 
     except Exception as e:
         err = str(e)
@@ -504,7 +1067,7 @@ def generate_ai_answer(
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
     temperature = temperature if temperature is not None else config.get("temperature", 0.3)
-    max_tokens  = config.get("max_tokens", 2048)   # НЕ урезаем — берём из конфига
+    max_tokens  = config.get("max_tokens", 2048)
     timeout     = config.get("timeout_seconds", 300)
 
     if _SOURCES_ONLY_MODE:
@@ -514,25 +1077,24 @@ def generate_ai_answer(
     with _cache_lock:
         if cache_key in _llm_cache:
             cached = _llm_cache[cache_key]
-            if datetime.now().timestamp() - cached.get("timestamp", 0) < 604800:
+            answer = cached.get("answer", "")
+            fresh  = datetime.now().timestamp() - cached.get("timestamp", 0) < 604800
+            if fresh and _is_valid_answer(answer):
                 print(f"[CACHE HIT] {model}")
-                return cached["answer"]
+                return answer
+            elif not _is_valid_answer(answer):
+                print(f"[CACHE] Сломанный ответ — удаляем, генерируем заново")
+                del _llm_cache[cache_key]
 
     try:
         prompts = load_prompts()
-        context_parts = []
-        for i, src in enumerate(sources[:6], 1):
-            art = f", пункт {src['article']}" if src.get('article') else ""
-            context_parts.append(f"[{i}] {src['file']}{art}:\n{src['snippet']}")
-        context = "\n\n---\n\n".join(context_parts)
+        context = _build_context(sources)
 
         system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
         user_content  = prompts.get("advisor_user",   DEFAULT_PROMPTS["advisor_user"]).format(
             query=query, context=context,
         )
 
-        # Qwen3: отключаем thinking mode
-        # /no_think должен быть в USER-сообщении (не в system!)
         is_qwen3   = "qwen3" in model.lower() or "qwen/qwen3" in model.lower()
         extra_body = {}
         if is_qwen3:
@@ -553,6 +1115,7 @@ def generate_ai_answer(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            frequency_penalty=1.2,   # штраф за повторения
         )
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -572,11 +1135,18 @@ def generate_ai_answer(
 
         answer = strip_thinking_blocks(raw_content)
 
-        with _cache_lock:
-            _llm_cache[cache_key] = {
-                "answer": answer, "timestamp": datetime.now().timestamp(),
-                "query": query, "model": model,
-            }
+        # Не кэшируем сломанные ответы
+        is_broken = (
+            not answer.strip()
+            or len(answer) < 20
+            or answer.count("CL ") > 10
+        )
+        if not is_broken:
+            with _cache_lock:
+                _llm_cache[cache_key] = {
+                    "answer": answer, "timestamp": datetime.now().timestamp(),
+                    "query": query, "model": model,
+                }
             save_llm_cache()
 
         return answer
@@ -632,7 +1202,7 @@ def ask_question(
             print(f"[ASK] FAQ за {time.perf_counter()-t_start:.2f} сек")
             return result
 
-    # Векторный поиск
+    # Гибридный поиск (BM25 + vector + reranking)
     sources = search_vector_db(query, top_k=top_k)
     result["sources"] = sources
 
