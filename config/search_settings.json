@@ -1,0 +1,7 @@
+{
+  "bm25_weight": 1.2,
+  "candidates_per_var": 35,
+  "context_max_chars": 20000,
+  "reranker_enabled": true,
+  "reranker_model": "BAAI/bge-reranker-v2-m3"
+}

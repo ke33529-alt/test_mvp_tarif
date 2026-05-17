@@ -100,11 +100,26 @@ def get_embedding_function():
         model_name=EMBEDDING_MODEL
     )
 
+# ── Синглтон клиента ChromaDB ─────────────────────────────────────────────────
+# PersistentClient нельзя открывать несколько раз на одну папку —
+# это вызывает "already exists" и конфликты. Один клиент на весь процесс.
+_chroma_client = None
+_chroma_client_lock = __import__('threading').Lock()
+
+def _get_chroma_client():
+    global _chroma_client
+    if _chroma_client is not None:
+        return _chroma_client
+    with _chroma_client_lock:
+        if _chroma_client is None:
+            import chromadb
+            os.makedirs(VECTOR_DB_DIR, exist_ok=True)
+            _chroma_client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+        return _chroma_client
+
 def initialize_db():
     """Инициализирует базу данных ChromaDB с правильной embedding function"""
-    import chromadb
-    os.makedirs(VECTOR_DB_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+    client = _get_chroma_client()
     ef = get_embedding_function()
     try:
         collection = client.get_collection(name="tariff_docs", embedding_function=ef)
@@ -177,47 +192,56 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
 
 def _snap_to_boundary(text: str, start: int, end: int, settings: dict) -> int:
     """
-    Возвращает позицию обрезки в диапазоне [start+1 .. end].
-    ГАРАНТИРУЕТ продвижение минимум на 1 символ от start.
+    Стратегия: сначала ищем границу НАЗАД в «хорошей» зоне [min_back..end],
+    не нашли — ищем ВПЕРЁД от end. Чанк растянется, но не разрежется.
 
-    no_cut_paragraph → ищет \\n\\n в окне [start .. end]
-    no_cut_sentence  → ищет . ! ? в окне [start .. end]
-    no_cut_word      → ищет пробел в окне [start .. end]
+    min_back = start + 3/4 окна — достаточно близко к концу окна,
+    чтобы rfind не поймал точку в дате у самого начала окна.
     """
     if end >= len(text):
         return len(text)
 
-    # Минимальное продвижение — половина окна, чтобы не застрять
-    min_end = start + max(1, (end - start) // 2)
+    window = end - start
+    # Ищем назад только в последней четверти окна — исключаем точки в датах
+    min_back = start + (window * 3 // 4)
 
-    slice_ = text[start:end]
-
+    # ── Абзац: \n\n ──────────────────────────────────────────────────────────
     if settings.get("no_cut_paragraph", False):
-        pos = slice_.rfind("\n\n")
-        if pos > 0:
-            candidate = start + pos + 2
-            if candidate > min_end:
-                return candidate
+        pos = text.rfind("\n\n", min_back, end)
+        if pos >= min_back:
+            return pos + 2
+        pos = text.find("\n\n", end)                   # → вперёд
+        if pos != -1:
+            return pos + 2
 
+    # ── Предложение: . ! ? ───────────────────────────────────────────────────
     if settings.get("no_cut_sentence", True):
-        best = -1
+        best_back = -1
         for punct in (".", "!", "?"):
-            pos = slice_.rfind(punct)
-            if pos > best:
-                best = pos
-        if best > 0:
-            candidate = start + best + 1
-            if candidate > min_end:
-                return candidate
+            p = text.rfind(punct, min_back, end)
+            if p > best_back:
+                best_back = p
+        if best_back >= min_back:
+            return best_back + 1
+        # Не нашли в хорошей зоне — ищем вперёд (чанк станет немного больше)
+        best_fwd = len(text)
+        for punct in (".", "!", "?"):
+            p = text.find(punct, end)
+            if p != -1 and p < best_fwd:
+                best_fwd = p
+        if best_fwd < len(text):
+            return best_fwd + 1
 
+    # ── Слово: пробел ────────────────────────────────────────────────────────
     if settings.get("no_cut_word", True):
-        pos = slice_.rfind(" ")
-        if pos > 0:
-            candidate = start + pos + 1
-            if candidate > min_end:
-                return candidate
+        pos = text.rfind(" ", min_back, end)
+        if pos >= min_back:
+            return pos + 1
+        pos = text.find(" ", end)                         # → вперёд
+        if pos != -1:
+            return pos + 1
 
-    # Граница не найдена в «хорошей» зоне — режем жёстко по end
+    # Все опции выключены или граница не найдена — жёсткий разрез
     return end
 
 
@@ -245,11 +269,8 @@ def _split_fixed(text: str, size: int, overlap: int = 0, settings: dict = None) 
         if chunk:
             chunks.append(chunk)
 
-        # Если достигли конца файла — выходим. Без этого при overlap>0
-        # pos зависает на (len(text) - overlap) и цикл крутится до лимита 2000.
         if end >= len(text):
             break
-
         pos = max(end - overlap, end - size + 1) if overlap else end
 
     if len(chunks) >= MAX_CHUNKS_PER_FILE:
@@ -378,6 +399,12 @@ def index_category(category="npa"):
             continue
         file_path = os.path.join(folder, filename)
         if os.path.isfile(file_path):
+            # Удаляем старые чанки файла перед переиндексацией —
+            # иначе при смене настроек чанкования старые чанки накапливаются
+            try:
+                remove_file_from_index(filename)
+            except Exception:
+                pass
             result = index_file(file_path, category)
             results.append({"file": filename, "result": result})
     return {"status": "success", "files": results}
@@ -385,7 +412,7 @@ def index_category(category="npa"):
 def get_index_stats():
     """Возвращает статистику индекса (для совместимости с app.py)"""
     try:
-        client, collection = initialize_db()
+        _, collection = initialize_db()
         count = collection.count()
         return {"status": "success", "documents": count}
     except Exception as e:
@@ -394,11 +421,14 @@ def get_index_stats():
 def clear_index():
     """Очищает индекс (для совместимости с app.py)"""
     try:
-        import chromadb
-        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
-        client.delete_collection(name="tariff_docs")
+        client = _get_chroma_client()
+        try:
+            client.delete_collection(name="tariff_docs")
+        except Exception:
+            pass  # коллекции не было — не страшно
         ef = get_embedding_function()
         client.create_collection(name="tariff_docs", embedding_function=ef)
+        print("[INDEX] Индекс очищен и пересоздан")
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -406,8 +436,7 @@ def clear_index():
 def remove_file_from_index(filename: str):
     """Удаляет все чанки файла из индекса по имени файла"""
     try:
-        import chromadb
-        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+        client = _get_chroma_client()
         ef = get_embedding_function()
         try:
             collection = client.get_collection(name="tariff_docs", embedding_function=ef)
@@ -608,8 +637,7 @@ def rebuild_index():
 def get_chunks_by_file(limit_per_file: int = 10) -> dict:
     """Возвращает информацию о чанках в разрезе файлов"""
     try:
-        import chromadb
-        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+        client = _get_chroma_client()
         ef = get_embedding_function()
         try:
             collection = client.get_collection(name="tariff_docs", embedding_function=ef)
@@ -668,8 +696,7 @@ def get_chunks_by_file(limit_per_file: int = 10) -> dict:
 def get_chunk_stats() -> dict:
     """Возвращает общую статистику по чанкам"""
     try:
-        import chromadb
-        client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+        client = _get_chroma_client()
         ef = get_embedding_function()
         try:
             collection = client.get_collection(name="tariff_docs", embedding_function=ef)

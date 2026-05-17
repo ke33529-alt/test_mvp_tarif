@@ -804,7 +804,7 @@ elif main_choice == "🛠 Админка":
     else:
         admin_subtab = st.radio(
             "Раздел админки",
-            ["📈 Аналитика ИИ", "📚 Документы", "⚙️ Настройки чанкования", "📝 Промпты", "📝 Отзывы", "⚙️ Настройки"],
+            ["📈 Аналитика ИИ", "📚 Документы", "⚙️ Настройки чанкования", "🎯 Поиск и реранкинг", "📝 Промпты", "📝 Отзывы", "⚙️ Настройки"],
             horizontal=True,
         )
 
@@ -1073,13 +1073,26 @@ elif main_choice == "🛠 Админка":
                             from core.indexer import index_category
                             res = index_category(CATEGORY_FOLDERS[reindex_cat])
                             if res["status"] == "success":
-                                st.success(f"✅ Файлов: {len(res['files'])}")
+                                _fi_count = len(res.get("files", []))
+                                _chunk_count = sum(
+                                    r.get("result", {}).get("chunks", 0)
+                                    for r in res.get("files", [])
+                                    if isinstance(r.get("result"), dict)
+                                )
+                                st.session_state["_mass_reindex_msg"] = (
+                                    f"✅ Раздел **{reindex_cat}** переиндексирован: "
+                                    f"{_fi_count} файл(ов), {_chunk_count} чанков"
+                                )
                                 try:
                                     from core.advisor import invalidate_hybrid_retriever
                                     invalidate_hybrid_retriever()
                                 except Exception: pass
+                                st.rerun()
                             else: st.error(f"❌ {res.get('message','')}")
                         except Exception as e: st.error(f"❌ {e}")
+                if st.session_state.get("_mass_reindex_msg"):
+                    st.success(st.session_state["_mass_reindex_msg"])
+                    del st.session_state["_mass_reindex_msg"]
                 st.divider()
                 if st.button("🗑️ Очистить весь индекс", type="secondary", use_container_width=True, key="clear_index_btn"):
                     st.session_state._confirm_clear_index = True
@@ -1095,16 +1108,20 @@ elif main_choice == "🛠 Админка":
                                     clear_index()
                                 except Exception: pass
                                 try:
-                                    from core.advisor import invalidate_hybrid_retriever
-                                    invalidate_hybrid_retriever()
+                                    from core.advisor import invalidate_chroma_collection
+                                    invalidate_chroma_collection()
                                 except Exception: pass
                                 st.session_state._confirm_clear_index = False
+                                st.session_state["_mass_clear_msg"] = "🗑️ Весь индекс очищен. Файлы на диске сохранены."
                                 st.rerun()
                         with cb:
                             if st.button("← Отмена", use_container_width=True, key="cancel_clear_idx"):
                                 st.session_state._confirm_clear_index = False
                                 st.rerun()
                     _confirm_clear()
+                if st.session_state.get("_mass_clear_msg"):
+                    st.success(st.session_state["_mass_clear_msg"])
+                    del st.session_state["_mass_clear_msg"]
 
         elif admin_subtab == "⚙️ Настройки чанкования":
             st.header("⚙️ Настройки чанкования документов")
@@ -1187,12 +1204,20 @@ elif main_choice == "🛠 Админка":
                         "no_cut_paragraph":   no_cut_paragraph,
                     }
                     with open(config_file,'w',encoding='utf-8') as f: json.dump(config,f,ensure_ascii=False,indent=2)
-                    st.toast("✅ Параметры сохранены. Переиндексируйте документы.", icon="💾")
+                    st.toast("✅ Параметры сохранены — не забудьте переиндексировать документы", icon="💾")
+                    st.session_state["_settings_saved"] = True
                     st.rerun()
+                if st.session_state.get("_settings_saved"):
+                    st.success("✅ Параметры чанкования сохранены. Для применения — переиндексируйте документы в разделе **Документы → Массовые операции**.")
+                    st.session_state["_settings_saved"] = False
                 if st.button("🔄 Сбросить к умолчаниям", key="reset_config", use_container_width=True):
                     if os.path.exists(config_file): os.remove(config_file)
                     st.toast("✅ Конфигурация сброшена", icon="🔄")
+                    st.session_state["_settings_reset"] = True
                     st.rerun()
+                if st.session_state.get("_settings_reset"):
+                    st.info("🔄 Настройки сброшены к умолчаниям.")
+                    st.session_state["_settings_reset"] = False
             with tab5:
                 st.subheader("🔍 Просмотр чанков")
                 try:
@@ -1363,6 +1388,181 @@ elif main_choice == "🛠 Админка":
 
                 except Exception as e:
                     st.error(f"❌ {type(e).__name__}: {e}")
+
+        elif admin_subtab == "🎯 Поиск и реранкинг":
+            st.header("🎯 Настройки поиска и реранкинга")
+            st.info("Изменения применяются сразу к следующему запросу. Перезапуск не нужен.")
+
+            _sr_file = os.path.join("config", "search_settings.json")
+            _sr_defaults = {
+                "bm25_weight":        1.5,
+                "candidates_per_var": 15,
+                "context_max_chars":  8000,
+                "reranker_enabled":   True,
+            }
+            if os.path.exists(_sr_file):
+                try:
+                    with open(_sr_file, "r", encoding="utf-8") as f:
+                        _sr_cur = {**_sr_defaults, **json.load(f)}
+                except Exception:
+                    _sr_cur = dict(_sr_defaults)
+            else:
+                _sr_cur = dict(_sr_defaults)
+
+            st.subheader("⚖️ Гибридный поиск (BM25 + вектор)")
+            _bm25_w = st.slider(
+                "Вес BM25 относительно векторного поиска",
+                min_value=0.5, max_value=3.0, step=0.1,
+                value=float(_sr_cur["bm25_weight"]),
+                help="1.0 = равный вес. >1 = BM25 важнее (точное вхождение слов). <1 = вектор важнее (семантика).",
+                key="sr_bm25_weight",
+            )
+            st.caption(f"{'🔤 Точные слова важнее' if _bm25_w > 1.0 else '🧠 Семантика важнее' if _bm25_w < 1.0 else '⚖️ Равный вес'}")
+
+            _cands = st.slider(
+                "Кандидатов на вариант запроса",
+                min_value=5, max_value=40, step=5,
+                value=int(_sr_cur["candidates_per_var"]),
+                help="Сколько чанков отбирается от каждого варианта запроса перед реранкингом. Больше = точнее, но медленнее.",
+                key="sr_candidates",
+            )
+
+            st.divider()
+            st.subheader("🔁 Реранкинг (CrossEncoder)")
+            _reranker_on = st.toggle(
+                "Включить реранкинг",
+                value=bool(_sr_cur["reranker_enabled"]),
+                help="CrossEncoder переставляет кандидатов по реальной релевантности запросу. Отключите если медленно.",
+                key="sr_reranker_on",
+            )
+            if _reranker_on:
+                try:
+                    from core.advisor import get_reranker_status as _grs, get_reranker as _gr, invalidate_reranker as _ir
+                    _status = _grs()
+                    if _status["loaded"]:
+                        st.success(f"✅ Загружена модель: `{_status['model_name']}`")
+                    else:
+                        with st.spinner("⏳ Загружаем реранкер..."):
+                            _rm = _gr()
+                        if _rm:
+                            st.success(f"✅ Загружена модель: `{_rm.model_name}`")
+                        else:
+                            _last_err = _status.get("last_error", "")
+                            st.warning("⚠️ Реранкер не загружен")
+                            if _last_err:
+                                st.code(_last_err, language="text")
+                            if st.button("🔄 Попробовать снова", key="sr_reload_reranker"):
+                                _ir()
+                                st.rerun()
+                except Exception as _e:
+                    st.warning(f"⚠️ Ошибка импорта: {_e}")
+
+            else:
+                st.caption("Результаты ранжируются только по RRF-score (BM25 + вектор).")
+
+            st.divider()
+            st.subheader("🤖 Модель реранкера")
+            try:
+                from core.advisor import AVAILABLE_RERANKER_MODELS as _ARM, get_reranker_status as _grs2
+                _model_ids    = [m["id"]    for m in _ARM]
+                _model_labels = [m["label"] for m in _ARM]
+                _model_descs  = {m["id"]: m["desc"] for m in _ARM}
+                _cur_model    = _sr_cur.get("reranker_model", _model_ids[0])
+                _cur_idx      = _model_ids.index(_cur_model) if _cur_model in _model_ids else 0
+
+                _sel_label = st.radio(
+                    "Выберите модель реранкера",
+                    _model_labels,
+                    index=_cur_idx,
+                    key="sr_reranker_model",
+                )
+                _sel_model_id = _model_ids[_model_labels.index(_sel_label)]
+                st.caption(f"ℹ️ {_model_descs.get(_sel_model_id, '')}")
+
+                # Кнопка переключения — сброс синглтона + загрузка новой модели
+                _loaded_status = _grs2()
+                _currently_loaded = _loaded_status.get("model_name", "")
+                _model_changed = _sel_model_id != _cur_model
+                _not_this_model = _loaded_status["loaded"] and _currently_loaded != _sel_model_id
+
+                if _model_changed or _not_this_model:
+                    if st.button(
+                        f"⚡ Переключить на выбранную модель",
+                        key="sr_switch_model",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        from core.advisor import invalidate_reranker as _ir3, get_reranker as _gr2
+                        _ir3()
+                        # Сохраняем новую модель в конфиг
+                        _new_sr_model = {**_sr_cur, "reranker_model": _sel_model_id}
+                        os.makedirs("config", exist_ok=True)
+                        with open(_sr_file, "w", encoding="utf-8") as f:
+                            json.dump(_new_sr_model, f, ensure_ascii=False, indent=2)
+                        st.session_state["_search_settings"] = _new_sr_model
+                        with st.spinner(f"⏳ Загружаем {_sel_model_id}..."):
+                            _new_rm = _gr2()
+                        if _new_rm:
+                            st.session_state["_model_switched"] = _new_rm.model_name
+                        else:
+                            st.session_state["_model_switch_failed"] = _sel_model_id
+                        st.rerun()
+
+                if st.session_state.get("_model_switched"):
+                    st.success(f"✅ Модель переключена: `{st.session_state['_model_switched']}`")
+                    del st.session_state["_model_switched"]
+                if st.session_state.get("_model_switch_failed"):
+                    st.error(f"❌ Не удалось загрузить `{st.session_state['_model_switch_failed']}` — проверьте консоль")
+                    del st.session_state["_model_switch_failed"]
+
+            except Exception as _me:
+                st.warning(f"Не удалось загрузить список моделей: {_me}")
+                _sel_model_id = _sr_cur.get("reranker_model", "DiTy/cross-encoder-russian-msmarco")
+
+            st.divider()
+            st.subheader("📄 Контекст для LLM")
+            _ctx = st.slider(
+                "Максимум символов контекста",
+                min_value=2000, max_value=20000, step=1000,
+                value=int(_sr_cur["context_max_chars"]),
+                help="Сколько символов из найденных чанков передаётся LLM. Больше = полнее ответ, но медленнее генерация.",
+                key="sr_context",
+            )
+            _tok_est = _ctx // 3
+            st.caption(f"≈ {_tok_est} токенов контекста · при radius=1 и чанке 1750 симв. один источник = ~5250 символов")
+
+            st.divider()
+            _sc1, _sc2 = st.columns(2)
+            with _sc1:
+                if st.button("💾 Сохранить остальные настройки", type="primary", use_container_width=True, key="sr_save"):
+                    _new_sr = {
+                        "bm25_weight":        _bm25_w,
+                        "candidates_per_var": _cands,
+                        "context_max_chars":  _ctx,
+                        "reranker_enabled":   _reranker_on,
+                        "reranker_model":     _sel_model_id,
+                    }
+                    os.makedirs("config", exist_ok=True)
+                    with open(_sr_file, "w", encoding="utf-8") as f:
+                        json.dump(_new_sr, f, ensure_ascii=False, indent=2)
+                    st.session_state["_search_settings"] = _new_sr
+                    st.session_state["_sr_saved"] = True
+                    st.rerun()
+            with _sc2:
+                if st.button("🔄 Сбросить к умолчаниям", use_container_width=True, key="sr_reset"):
+                    if os.path.exists(_sr_file):
+                        os.remove(_sr_file)
+                    st.session_state.pop("_search_settings", None)
+                    from core.advisor import invalidate_reranker as _ir_reset
+                    _ir_reset()
+                    st.session_state["_sr_reset"] = True
+                    st.rerun()
+            if st.session_state.get("_sr_saved"):
+                st.success("✅ Настройки поиска сохранены — применятся к следующему запросу.")
+                del st.session_state["_sr_saved"]
+            if st.session_state.get("_sr_reset"):
+                st.info("🔄 Настройки сброшены к умолчаниям.")
+                del st.session_state["_sr_reset"]
 
         elif admin_subtab == "📝 Промпты":
             st.header("📝 Управление промптами")

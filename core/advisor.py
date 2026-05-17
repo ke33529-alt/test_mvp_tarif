@@ -143,6 +143,26 @@ _ST_MODEL_KEY = "__regula_ai_st_model__"
 _st_lock      = threading.Lock()
 
 
+def _get_device() -> str:
+    """Автодетект GPU. Возвращает 'cuda', 'mps' (Apple Silicon) или 'cpu'."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            print(f"[DEVICE] GPU найден: {name} — используем cuda")
+            return "cuda"
+        if torch.backends.mps.is_available():
+            print("[DEVICE] Apple Silicon GPU — используем mps")
+            return "mps"
+    except Exception:
+        pass
+    print("[DEVICE] GPU не найден — используем cpu")
+    return "cpu"
+
+
+_DEVICE = _get_device()   # определяем один раз при старте модуля
+
+
 def get_st_model():
     if sys.modules.get(_ST_MODEL_KEY) is not None:
         return sys.modules[_ST_MODEL_KEY]
@@ -155,10 +175,10 @@ def get_st_model():
         print(f"[EMBED] Загрузка модели {EMBEDDING_MODEL} (один раз)...")
         try:
             from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(EMBEDDING_MODEL)
+            model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")  # CPU: не конкурирует с LLM за VRAM
             model.encode(["прогрев"], normalize_embeddings=True)
             sys.modules[_ST_MODEL_KEY] = model
-            print(f"[EMBED] Готово за {time.perf_counter()-t0:.1f} сек. Далее ~0.1 сек/запрос.")
+            print(f"[EMBED] Готово за {time.perf_counter()-t0:.1f} сек на {_DEVICE}. Далее ~0.1 сек/запрос.")
         except Exception as e:
             print(f"[EMBED ERROR] {e}")
             return None
@@ -175,44 +195,39 @@ def embed_query(query: str):
 
 
 # =============================================================================
-# ChromaDB — синглтон коллекции
+# ChromaDB — единый клиент через indexer (два PersistentClient → "already exists")
 # =============================================================================
-_chroma_client     = None
+_chroma_lock       = __import__("threading").Lock()
 _chroma_collection = None
-_chroma_lock       = threading.Lock()
 
 
 def get_chroma_collection():
-    global _chroma_client, _chroma_collection
+    global _chroma_collection
     with _chroma_lock:
         if _chroma_collection is not None:
             return _chroma_collection
-
-        import chromadb
         t0 = time.perf_counter()
         try:
-            _chroma_client = chromadb.PersistentClient(
-                path=CHROMA_DB_PATH,
-                settings=chromadb.Settings(anonymized_telemetry=False, allow_reset=True),
-            )
-        except Exception:
+            from core.indexer import _get_chroma_client
+            client = _get_chroma_client()
             try:
-                _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-            except Exception as e:
-                print(f"[CHROMA ERROR] {e}")
-                return None
+                _chroma_collection = client.get_collection("tariff_docs")
+            except Exception:
+                _chroma_collection = client.create_collection("tariff_docs")
+            print(f"[CHROMA] Готово за {time.perf_counter()-t0:.2f} сек ({_chroma_collection.count()} чанков)")
+            return _chroma_collection
+        except Exception as e:
+            print(f"[CHROMA ERROR] {e}")
+            return None
 
-        try:
-            _chroma_collection = _chroma_client.get_collection("tariff_docs")
-        except Exception:
-            try:
-                _chroma_collection = _chroma_client.create_collection("tariff_docs")
-            except Exception as e:
-                print(f"[CHROMA ERROR] {e}")
-                return None
 
-        print(f"[CHROMA] Готово за {time.perf_counter()-t0:.2f} сек ({_chroma_collection.count()} чанков)")
-        return _chroma_collection
+def invalidate_chroma_collection():
+    global _chroma_collection
+    with _chroma_lock:
+        _chroma_collection = None
+    invalidate_hybrid_retriever()
+    print("[CHROMA] Коллекция сброшена.")
+
 
 
 # =============================================================================
@@ -279,7 +294,8 @@ class HybridRetriever:
         """
         vector_hits = self._vector_search(query, top_k)
         bm25_hits   = self._bm25_search(query, top_k) if self.bm25 else {}
-        return self._rrf_merge(vector_hits, bm25_hits)
+        _bw = _load_search_settings().get("bm25_weight", 1.5)
+        return self._rrf_merge(vector_hits, bm25_hits, bm25_weight=_bw)
 
     def _vector_search(self, query: str, top_k: int) -> dict:
         """Возвращает {id: {"doc", "meta", "vector_rank"}}"""
@@ -331,7 +347,7 @@ class HybridRetriever:
             return {}
 
     @staticmethod
-    def _rrf_merge(vector_hits: dict, bm25_hits: dict, k: int = 60) -> list:
+    def _rrf_merge(vector_hits: dict, bm25_hits: dict, k: int = 60, bm25_weight: float = 1.0) -> list:
         """
         Reciprocal Rank Fusion:
         score = 1/(k + rank_vector + 1) + 1/(k + rank_bm25 + 1)
@@ -343,7 +359,7 @@ class HybridRetriever:
             if id_ in vector_hits:
                 score += 1.0 / (k + vector_hits[id_]["vector_rank"] + 1)
             if id_ in bm25_hits:
-                score += 1.0 / (k + bm25_hits[id_]["bm25_rank"] + 1)
+                score += bm25_weight / (k + bm25_hits[id_]["bm25_rank"] + 1)
             source = vector_hits.get(id_) or bm25_hits.get(id_)
             scored.append({
                 "id":        id_,
@@ -401,67 +417,109 @@ def invalidate_hybrid_retriever():
 _RERANKER_KEY  = "__regula_ai_reranker__"
 _reranker_lock = threading.Lock()
 
-# Приоритет: скорость → качество → отключение
-# L-6 (6 слоёв) ~в 2 раза быстрее L-12; для нормативных запросов разница
-# в качестве несущественна, а выигрыш по времени — 3-8 сек на CPU.
-_RERANKER_MODELS = [
-    "cross-encoder/ms-marco-MiniLM-L-6-v2",          # быстро, ~3-5 сек на CPU
-    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",   # качественнее, но медленнее
-]
+# Список моделей — см. AVAILABLE_RERANKER_MODELS и _get_reranker_models_list()
 
 
 class Reranker:
-    """CrossEncoder для ранжирования финального списка кандидатов."""
+    """CrossEncoder для ранжирования кандидатов. torch.compile убран — ломает predict."""
 
     def __init__(self, model_name: str):
         from sentence_transformers import CrossEncoder
         t0 = time.perf_counter()
-        self.model      = CrossEncoder(model_name)
+        self.model      = CrossEncoder(model_name, device=_DEVICE)
         self.model_name = model_name
-        # Прогрев
-        self.model.predict([("тест", "тест прогрев")])
-        print(f"[RERANKER] Загружен {model_name} за {time.perf_counter()-t0:.1f} сек")
+        if _DEVICE == "cuda":
+            try:
+                self.model.model = self.model.model.half()
+                print(f"[RERANKER] FP16 включён")
+            except Exception as e:
+                print(f"[RERANKER] FP16 недоступен: {e}")
+        try:
+            self.model.predict([("тест", "тест")], batch_size=1, show_progress_bar=False)
+        except Exception as _w:
+            print(f"[RERANKER] Прогрев пропущен: {type(_w).__name__}")
+        try:
+            _dev = next(self.model.model.parameters()).device
+        except Exception:
+            _dev = _DEVICE
+        print(f"[RERANKER] Загружен {model_name} на {_dev} за {time.perf_counter()-t0:.1f} сек")
 
     def rerank(self, query: str, candidates: list, top_n: int = 5) -> list:
         if not candidates:
             return candidates
-        t0 = time.perf_counter()
-        # Обрезаем текст до 350 символов: CrossEncoder обрабатывает каждый
-        # символ через BERT — 800 симв. vs 350 симв. даёт ~2x ускорение
-        # без потери качества ранжирования (структура нормативного текста
-        # раскрывается в первых предложениях).
-        pairs  = [(query, c["doc"][:350]) for c in candidates]
-        scores = self.model.predict(pairs)
-        for candidate, score in zip(candidates, scores):
-            candidate["rerank_score"] = float(score)
+        t0    = time.perf_counter()
+        pairs = [(query, c["doc"]) for c in candidates]
+        try:
+            scores = self.model.predict(pairs, batch_size=max(len(pairs), 32), show_progress_bar=False)
+        except Exception as e:
+            print(f"[RERANKER] predict упал: {type(e).__name__}: {e} — без реранкинга")
+            return candidates[:top_n]
+        try:
+            scores = list(scores.cpu().numpy() if hasattr(scores, "cpu") else scores)
+        except Exception:
+            scores = list(scores)
+        for c, s in zip(candidates, scores):
+            c["rerank_score"] = float(s)
         result = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:top_n]
-        print(f"[RERANKER] {len(candidates)} -> {top_n} кандидатов за {time.perf_counter()-t0:.2f} сек")
+        scores_str = ", ".join(f"{c['rerank_score']:.2f}" for c in result)
+        print(f"[RERANKER] {self.model_name}: {len(candidates)}→{top_n} за {time.perf_counter()-t0:.2f}с | [{scores_str}]")
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         return result
 
 
 def get_reranker() -> Optional[Reranker]:
     """Синглтон Reranker с автовыбором модели."""
     existing = sys.modules.get(_RERANKER_KEY)
-    if existing is not None:
+    # Проверяем именно на Reranker, False = прошлая ошибка → не блокируем навсегда
+    if isinstance(existing, Reranker):
         return existing
 
     with _reranker_lock:
         existing = sys.modules.get(_RERANKER_KEY)
-        if existing is not None:
+        if isinstance(existing, Reranker):
             return existing
 
-        for model_name in _RERANKER_MODELS:
+        for model_name in _get_reranker_models_list():
             try:
                 reranker = Reranker(model_name)
                 sys.modules[_RERANKER_KEY] = reranker
                 return reranker
             except Exception as e:
-                print(f"[RERANKER] Не удалось загрузить {model_name}: {e}")
+                import traceback
+                print(f"[RERANKER] Не удалось загрузить {model_name}: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                sys.modules["__reranker_last_error__"] = f"{type(e).__name__}: {e}"
 
         print("[RERANKER] Все модели недоступны. Reranking отключён.")
-        # Ставим заглушку-None, чтобы не пытаться снова на каждом запросе
-        sys.modules[_RERANKER_KEY] = False
+        sys.modules.pop(_RERANKER_KEY, None)   # не блокируем — при след. запросе попробуем снова
         return None
+
+
+def invalidate_reranker():
+    """Сбрасывает синглтон реранкера — для принудительной перезагрузки из UI."""
+    sys.modules.pop(_RERANKER_KEY, None)
+    print("[RERANKER] Синглтон сброшен, перезагрузка при следующем запросе.")
+
+
+def get_reranker_status() -> dict:
+    """Статус реранкера без попытки загрузки. Проверяет по атрибутам."""
+    existing = sys.modules.get(_RERANKER_KEY)
+    if existing is not None and hasattr(existing, "model_name") and hasattr(existing, "rerank"):
+        return {"loaded": True, "model_name": existing.model_name}
+    last_err = sys.modules.get("__reranker_last_error__", "")
+    return {"loaded": False, "last_error": last_err}
+
+
+def _get_reranker_models_list() -> list:
+    """Выбранная пользователем модель первой, остальные как fallback."""
+    chosen  = _load_search_settings().get("reranker_model", "DiTy/cross-encoder-russian-msmarco")
+    all_ids = [m["id"] for m in AVAILABLE_RERANKER_MODELS]
+    return [chosen] + [m for m in all_ids if m != chosen]
 
 
 # =============================================================================
@@ -584,6 +642,48 @@ def search_faq(query: str, top_k: int = 3) -> list:
 # Вспомогательные функции пайплайна поиска
 # =============================================================================
 
+SEARCH_CONFIG_FILE = os.path.join("config", "search_settings.json")
+
+AVAILABLE_RERANKER_MODELS = [
+    {"id": "DiTy/cross-encoder-russian-msmarco",          "label": "🇷🇺 Русская (DiTy MS MARCO)",       "desc": "Обучена на русском MS MARCO. Лучший выбор для русскоязычных документов."},
+    {"id": "BAAI/bge-reranker-v2-m3",                     "label": "🌍 Мультиязычная (BGE-M3)",          "desc": "Multilingual, 100+ языков включая русский. Крупнее, точнее."},
+    {"id": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1", "label": "🌍 Мультиязычная лёгкая (mMiniLM)", "desc": "Переведённый MARCO. Быстрее BGE-M3, немного хуже на русском."},
+    {"id": "cross-encoder/ms-marco-MiniLM-L-6-v2",        "label": "🇬🇧 Английская (MS MARCO L6)",       "desc": "Только английский. Самая быстрая, для русского не рекомендуется."},
+]
+
+DEFAULT_SEARCH_SETTINGS = {
+    "bm25_weight":         1.5,
+    "candidates_per_var":  15,
+    "context_max_chars":   8000,
+    "reranker_enabled":    True,
+    "reranker_model":      "DiTy/cross-encoder-russian-msmarco",
+}
+def _load_search_settings() -> dict:
+    """Загружает настройки поиска из конфига. Fallback → DEFAULT_SEARCH_SETTINGS."""
+    try:
+        import streamlit as st
+        ss = st.session_state.get("_search_settings")
+        if ss:
+            return ss
+    except Exception:
+        pass
+    if os.path.exists(SEARCH_CONFIG_FILE):
+        try:
+            with open(SEARCH_CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                return {**DEFAULT_SEARCH_SETTINGS, **saved}
+        except Exception:
+            pass
+    return dict(DEFAULT_SEARCH_SETTINGS)
+
+
+def save_search_settings(settings: dict):
+    """Сохраняет настройки поиска в конфиг."""
+    os.makedirs(os.path.dirname(SEARCH_CONFIG_FILE), exist_ok=True)
+    with open(SEARCH_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
 def _load_neighbor_radius() -> int:
     """
     Читает neighbor_radius из Streamlit session_state (задаётся в UI советчика).
@@ -624,43 +724,47 @@ def _fetch_neighbors(top_candidates: list, collection, radius: int) -> dict:
 
     t0 = time.perf_counter()
 
-    # Собираем уникальные doc_id всех победителей
-    doc_ids = list({
-        (c.get("meta") or {}).get("doc_id")
-        or (c.get("meta") or {}).get("filename", "unknown")
+    # Собираем уникальные filename всех победителей.
+    # doc_id в метаданных не сохраняется — используем filename как ключ.
+    filenames = list({
+        (c.get("meta") or {}).get("filename", "unknown")
         for c in top_candidates
+        if (c.get("meta") or {}).get("filename")
     })
+
+    if not filenames:
+        return {}
 
     # Один батч-запрос — все чанки из этих документов
     try:
-        if len(doc_ids) == 1:
+        if len(filenames) == 1:
             batch = collection.get(
-                where={"doc_id": doc_ids[0]},
+                where={"filename": filenames[0]},
                 include=["documents", "metadatas"],
             )
         else:
             batch = collection.get(
-                where={"doc_id": {"$in": doc_ids}},
+                where={"filename": {"$in": filenames}},
                 include=["documents", "metadatas"],
             )
     except Exception as e:
         print(f"[NEIGHBORS] Батч-запрос не удался: {e}")
         return {}
 
-    # Строим chunk_map: (doc_id, chunk_index) → text
+    # Строим chunk_map: (filename, chunk_index) → text
     chunk_map: dict = {}
     for doc, meta in zip(batch.get("documents", []), batch.get("metadatas", [])):
         if not meta:
             continue
-        did  = meta.get("doc_id") or meta.get("filename", "unknown")
-        cidx = int(meta.get("chunk_index", 0))
-        chunk_map[(did, cidx)] = doc
+        fname = meta.get("filename", "unknown")
+        cidx  = int(meta.get("chunk_index", 0))
+        chunk_map[(fname, cidx)] = doc
 
     # Склеиваем контекст для каждого победителя
     result = {}
     for c in top_candidates:
         meta   = c.get("meta") or {}
-        doc_id = meta.get("doc_id") or meta.get("filename", "unknown")
+        doc_id = meta.get("filename", "unknown")   # ключ — filename
         cidx   = int(meta.get("chunk_index", 0))
 
         parts = []
@@ -670,6 +774,8 @@ def _fetch_neighbors(top_candidates: list, collection, radius: int) -> dict:
                 parts.append(text)
 
         result[(doc_id, cidx)] = "\n\n".join(parts) if parts else c.get("doc", "")
+        if parts:
+            print(f"[NEIGHBORS] {doc_id} чанк {cidx}: собрано {len(parts)} частей")
 
     n_expanded = sum(1 for v in result.values() if "\n\n" in v)
     print(f"[NEIGHBORS] radius={radius}, расширено {n_expanded}/{len(top_candidates)} "
@@ -724,9 +830,13 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
         # Для каждого варианта запроса делаем поиск и собираем кандидатов.
         # Один кандидат может встретиться в нескольких вариантах — берём
         # лучший (максимальный) RRF-score.
+        _ss = _load_search_settings()
+        _cands_per_var = int(_ss.get("candidates_per_var", 15))
+        _reranker_on   = bool(_ss.get("reranker_enabled", True))
+
         merged: dict = {}   # id → candidate dict
         for variant in unique_variants:
-            for c in retriever.search(variant, top_k=top_k * 2):
+            for c in retriever.search(variant, top_k=_cands_per_var):
                 cid = c["id"]
                 if cid not in merged or c["score"] > merged[cid]["score"]:
                     merged[cid] = c
@@ -741,35 +851,43 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
 
         # Если BM25 и вектор не пересекаются совсем — BM25 добавляет шум
         if n_overlap == 0:
-            candidates = [c for c in candidates if c['in_vector']]
-            print("[HYBRID] Нет пересечений — только векторные результаты")
+            print("[HYBRID] Нет пересечений vector+bm25 — оставляем оба источника для реранкинга")
 
-        # ── Шаг 3: CrossEncoder реранкинг на КОРОТКОМ оригинальном тексте ───
-        reranker = get_reranker()
+        # ── Шаг 3: CrossEncoder реранкинг ──────────────────────────────────
+        reranker = get_reranker() if _reranker_on else None
         if reranker and candidates:
             candidates = reranker.rerank(query, candidates, top_n=top_k)
         else:
+            if not _reranker_on:
+                print("[RERANKER] Отключён в настройках поиска")
+            elif reranker is None:
+                print("[RERANKER] Не загружен — используем RRF-порядок")
             candidates = candidates[:top_k]
 
         # ── Шаг 4: подтягиваем соседей ПОСЛЕ реранкинга ─────────────────────
         radius     = _load_neighbor_radius()
         collection = get_chroma_collection()
         neighbors  = _fetch_neighbors(candidates, collection, radius)
+        print(f"[NEIGHBORS] radius={radius}, получено ключей: {len(neighbors)}")
 
         # ── Шаг 5: форматируем в стандартный формат sources ─────────────────
         sources = []
         for c in candidates:
             meta   = c.get("meta") or {}
-            doc_id = meta.get("doc_id") or meta.get("filename", "unknown")
+            # Ключ соседей — filename (doc_id не хранится в ChromaDB)
+            fname  = meta.get("filename", "unknown")
             cidx   = int(meta.get("chunk_index", 0))
 
             # snippet = расширенный контекст (с соседями) если есть,
             # иначе — оригинальный чанк
-            snippet = neighbors.get((doc_id, cidx), c.get("doc", ""))
+            raw_snippet = neighbors.get((fname, cidx))
+            snippet = raw_snippet if raw_snippet else c.get("doc", "")
+            print(f"[NEIGHBORS] чанк {cidx} ({fname}): "
+                  f"{'соседи {}'.format(len(raw_snippet)) if raw_snippet else 'только чанк'})")
 
             pseudo_dist = round(max(0.0, 1.0 - c.get("score", 0.5) * 60), 3)
             sources.append({
-                "snippet":      snippet[:2000] + ("..." if len(snippet) > 2000 else ""),
+                "snippet":      snippet,
                 "file":         meta.get("filename", "Неизвестно"),
                 "page":         meta.get("page", ""),
                 "category":     meta.get("category", "Общее"),
@@ -800,14 +918,15 @@ def _is_valid_answer(text: str) -> bool:
     return True
 
 
-def _build_context(sources: list, max_chars: int = 3000) -> str:
+def _build_context(sources: list, max_chars: int = None) -> str:
+    if max_chars is None:
+        max_chars = int(_load_search_settings().get("context_max_chars", 8000))
     """
-    Собирает контекст из источников с жёстким ограничением суммарного размера.
+    Собирает контекст из источников.
 
-    max_chars подобран под qwen3.5-9b (4096 токенов ≈ ~12 000 символов,
-    из которых ~6000 оставляем на системный промпт + вопрос + ответ).
-    При radius=2 один snippet = ~4500 симв., бюджет позволяет 1-2 источника
-    полностью или 3-5 источников с обрезкой — в зависимости от top_k.
+    max_chars=12000 (~4000 токенов) — разумный бюджет для моделей с большим
+    контекстным окном. При radius=2 и чанке 1750 симв. один snippet ≈ 8750 симв.
+    Бюджет позволяет 1 источник полностью или несколько с разумной обрезкой.
     """
     parts = []
     budget = max_chars
@@ -958,7 +1077,7 @@ def stream_ai_answer(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-            frequency_penalty=1.2,   # штраф за повторения — предотвращает "CL CL CL..."
+            frequency_penalty=0.1,   # штраф за повторения — предотвращает "CL CL CL..."
             stream=True,
         )
         if extra_body:
@@ -1115,7 +1234,7 @@ def generate_ai_answer(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-            frequency_penalty=1.2,   # штраф за повторения
+            frequency_penalty=0.1,   # штраф за повторения
         )
         if extra_body:
             kwargs["extra_body"] = extra_body

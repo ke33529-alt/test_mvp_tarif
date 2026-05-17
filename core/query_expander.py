@@ -31,20 +31,27 @@ class QueryExpander:
     
     def expand(self, query: str) -> List[str]:
         """Возвращает список вариантов запроса для поиска"""
+        import re as _re
         variants = [query]
         query_lower = query.lower()
-        
-        # 1. Добавляем синонимы
+
+        # 1. Синонимы — только по границе слова, чтобы не ломать окончания
         for short, full_list in self.SYNONYMS.items():
-            if short in query_lower:
+            pattern = _re.compile(r'\b' + _re.escape(short) + r'\b', _re.IGNORECASE)
+            if pattern.search(query_lower):
                 for full in full_list:
-                    variants.append(query_lower.replace(short, full))
-        
-        # 2. Добавляем перефразирования
+                    variant = pattern.sub(full, query_lower)
+                    if variant != query_lower:
+                        variants.append(variant)
+
+        # 2. Перефразирования — только по границе слова
         for short, full_list in self.REPHRASES.items():
-            if short in query_lower:
+            pattern = _re.compile(_re.escape(short), _re.IGNORECASE)
+            if pattern.search(query_lower):
                 for full in full_list:
-                    variants.append(query_lower.replace(short, full))
+                    variant = pattern.sub(full, query_lower)
+                    if variant != query_lower:
+                        variants.append(variant)
         
         # 3. Добавляем ключевые слова тарифной тематики
         tariff_keywords = ["тариф", "регулирование", "фас", "приказ", "расходы", "выручка"]
