@@ -367,6 +367,23 @@ elif main_choice == "🤝 Советчик":
     st.info("📌 Задайте вопрос по тарифному регулированию — ИИ найдёт ответ в базе НПА")
 
     # Инициализация session_state
+    # Загружаем сохранённые настройки советчика
+    _adv_prefs_file = os.path.join("config", "advisor_prefs.json")
+    _adv_defaults   = {"top_k": 20, "neighbor_radius": 0, "temperature": 0.3}
+    if "_adv_prefs_loaded" not in st.session_state:
+        try:
+            if os.path.exists(_adv_prefs_file):
+                with open(_adv_prefs_file, "r", encoding="utf-8") as _f:
+                    _adv_prefs = {**_adv_defaults, **json.load(_f)}
+            else:
+                _adv_prefs = _adv_defaults
+        except Exception:
+            _adv_prefs = _adv_defaults
+        st.session_state["_adv_top_k"]          = _adv_prefs["top_k"]
+        st.session_state["_adv_neighbor_radius"] = _adv_prefs["neighbor_radius"]
+        st.session_state["_adv_temperature"]     = _adv_prefs["temperature"]
+        st.session_state["_adv_prefs_loaded"]    = True
+
     for key, val in [
         ("last_query", ""), ("last_result", None), ("search_triggered", False),
         ("sources_only_mode", False), ("query_times", []),
@@ -393,20 +410,39 @@ elif main_choice == "🤝 Советчик":
     with st.expander("⚙️ Настройки", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
-            top_k       = st.slider("Количество источников (топ-K)", 1, 10, 5, key="top_k_slider",
-                help="Сколько чанков передаётся LLM после реранкинга")
-            temperature = st.slider("Креативность ответа", 0.0, 1.0, 0.3, 0.1, key="temp_slider")
+            top_k = st.slider(
+                "Количество источников (топ-K)", 1, 50,
+                st.session_state.get("_adv_top_k", 20),
+                key="top_k_slider",
+                help="Сколько чанков передаётся LLM после реранкинга",
+            )
+            temperature = st.slider(
+                "Креативность ответа", 0.0, 1.0,
+                float(st.session_state.get("_adv_temperature", 0.3)),
+                0.1, key="temp_slider",
+            )
             neighbor_radius = st.slider(
                 "Соседних чанков с каждой стороны", 0, 5,
-                st.session_state.get("neighbor_radius", 2),
+                st.session_state.get("_adv_neighbor_radius", 0),
                 key="neighbor_radius_slider",
-                help="Для каждого найденного чанка подтягивается N соседей слева и справа. "
-                     "0 — только сам чанк. 2 — чанк + 2 слева + 2 справа = 5 чанков контекста. "
-                     "Больше — шире контекст, но LLM может потеряться."
+                help="Для каждого найденного чанка подтягивается N соседей. "
+                     "0 — только сам чанк (рекомендуется при режиме ⚖️ По пунктам НПА). "
+                     "Больше — шире контекст, но LLM может потеряться.",
             )
-            st.session_state.neighbor_radius = neighbor_radius
+            st.session_state.neighbor_radius        = neighbor_radius
+            st.session_state["_adv_top_k"]          = top_k
+            st.session_state["_adv_neighbor_radius"] = neighbor_radius
+            st.session_state["_adv_temperature"]     = temperature
             if neighbor_radius > 0:
                 st.caption(f"Каждый результат даёт {1 + neighbor_radius * 2} чанков контекста")
+            # Сохраняем в конфиг при каждом изменении
+            try:
+                os.makedirs("config", exist_ok=True)
+                with open(os.path.join("config", "advisor_prefs.json"), "w", encoding="utf-8") as _f:
+                    json.dump({"top_k": top_k, "neighbor_radius": neighbor_radius,
+                               "temperature": float(temperature)}, _f, ensure_ascii=False)
+            except Exception:
+                pass
         with col2:
             try:
                 from core.advisor import get_available_models
@@ -480,7 +516,8 @@ elif main_choice == "🤝 Советчик":
                 else:
                     # 2. Векторный поиск
                     with st.spinner("🔍 Ищем в базе знаний..."):
-                        sources = search_vector_db(query, top_k=top_k)
+                        _effective_top_k = st.session_state.get("_adv_top_k", top_k)
+                        sources = search_vector_db(query, top_k=_effective_top_k)
 
                     if sources and not st.session_state.sources_only_mode:
                         st.success(f"✅ Ответ сгенерирован ИИ · модель: {st.session_state.advisor_model}")
@@ -1386,7 +1423,15 @@ elif main_choice == "🛠 Админка":
                         with _tq_c1:
                             test_query = st.text_input("Запрос", placeholder="расходы на ремонт основных средств", key="test_query_input")
                         with _tq_c2:
-                            test_top_k = st.number_input("Топ-K", min_value=1, max_value=20, value=5, key="test_top_k")
+                            try:
+                                _sr_file_path = os.path.join('config', 'search_settings.json')
+                                _sr_saved = json.load(open(_sr_file_path, encoding='utf-8')) if os.path.exists(_sr_file_path) else {}
+                                _test_default_k = int(_sr_saved.get('candidates_per_var', 25))
+                            except Exception:
+                                _test_default_k = 25
+                            test_top_k = st.number_input('Топ-K', min_value=1, max_value=200,
+                                value=_test_default_k, key='test_top_k',
+                                help='По умолчанию = кандидатов на вариант из настроек поиска')
                         if st.button("🔎 Найти чанки", key="test_search_btn", type="primary"):
                             if test_query.strip():
                                 with st.spinner("Ищем..."):
@@ -1525,6 +1570,101 @@ elif main_choice == "🛠 Админка":
                 st.warning(f"Не удалось загрузить список моделей: {_me}")
                 _sel_model_id = _sr_cur.get("reranker_model", "DiTy/cross-encoder-russian-msmarco")
 
+            st.divider()
+            st.subheader("🔎 Тест вариантов запроса")
+            st.caption(
+                "Показывает варианты запроса, **все кандидаты до реранкинга** "
+                "(пул = «Кандидатов на вариант» × кол-во вариантов – дубли) "
+                "и финальные результаты после реранкинга."
+            )
+            _dbg_c1, _dbg_c2 = st.columns([4, 1])
+            with _dbg_c1:
+                _test_q = st.text_input(
+                    "Введите запрос для проверки",
+                    placeholder="например: ДМС, расходы на ремонт",
+                    key="sr_query_expand_test",
+                )
+            with _dbg_c2:
+                _dbg_topk = st.number_input(
+                    "Финальный топ-K",
+                    min_value=1, max_value=20, value=5,
+                    help="Сколько результатов вернуть ПОСЛЕ реранкинга",
+                    key="sr_debug_topk",
+                )
+
+            if st.button("🔬 Запустить тест кандидатов", key="sr_debug_btn", type="primary"):
+                if _test_q.strip():
+                    with st.spinner("⏳ Выполняем поиск..."):
+                        try:
+                            from core.advisor import debug_search_candidates as _dsc
+                            _dbg = _dsc(_test_q.strip(), top_k=int(_dbg_topk))
+                        except Exception as _dbe:
+                            st.error(f"❌ {type(_dbe).__name__}: {_dbe}")
+                            _dbg = None
+
+                    if _dbg:
+                        if _dbg.get("error"):
+                            st.error(f"❌ {_dbg['error']}")
+                        else:
+                            # ── варианты запроса
+                            st.markdown("##### 🔀 Варианты запроса")
+                            for _vi, _vq in enumerate(_dbg["query_variants"], 1):
+                                _vlabel = "🎯 оригинал" if _vi == 1 else f"🔁 синоним {_vi-1}"
+                                st.code(f"{_vlabel}: {_vq}", language=None)
+
+                            # ── пул ДО реранкинга
+                            _pre = _dbg["pre_rerank"]
+                            _cpv = _cands
+                            _nv  = len(_dbg["query_variants"])
+                            st.markdown(
+                                f"##### 📥 Пул до реранкинга: **{len(_pre)}** уникальных кандидатов"
+                                f"  <span style='color:grey;font-size:0.85em'>"
+                                f"(настройка {_cpv} × {_nv} вар. → дедупликация)</span>",
+                                unsafe_allow_html=True,
+                            )
+                            for _pi, _pc in enumerate(_pre, 1):
+                                _pm  = _pc.get("meta") or {}
+                                _inv = "🔵 vec" if _pc.get("in_vector") else ""
+                                _inb = "🟤 bm25" if _pc.get("in_bm25") else ""
+                                _rrf = f"RRF={_pc.get('score', 0):.5f}"
+                                with st.expander(
+                                    f"#{_pi} · {_pm.get('filename','?')} · "
+                                    f"чанк {_pm.get('chunk_index','')} · {_rrf} {_inv} {_inb}",
+                                    expanded=False,
+                                ):
+                                    st.text_area("", _pc.get("doc", "")[:600],
+                                                 height=120, disabled=True,
+                                                 key=f"dbg_pre_{_pi}")
+
+                            # ── результаты ПОСЛЕ реранкинга
+                            _post  = _dbg["post_rerank"]
+                            _rused = "✅ CrossEncoder" if _dbg["reranker_used"] else "⚠️ реранкинг отключён"
+                            st.markdown(
+                                f"##### 🏆 После реранкинга: **{len(_post)}** результатов "
+                                f"<span style='color:grey;font-size:0.85em'>({_rused})</span>",
+                                unsafe_allow_html=True,
+                            )
+                            for _qi, _qc in enumerate(_post, 1):
+                                _qm     = _qc.get("meta") or {}
+                                _rrf2   = f"RRF={_qc.get('score', 0):.5f}"
+                                _rscore = (
+                                    f" | rerank={_qc.get('rerank_score', 0):.3f}"
+                                    if _dbg["reranker_used"] else ""
+                                )
+                                with st.expander(
+                                    f"#{_qi} · {_qm.get('filename','?')} · "
+                                    f"чанк {_qm.get('chunk_index','')} · {_rrf2}{_rscore}",
+                                    expanded=(_qi == 1),
+                                ):
+                                    st.text_area("", _qc.get("doc", "")[:600],
+                                                 height=150, disabled=True,
+                                                 key=f"dbg_post_{_qi}")
+
+                            st.caption(f"⏱ Время: {_dbg['elapsed']} сек")
+                else:
+                    st.warning("⚠️ Введите запрос")
+
+            st.divider()
             st.subheader("📄 Контекст для LLM")
             _ctx = st.slider(
                 "Максимум символов контекста",

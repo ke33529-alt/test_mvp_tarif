@@ -20,6 +20,45 @@ for _stream in (sys.stdout, sys.stderr):
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+# =============================================================================
+# Лемматизатор pymorphy3 — синглтон, инициализируется один раз
+# Graceful degradation: если не установлен — BM25 работает без лемматизации
+# =============================================================================
+_morph           = None
+_morph_lock      = threading.Lock()
+_MORPH_AVAILABLE = False
+
+try:
+    import pymorphy3 as _pymorphy3_module
+    _MORPH_AVAILABLE = True
+    print("[MORPH] pymorphy3 доступен — BM25 будет использовать лемматизацию")
+except ImportError:
+    print("[MORPH] pymorphy3 не установлен. Запустите: pip install pymorphy3")
+    print("[MORPH] BM25 будет работать без лемматизации (хуже по морфологии)")
+
+
+def _get_morph():
+    """Синглтон MorphAnalyzer — создаётся один раз, потокобезопасно."""
+    global _morph
+    if _morph is not None:
+        return _morph
+    with _morph_lock:
+        if _morph is None:
+            t0 = time.perf_counter()
+            _morph = _pymorphy3_module.MorphAnalyzer()
+            print(f"[MORPH] MorphAnalyzer загружен за {time.perf_counter()-t0:.2f} сек")
+    return _morph
+
+
+def _lemmatize_token(token: str) -> str:
+    """Возвращает лемму (начальную форму) русского слова."""
+    if not _MORPH_AVAILABLE:
+        return token
+    try:
+        return _get_morph().parse(token)[0].normal_form
+    except Exception:
+        return token
  
 # =============================================================================
 # Отключение телеметрии ChromaDB
@@ -263,8 +302,24 @@ class HybridRetriever:
         self._build_index()
  
     def _tokenize(self, text: str) -> list:
-        """Простая токенизация: буквы/цифры, нижний регистр."""
-        return re.findall(r'\w+', text.lower())
+        """
+        Токенизация с лемматизацией через pymorphy3.
+        Каждое русское слово приводится к начальной форме (лемме),
+        что позволяет BM25 находить совпадения независимо от падежа/числа/времени.
+        Пример: 'неподконтрольным' и 'неподконтрольные' → оба 'неподконтрольный'.
+        Если pymorphy3 не установлен — работает как раньше (без лемматизации).
+        """
+        tokens = re.findall(r'[а-яёa-z0-9]+', text.lower())
+        if not _MORPH_AVAILABLE:
+            return tokens
+        result = []
+        for token in tokens:
+            result.append(token)
+            if re.match(r'^[а-яё]{3,}$', token):
+                lemma = _lemmatize_token(token)
+                if lemma != token:
+                    result.append(lemma)
+        return result
  
     def _build_index(self):
         t0 = time.perf_counter()
@@ -905,6 +960,71 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
     return _pure_vector_search(query, top_k, t0)
  
  
+def debug_search_candidates(query: str, top_k: int = 5) -> dict:
+    """
+    Отладочная функция для UI «Поиск и реранкинг».
+    Возвращает кандидатов ДО и ПОСЛЕ реранкинга, а также варианты запроса.
+    Не подтягивает соседей — нужен только чистый текст чанка для просмотра.
+    """
+    result = {
+        "query_variants": [query],
+        "pre_rerank":     [],
+        "post_rerank":    [],
+        "reranker_used":  False,
+        "elapsed":        0.0,
+        "error":          None,
+    }
+
+    t0 = time.perf_counter()
+    try:
+        retriever = get_hybrid_retriever()
+        if retriever is None:
+            result["error"] = "HybridRetriever не инициализирован (база пуста?)"
+            return result
+
+        try:
+            from core.query_expander import QueryExpander
+            expander = QueryExpander()
+            raw_variants = expander.expand(query)
+            synonym_variants = [
+                v for v in raw_variants
+                if v != query and not v.endswith("тарифное регулирование")
+            ]
+        except Exception:
+            synonym_variants = []
+
+        unique_variants = [query] + synonym_variants[:2]
+        result["query_variants"] = unique_variants
+
+        _ss = _load_search_settings()
+        _cands_per_var = int(_ss.get("candidates_per_var", 15))
+        _reranker_on   = bool(_ss.get("reranker_enabled", True))
+
+        merged: dict = {}
+        for variant in unique_variants:
+            for c in retriever.search(variant, top_k=_cands_per_var):
+                cid = c["id"]
+                if cid not in merged or c["score"] > merged[cid]["score"]:
+                    merged[cid] = c
+
+        pre_rerank = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        result["pre_rerank"] = pre_rerank
+
+        reranker = get_reranker() if _reranker_on else None
+        if reranker and pre_rerank:
+            post = reranker.rerank(query, list(pre_rerank), top_n=top_k)
+            result["post_rerank"]   = post
+            result["reranker_used"] = True
+        else:
+            result["post_rerank"] = pre_rerank[:top_k]
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    result["elapsed"] = round(time.perf_counter() - t0, 3)
+    return result
+
+
 def _is_valid_answer(text: str) -> bool:
     """Проверяет что ответ не сломан (петля, пустой, слишком короткий)."""
     if not text or len(text.strip()) < 20:
