@@ -19,11 +19,11 @@
     "doc_year": "(\\d{4})"
   },
   "chunking_settings": {
-    "chunking_mode": "structural",
+    "chunking_mode": "legal",
     "separator": "&&",
     "fixed_chunk_length": 1200,
-    "min_chunk_length": 80,
-    "max_chunk_length": 5000,
+    "min_chunk_length": 51,
+    "max_chunk_length": 8000,
     "chunk_overlap": 0,
     "no_cut_word": false,
     "no_cut_sentence": true,

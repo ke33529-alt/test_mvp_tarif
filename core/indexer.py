@@ -144,8 +144,24 @@ def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> l
     overlap = settings.get("chunk_overlap", 0)
     min_len = settings.get("min_chunk_length", 50)
 
+    # ── Режим 0: юридический чанкер по пунктам НПА ──────────────────────────
+    if mode == "legal" and chunker:
+        doc_id  = base_metadata.get("filename", "unknown")
+        max_len = settings.get("max_chunk_length", 3000)
+        if hasattr(chunker, "max_chunk_chars"):
+            chunker.max_chunk_chars = max_len
+        min_len_legal = settings.get("min_chunk_length", 50)
+        if hasattr(chunker, "chunk_by_legal_structure"):
+            chunks = chunker.chunk_by_legal_structure(text, doc_id, base_metadata)
+        else:
+            chunks = chunker.chunk_by_structure(text, base_metadata)
+        chunks = [c for c in chunks if len(c.get("text", "")) >= min_len_legal]
+        if len(chunks) > MAX_CHUNKS_PER_FILE:
+            chunks = chunks[:MAX_CHUNKS_PER_FILE]
+        return chunks
+
     # ── Режим 1: умный структурный чанкер ───────────────────────────────────
-    if mode == "structural" and chunker:
+    elif mode == "structural" and chunker:
         chunks = chunker.chunk_by_structure(text, base_metadata)
         if overlap > 0:
             chunks = _apply_overlap(chunks, overlap)
@@ -361,18 +377,21 @@ def index_file(file_path, category="npa"):
             ids.append(doc_id)
             documents.append(chunk['text'])
             metadatas.append({
-                "filename": chunk['metadata'].get('filename', ''),
-                "filepath": chunk['metadata'].get('filepath', ''),
-                "category": chunk['metadata'].get('category', ''),
-                "doc_type": chunk['metadata'].get('doc_type', ''),
-                "doc_number": chunk['metadata'].get('doc_number', ''),
-                "doc_date": chunk['metadata'].get('doc_date', ''),
-                "struct_type": chunk['metadata'].get('struct_type', ''),
-                "struct_text": chunk['metadata'].get('struct_text', ''),
-                "article": chunk['metadata'].get('article', ''),
-                "paragraph": chunk['metadata'].get('paragraph', ''),
-                "chunk_index": i,
-                "indexed_at": datetime.now().isoformat()
+                "filename":      chunk['metadata'].get('filename', ''),
+                "filepath":      chunk['metadata'].get('filepath', ''),
+                "category":      chunk['metadata'].get('category', ''),
+                "doc_type":      chunk['metadata'].get('doc_type', ''),
+                "doc_number":    chunk['metadata'].get('doc_number', ''),
+                "doc_date":      chunk['metadata'].get('doc_date', ''),
+                "struct_type":   chunk['metadata'].get('struct_type', ''),
+                "struct_text":   chunk['metadata'].get('text_preview', chunk['metadata'].get('struct_text', '')),
+                "article":       chunk['metadata'].get('article', ''),
+                "paragraph":     chunk['metadata'].get('paragraph', ''),
+                "section":       chunk['metadata'].get('section', ''),
+                "document_part": chunk['metadata'].get('document_part', ''),
+                "text_preview":  chunk['metadata'].get('text_preview', ''),
+                "chunk_index":   i,
+                "indexed_at":    datetime.now().isoformat()
             })
 
         BATCH = 100
@@ -583,18 +602,21 @@ def rebuild_index():
             ids.append(doc_id)
             documents_list.append(chunk['text'])
             metadatas_list.append({
-                "filename": chunk['metadata'].get('filename', ''),
-                "filepath": chunk['metadata'].get('filepath', ''),
-                "category": chunk['metadata'].get('category', ''),
-                "doc_type": chunk['metadata'].get('doc_type', ''),
-                "doc_number": chunk['metadata'].get('doc_number', ''),
-                "doc_date": chunk['metadata'].get('doc_date', ''),
-                "struct_type": chunk['metadata'].get('struct_type', ''),
-                "struct_text": chunk['metadata'].get('struct_text', ''),
-                "article": chunk['metadata'].get('article', ''),
-                "paragraph": chunk['metadata'].get('paragraph', ''),
-                "chunk_index": i,
-                "indexed_at": datetime.now().isoformat()
+                "filename":      chunk['metadata'].get('filename', ''),
+                "filepath":      chunk['metadata'].get('filepath', ''),
+                "category":      chunk['metadata'].get('category', ''),
+                "doc_type":      chunk['metadata'].get('doc_type', ''),
+                "doc_number":    chunk['metadata'].get('doc_number', ''),
+                "doc_date":      chunk['metadata'].get('doc_date', ''),
+                "struct_type":   chunk['metadata'].get('struct_type', ''),
+                "struct_text":   chunk['metadata'].get('text_preview', chunk['metadata'].get('struct_text', '')),
+                "article":       chunk['metadata'].get('article', ''),
+                "paragraph":     chunk['metadata'].get('paragraph', ''),
+                "section":       chunk['metadata'].get('section', ''),
+                "document_part": chunk['metadata'].get('document_part', ''),
+                "text_preview":  chunk['metadata'].get('text_preview', ''),
+                "chunk_index":   i,
+                "indexed_at":    datetime.now().isoformat()
             })
 
         # Вставляем батчами по 100

@@ -1,7 +1,7 @@
 {
-  "bm25_weight": 1.2,
-  "candidates_per_var": 35,
+  "bm25_weight": 2.0,
+  "candidates_per_var": 25,
   "context_max_chars": 20000,
   "reranker_enabled": true,
-  "reranker_model": "BAAI/bge-reranker-v2-m3"
+  "reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 }

@@ -1143,17 +1143,39 @@ elif main_choice == "🛠 Админка":
                 st.subheader("Параметры чанкования")
                 settings = config.get("chunking_settings",{})
                 chunking_mode = st.radio("Режим чанкования",
-                    options=["structural","separator","fixed"],
-                    format_func=lambda x:{"structural":"🧠 Умный (по структуре)","separator":"✂️ По разделителю","fixed":"📏 Фиксированная длина"}[x],
-                    index=["structural","separator","fixed"].index(settings.get("chunking_mode","structural")),
+                    options=["legal","structural","separator","fixed"],
+                    format_func=lambda x:{
+                        "legal":      "⚖️ По пунктам НПА (рекомендуется)",
+                        "structural": "🧠 Умный (по структуре)",
+                        "separator":  "✂️ По разделителю",
+                        "fixed":      "📏 Фиксированная длина",
+                    }.get(x, x),
+                    index=["legal","structural","separator","fixed"].index(
+                        settings.get("chunking_mode","legal")
+                        if settings.get("chunking_mode","legal") in ["legal","structural","separator","fixed"]
+                        else "legal"
+                    ),
                     key="chunking_mode_radio")
                 st.divider()
-                separator      = settings.get("separator","&&")
-                fixed_length   = settings.get("fixed_chunk_length",1000)
-                min_chunk      = settings.get("min_chunk_length", 80)
-                max_chunk      = settings.get("max_chunk_length", 900)
-                chunk_overlap  = settings.get("chunk_overlap", 150)
-                if chunking_mode == "structural":
+                # Инициализируем все переменные из settings ДО if/elif —
+                # иначе NameError если режим не выбирает свой виджет
+                separator     = settings.get("separator", "&&")
+                fixed_length  = settings.get("fixed_chunk_length", 1000)
+                min_chunk     = settings.get("min_chunk_length", 80)
+                max_chunk     = settings.get("max_chunk_length", 1500)
+                chunk_overlap = settings.get("chunk_overlap", 0)
+                if chunking_mode == "legal":
+                    st.caption("⚖️ Один чанк = один пункт/статья/подпункт НПА. Максимальная точность цитирования.")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        max_chunk = st.slider("Макс. длина чанка (симв.)", 500, 8000, max_chunk,
+                            key="max_chunk_legal",
+                            help="Если пункт длиннее — режется по предложениям с сохранением заголовка пункта")
+                    with col2:
+                        min_chunk = st.slider("Мин. длина блока (симв.)", 10, 300, min_chunk,
+                            key="min_chunk_legal",
+                            help="Блоки короче этого значения объединяются со следующим")
+                elif chunking_mode == "structural":
                     col1,col2 = st.columns(2)
                     with col1:
                         min_chunk = st.slider("Мин. длина чанка (симв.)", 10, 500, min_chunk, key="min_chunk_s",
@@ -1456,21 +1478,19 @@ elif main_choice == "🛠 Админка":
                                 st.rerun()
                 except Exception as _e:
                     st.warning(f"⚠️ Ошибка импорта: {_e}")
-
             else:
                 st.caption("Результаты ранжируются только по RRF-score (BM25 + вектор).")
 
             st.divider()
             st.subheader("🤖 Модель реранкера")
             try:
-                from core.advisor import AVAILABLE_RERANKER_MODELS as _ARM, get_reranker_status as _grs2
+                from core.advisor import AVAILABLE_RERANKER_MODELS as _ARM, get_reranker_status as _grs2, invalidate_reranker as _ir3, get_reranker as _gr2
                 _model_ids    = [m["id"]    for m in _ARM]
                 _model_labels = [m["label"] for m in _ARM]
                 _model_descs  = {m["id"]: m["desc"] for m in _ARM}
                 _cur_model    = _sr_cur.get("reranker_model", _model_ids[0])
                 _cur_idx      = _model_ids.index(_cur_model) if _cur_model in _model_ids else 0
-
-                _sel_label = st.radio(
+                _sel_label    = st.radio(
                     "Выберите модель реранкера",
                     _model_labels,
                     index=_cur_idx,
@@ -1478,23 +1498,11 @@ elif main_choice == "🛠 Админка":
                 )
                 _sel_model_id = _model_ids[_model_labels.index(_sel_label)]
                 st.caption(f"ℹ️ {_model_descs.get(_sel_model_id, '')}")
-
-                # Кнопка переключения — сброс синглтона + загрузка новой модели
                 _loaded_status = _grs2()
                 _currently_loaded = _loaded_status.get("model_name", "")
-                _model_changed = _sel_model_id != _cur_model
-                _not_this_model = _loaded_status["loaded"] and _currently_loaded != _sel_model_id
-
-                if _model_changed or _not_this_model:
-                    if st.button(
-                        f"⚡ Переключить на выбранную модель",
-                        key="sr_switch_model",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        from core.advisor import invalidate_reranker as _ir3, get_reranker as _gr2
+                if _loaded_status["loaded"] and _currently_loaded != _sel_model_id:
+                    if st.button("⚡ Переключить на выбранную модель", key="sr_switch_model", type="primary", use_container_width=True):
                         _ir3()
-                        # Сохраняем новую модель в конфиг
                         _new_sr_model = {**_sr_cur, "reranker_model": _sel_model_id}
                         os.makedirs("config", exist_ok=True)
                         with open(_sr_file, "w", encoding="utf-8") as f:
@@ -1507,19 +1515,16 @@ elif main_choice == "🛠 Админка":
                         else:
                             st.session_state["_model_switch_failed"] = _sel_model_id
                         st.rerun()
-
                 if st.session_state.get("_model_switched"):
                     st.success(f"✅ Модель переключена: `{st.session_state['_model_switched']}`")
                     del st.session_state["_model_switched"]
                 if st.session_state.get("_model_switch_failed"):
-                    st.error(f"❌ Не удалось загрузить `{st.session_state['_model_switch_failed']}` — проверьте консоль")
+                    st.error(f"❌ Не удалось загрузить `{st.session_state['_model_switch_failed']}`")
                     del st.session_state["_model_switch_failed"]
-
             except Exception as _me:
                 st.warning(f"Не удалось загрузить список моделей: {_me}")
                 _sel_model_id = _sr_cur.get("reranker_model", "DiTy/cross-encoder-russian-msmarco")
 
-            st.divider()
             st.subheader("📄 Контекст для LLM")
             _ctx = st.slider(
                 "Максимум символов контекста",
@@ -1534,7 +1539,7 @@ elif main_choice == "🛠 Админка":
             st.divider()
             _sc1, _sc2 = st.columns(2)
             with _sc1:
-                if st.button("💾 Сохранить остальные настройки", type="primary", use_container_width=True, key="sr_save"):
+                if st.button("💾 Сохранить настройки поиска", type="primary", use_container_width=True, key="sr_save"):
                     _new_sr = {
                         "bm25_weight":        _bm25_w,
                         "candidates_per_var": _cands,
@@ -1553,8 +1558,6 @@ elif main_choice == "🛠 Админка":
                     if os.path.exists(_sr_file):
                         os.remove(_sr_file)
                     st.session_state.pop("_search_settings", None)
-                    from core.advisor import invalidate_reranker as _ir_reset
-                    _ir_reset()
                     st.session_state["_sr_reset"] = True
                     st.rerun()
             if st.session_state.get("_sr_saved"):
