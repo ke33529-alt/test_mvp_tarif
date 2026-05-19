@@ -1,980 +1,809 @@
 # streamlit_pages/doc_scanner.py
-import streamlit as st
+"""
+AI-Сканер документов
+Поддерживаемые форматы: PDF (текстовый и скан), DOCX, DOC, XLSX, JPG, PNG
+OCR: EasyOCR (основной) → Tesseract (fallback)
+Пересказ: LM Studio
+Поиск: текстовый с синонимами через QueryExpander
+"""
 import os
-import json
-import pandas as pd
-from datetime import datetime, timedelta
 import io
-from docx import Document as DocxDocument
 import re
-import shutil
+import json
+import time
+import hashlib
+import threading
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+
+import streamlit as st
 
 # =============================================================================
-# Функции OCR (EasyOCR с GPU поддержкой)
+# Утилиты — загрузка/сохранение базы сканов
 # =============================================================================
-def ocr_with_easyocr(image_path, use_gpu=True):
-    """Распознавание текста через EasyOCR с GPU поддержкой"""
+_DB_PATH = os.path.join("data", "doc_scanner", "scans_db.json")
+_DB_LOCK = threading.Lock()
+
+
+def _ensure_dir():
+    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+
+
+def _fname(doc: Dict) -> str:
+    """Совместимость: старые документы используют 'file_name', новые — 'filename'."""
+    return doc.get("filename") or doc.get("file_name") or "неизвестный файл"
+
+
+def load_db() -> Dict:
+    _ensure_dir()
+    if os.path.exists(_DB_PATH):
+        try:
+            with open(_DB_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"documents": [], "stats": {"total": 0, "last_scan": None}}
+
+
+def save_db(db: Dict):
+    _ensure_dir()
+    with _DB_LOCK:
+        with open(_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+# =============================================================================
+# OCR — EasyOCR с fallback на Tesseract
+# =============================================================================
+_easyocr_reader      = None
+_easyocr_lock        = threading.Lock()
+_EASYOCR_AVAILABLE   = False
+_TESSERACT_AVAILABLE = False
+
+
+def _init_ocr():
+    global _easyocr_reader, _EASYOCR_AVAILABLE, _TESSERACT_AVAILABLE
+    # EasyOCR
     try:
         import easyocr
-        
-        if not os.path.exists(image_path):
-            return f"#ERROR: Файл не найден: {image_path}"
-        
-        file_size = os.path.getsize(image_path)
-        if file_size == 0:
-            return f"#ERROR: Пустой файл: {image_path}"
-        if file_size > 50 * 1024 * 1024:
-            return f"#ERROR: Файл слишком большой: {file_size / 1024 / 1024:.1f} MB"
-        
-        ext = os.path.splitext(image_path)[1].lower()
-        valid_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
-        if ext not in valid_exts:
-            return f"#ERROR: Не поддерживаемый формат: {ext}"
-        
-        try:
-            from PIL import Image
-            img = Image.open(image_path)
-            img.verify()
-            img = Image.open(image_path)
-            img = img.convert('RGB')
-            
-            if img.size[0] == 0 or img.size[1] == 0:
-                return f"#ERROR: Изображение пустое: {image_path}"
-            
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                img.save(tmp.name, "PNG")
-                tmp_path = tmp.name
-        except Exception as e:
-            return f"#ERROR: Не удалось загрузить изображение: {str(e)}"
-        
-        if "easyocr_reader" not in st.session_state:
-            st.session_state.easyocr_reader = easyocr.Reader(
-                ['ru', 'en'], 
-                gpu=use_gpu,
-                verbose=False,
-                download_enabled=True,
-                cudnn_benchmark=True
-            )
-        
-        reader = st.session_state.easyocr_reader
-        
-        try:
-            results = reader.readtext(tmp_path, detail=0)
-            
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except:
-                    pass
-            
-            if not results:
-                return "#WARNING: Текст не распознан"
-            
-            text = ' '.join(results)
-            return text
-            
-        except Exception as e:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except:
-                    pass
-            return f"#ERROR EasyOCR: {str(e)}"
-
+        with _easyocr_lock:
+            if _easyocr_reader is None:
+                _easyocr_reader = easyocr.Reader(
+                    ["ru", "en"],
+                    gpu=True,
+                    verbose=False,
+                )
+        _EASYOCR_AVAILABLE = True
+        print("[OCR] EasyOCR инициализирован")
+    except ImportError:
+        print("[OCR] EasyOCR не установлен: pip install easyocr")
     except Exception as e:
-        return f"#ERROR EasyOCR: {str(e)}"
+        print(f"[OCR] EasyOCR ошибка инициализации: {e}")
+        try:
+            import streamlit as _st
+            _st.session_state["ocr_init_error"] = str(e)
+        except Exception:
+            pass
 
-def ocr_pdf(pdf_path, use_gpu=True):
-    """Распознавание PDF (текст + изображения через EasyOCR)"""
+    # Tesseract fallback
     try:
-        import fitz
-        import tempfile
-        
-        if not os.path.exists(pdf_path):
-            return f"#ERROR: Файл не найден: {pdf_path}", []
-        
-        doc = fitz.open(pdf_path)
-        full_text = []
-        pages_data = []
-        
-        for page_num, page in enumerate(doc, 1):
-            try:
-                text = page.get_text()
-                
-                if len(text.strip()) < 100:
-                    try:
-                        pix = page.get_pixmap()
-                        img = pix.tobytes("png")
-                        
-                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                            tmp.write(img)
-                            tmp_path = tmp.name
-                        
-                        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                            ocr_text = ocr_with_easyocr(tmp_path, use_gpu=use_gpu)
-                            text = ocr_text
-                        else:
-                            text = f"#ERROR: Не удалось создать временный файл для страницы {page_num}"
-                        
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except:
-                                pass
-                    except Exception as e:
-                        text = f"#ERROR OCR страницы {page_num}: {str(e)}"
-                
-                full_text.append(text)
-                pages_data.append({
-                    "page": page_num,
-                    "text": text,
-                    "word_count": len(text.split())
-                })
-            except Exception as e:
-                text = f"#ERROR Обработки страницы {page_num}: {str(e)}"
-                full_text.append(text)
-                pages_data.append({
-                    "page": page_num,
-                    "text": text,
-                    "word_count": 0
-                })
-        
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        _TESSERACT_AVAILABLE = True
+        print("[OCR] Tesseract доступен как fallback")
+    except Exception:
+        pass
+
+
+def _ocr_image(image) -> str:
+    """
+    Распознаёт текст из PIL Image.
+    Стратегия: EasyOCR → Tesseract → пустая строка.
+    """
+    # EasyOCR
+    if _EASYOCR_AVAILABLE and _easyocr_reader is not None:
+        try:
+            import numpy as np
+            img_array = np.array(image.convert("RGB"))
+            result = _easyocr_reader.readtext(img_array, detail=0, paragraph=True)
+            return "\n".join(result)
+        except Exception as e:
+            print(f"[OCR] EasyOCR ошибка: {e}")
+
+    # Tesseract fallback
+    if _TESSERACT_AVAILABLE:
+        try:
+            import pytesseract
+            return pytesseract.image_to_string(image, lang="rus+eng")
+        except Exception as e:
+            print(f"[OCR] Tesseract ошибка: {e}")
+
+    return ""
+
+
+# =============================================================================
+# Извлечение текста по типу файла
+# =============================================================================
+def _extract_pdf(file_bytes: bytes, filename: str) -> List[Dict]:
+    """
+    PDF → список страниц [{page, text, method}].
+    Сначала пробует извлечь текст напрямую (для текстовых PDF),
+    если страница пустая — применяет PaddleOCR.
+    """
+    pages = []
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for i, page in enumerate(doc, 1):
+            # Попытка прямого извлечения текста
+            text = page.get_text("text").strip()
+            method = "direct"
+
+            # Если текста мало — скан → OCR
+            if len(text) < 50:
+                try:
+                    from PIL import Image
+                    pix = page.get_pixmap(dpi=200)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    text = _ocr_image(img)
+                    method = "ocr"
+                except Exception as e:
+                    text = f"[Ошибка OCR стр.{i}: {e}]"
+                    method = "error"
+
+            pages.append({
+                "page": i,
+                "text": text,
+                "method": method,
+                "word_count": len(text.split()),
+            })
         doc.close()
-        return "\n\n--- СТРАНИЦА {page} ---\n\n".join(full_text), pages_data
-
+    except ImportError:
+        pages.append({"page": 1, "text": "[PyMuPDF не установлен: pip install pymupdf]",
+                       "method": "error", "word_count": 0})
     except Exception as e:
-        return f"#ERROR PDF: {str(e)}", []
+        pages.append({"page": 1, "text": f"[Ошибка PDF: {e}]",
+                       "method": "error", "word_count": 0})
+    return pages
 
-def read_docx_full(file_path):
-    """Полное чтение DOCX файла (все параграфы + таблицы)"""
+
+def _extract_docx(file_bytes: bytes) -> List[Dict]:
+    """DOCX → список страниц (по 100 строк каждая)."""
     try:
-        doc = DocxDocument(file_path)
-        all_text = []
-        
-        for para in doc.paragraphs:
-            if para.text.strip():
-                all_text.append(para.text)
-        
+        import docx
+        doc = docx.Document(io.BytesIO(file_bytes))
+        full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        # Таблицы
         for table in doc.tables:
             for row in table.rows:
-                row_text = []
-                for cell in row.cells:
-                    if cell.text.strip():
-                        row_text.append(cell.text)
-                if row_text:
-                    all_text.append(" | ".join(row_text))
-        
-        for section in doc.sections:
-            if section.header:
-                for para in section.header.paragraphs:
-                    if para.text.strip():
-                        all_text.insert(0, f"[HEADER] {para.text}")
-            if section.footer:
-                for para in section.footer.paragraphs:
-                    if para.text.strip():
-                        all_text.append(f"[FOOTER] {para.text}")
-        
-        text = "\n".join(all_text)
-        pages_data = [{
-            "page": 1,
-            "text": text,
-            "word_count": len(text.split()),
-            "paragraphs": len(doc.paragraphs),
-            "tables": len(doc.tables)
-        }]
-        
-        return text, pages_data
-    
-    except Exception as e:
-        return f"#ERROR DOCX: {str(e)}", []
-
-def process_document(file_path, use_gpu=True):
-    """Обрабатывает документ с GPU поддержкой"""
-    if not os.path.exists(file_path):
-        return f"#ERROR: Файл не найден: {file_path}", []
-
-    file_size = os.path.getsize(file_path)
-    if file_size == 0:
-        return f"#ERROR: Пустой файл: {file_path}", []
-
-    ext = os.path.splitext(file_path)[1].lower()
-
-    if ext in ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp']:
-        text = ocr_with_easyocr(file_path, use_gpu=use_gpu)
-        pages_data = [{"page": 1, "text": text, "word_count": len(text.split())}]
-
-    elif ext == '.pdf':
-        text, pages_data = ocr_pdf(file_path, use_gpu=use_gpu)
-
-    elif ext in ['.docx', '.doc']:
-        text, pages_data = read_docx_full(file_path)
-
-    elif ext in ['.txt']:
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
-            pages_data = [{"page": 1, "text": text, "word_count": len(text.split())}]
-        except Exception as e:
-            text = f"#ERROR TXT: {str(e)}"
-            pages_data = []
-
-    else:
-        text = f"#ERROR: Не поддерживаемый формат {ext}"
-        pages_data = []
-
-    return text, pages_data
-
-# =============================================================================
-# AI Суммаризация (с выбором модели)
-# =============================================================================
-def get_available_models():
-    """Получает список доступных моделей от Ollama"""
-    try:
-        import requests
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            return [m.get("name", "unknown") for m in models]
-        return ["phi3", "llama3.2"]  # Fallback
-    except:
-        return ["phi3", "llama3.2"]
-
-def summarize_with_ai(text, max_length=500, temperature=0.3, model="phi3"):
-    """Генерирует краткое содержание документа через core.summarizer"""
-    try:
-        from core.summarizer import summarize_text
-        
-        truncated_text = text[:8000] if len(text) > 8000 else text
-        
-        summary = summarize_text(
-            truncated_text,
-            model=model,
-            max_length=max_length,
-            temperature=temperature
-        )
-        
-        return summary
-    
-    except ImportError as e:
-        return f"#ERROR: Модуль summarizer не найден: {str(e)}"
-    except Exception as e:
-        return f"#ERROR AI Summarization: {str(e)}"
-
-def get_document_summary_cached(doc_id, text, max_length=500, temperature=0.3, model="phi3"):
-    """Получает суммаризацию из кэша или генерирует новую"""
-    try:
-        from core.summarizer import summarize_document
-        
-        result = summarize_document(
-            doc_id=doc_id,
-            text=text,
-            model=model,
-            max_length=max_length,
-            temperature=temperature,
-            use_cache=True
-        )
-        
-        if result["status"] == "success":
-            return result["summary"]
-        else:
-            return result.get("error", "#ERROR: Не удалось сгенерировать резюме")
-    
+                full_text += "\n" + " | ".join(c.text.strip() for c in row.cells)
+        return _split_into_pages(full_text, method="direct")
     except ImportError:
-        return summarize_with_ai(text, max_length, temperature, model)
+        return [{"page": 1, "text": "[python-docx не установлен: pip install python-docx]",
+                 "method": "error", "word_count": 0}]
     except Exception as e:
-        return f"#ERROR: {str(e)}"
+        return [{"page": 1, "text": f"[Ошибка DOCX: {e}]",
+                 "method": "error", "word_count": 0}]
 
-def summarize_folder_cached(folder_id, documents, max_length=1000, temperature=0.3, model="phi3"):
-    """Генерирует сводное резюме по папке документов"""
+
+def _extract_doc(file_bytes: bytes) -> List[Dict]:
+    """DOC (старый формат) → текст через mammoth."""
     try:
-        from core.summarizer import summarize_folder
-        
-        result = summarize_folder(
-            folder_id=folder_id,
-            documents=documents,
-            model=model,
-            max_length=max_length,
-            temperature=temperature,
-            use_cache=True
-        )
-        
-        if result["status"] == "success":
-            return result["summary"]
-        else:
-            return result.get("error", "#ERROR: Не удалось сгенерировать резюме по папке")
-    
+        import mammoth
+        result = mammoth.extract_raw_text(io.BytesIO(file_bytes))
+        return _split_into_pages(result.value, method="direct")
+    except ImportError:
+        return [{"page": 1, "text": "[mammoth не установлен: pip install mammoth]",
+                 "method": "error", "word_count": 0}]
     except Exception as e:
-        return f"#ERROR: {str(e)}"
+        return [{"page": 1, "text": f"[Ошибка DOC: {e}]",
+                 "method": "error", "word_count": 0}]
+
+
+def _extract_xlsx(file_bytes: bytes) -> List[Dict]:
+    """XLSX → текст из всех листов."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        lines = []
+        for sheet in wb.worksheets:
+            lines.append(f"=== Лист: {sheet.title} ===")
+            for row in sheet.iter_rows(values_only=True):
+                row_text = " | ".join(str(c) for c in row if c is not None)
+                if row_text.strip():
+                    lines.append(row_text)
+        return _split_into_pages("\n".join(lines), method="direct")
+    except ImportError:
+        return [{"page": 1, "text": "[openpyxl не установлен: pip install openpyxl]",
+                 "method": "error", "word_count": 0}]
+    except Exception as e:
+        return [{"page": 1, "text": f"[Ошибка XLSX: {e}]",
+                 "method": "error", "word_count": 0}]
+
+
+def _extract_image(file_bytes: bytes) -> List[Dict]:
+    """JPG/PNG → OCR."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(file_bytes))
+        text = _ocr_image(img)
+        return [{"page": 1, "text": text, "method": "ocr",
+                 "word_count": len(text.split())}]
+    except Exception as e:
+        return [{"page": 1, "text": f"[Ошибка изображения: {e}]",
+                 "method": "error", "word_count": 0}]
+
+
+def _split_into_pages(text: str, method: str = "direct", lines_per_page: int = 80) -> List[Dict]:
+    """Разбивает длинный текст на условные страницы."""
+    lines = text.splitlines()
+    pages = []
+    for i in range(0, max(1, len(lines)), lines_per_page):
+        chunk = "\n".join(lines[i:i + lines_per_page]).strip()
+        pages.append({
+            "page": len(pages) + 1,
+            "text": chunk,
+            "method": method,
+            "word_count": len(chunk.split()),
+        })
+    return pages if pages else [{"page": 1, "text": text, "method": method,
+                                  "word_count": len(text.split())}]
+
+
+def extract_text(file_bytes: bytes, filename: str) -> List[Dict]:
+    """Универсальный экстрактор — выбирает метод по расширению файла."""
+    ext = os.path.splitext(filename.lower())[1]
+    if ext == ".pdf":
+        return _extract_pdf(file_bytes, filename)
+    elif ext == ".docx":
+        return _extract_docx(file_bytes)
+    elif ext in (".doc",):
+        return _extract_doc(file_bytes)
+    elif ext in (".xlsx", ".xls"):
+        return _extract_xlsx(file_bytes)
+    elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"):
+        return _extract_image(file_bytes)
+    else:
+        return [{"page": 1, "text": f"[Формат {ext} не поддерживается]",
+                 "method": "error", "word_count": 0}]
+
 
 # =============================================================================
-# Функции хранения и поиска
+# База документов
 # =============================================================================
-def get_scans_db_path():
-    """Путь к базе распознанных документов"""
-    db_dir = os.path.join("data", "doc_scanner")
-    if not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-    return os.path.join(db_dir, "scans_db.json")
+def add_to_db(db: Dict, filename: str, pages: List[Dict]) -> str:
+    doc_id = hashlib.md5(
+        f"{filename}_{datetime.now().isoformat()}".encode()
+    ).hexdigest()[:12]
 
-def load_scans_db():
-    """Загружает базу распознанных документов"""
-    db_path = get_scans_db_path()
-    if os.path.exists(db_path):
-        with open(db_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"documents": [], "folders": {}, "stats": {"total": 0, "processed": 0, "last_scan": None}}
+    full_text = "\n".join(p["text"] for p in pages)
+    ocr_pages = sum(1 for p in pages if p.get("method") == "ocr")
 
-def save_scans_db(db):
-    """Сохраняет базу распознанных документов"""
-    db_path = get_scans_db_path()
-    with open(db_path, 'w', encoding='utf-8') as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-
-def add_document_to_db(db, file_path, text, pages_data, doc_type="unknown", folder_name=None):
-    """Добавляет документ в базу"""
-    doc_id = f"doc_{len(db['documents']) + 1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-
-    doc_type_keywords = {
-        "invoice": ["счет", "invoice", "счет-фактура"],
-        "act": ["акт", "act", "авр"],
-        "contract": ["договор", "contract", "соглашение", "контракт"],
-        "nakladnaya": ["накладная", "торг-12", "упд"],
-        "other": []
-    }
-
-    for dtype, keywords in doc_type_keywords.items():
-        if any(kw in file_name.lower() for kw in keywords):
-            doc_type = dtype
-            break
-
-    document = {
+    doc = {
         "id": doc_id,
-        "file_name": file_name,
-        "file_path": file_path,
-        "file_size": file_size,
-        "doc_type": doc_type,
-        "text": text,
-        "pages": pages_data,
+        "filename": filename,
+        "pages": pages,
+        "full_text": full_text,
+        "word_count": sum(p["word_count"] for p in pages),
+        "page_count": len(pages),
+        "ocr_pages": ocr_pages,
         "processed_at": datetime.now().isoformat(),
-        "word_count": sum(p.get("word_count", 0) for p in pages_data),
-        "folder_name": folder_name
     }
-
-    db["documents"].append(document)
-    db["stats"]["total"] += 1
-    db["stats"]["processed"] += 1
-    db["stats"]["last_scan"] = datetime.now().isoformat()
-    
-    if folder_name:
-        if folder_name not in db["folders"]:
-            db["folders"][folder_name] = []
-        db["folders"][folder_name].append(doc_id)
-
+    db["documents"].append(doc)
+    db["stats"]["total"] = len(db["documents"])
+    db["stats"]["last_scan"] = doc["processed_at"]
     return doc_id
 
-def search_in_documents(db, query, use_ai_synonyms=True):
-    """Поиск по распознанным документам с AI-синонимами"""
+
+# =============================================================================
+# Поиск с синонимами
+# =============================================================================
+def search_documents(db: Dict, query: str) -> List[Dict]:
+    """Поиск по всем документам с синонимами через QueryExpander."""
     if not query.strip():
         return []
 
-    synonyms = generate_synonyms(query) if use_ai_synonyms else [query]
-    results = []
+    # Расширяем запрос синонимами
+    search_terms = [query.lower()]
+    try:
+        from core.query_expander import QueryExpander
+        variants = QueryExpander().expand(query)
+        # Берём только словарные варианты (без тарифного суффикса)
+        search_terms += [
+            v.lower() for v in variants
+            if v != query and not v.endswith("тарифное регулирование")
+        ]
+    except Exception:
+        pass
 
+    results = []
     for doc in db.get("documents", []):
-        doc_matches = []
-        
+        matches = []
         for page in doc.get("pages", []):
             page_text = page.get("text", "").lower()
-            
-            match_found = False
-            match_terms = []
-            
-            for term in synonyms:
-                if term.lower() in page_text:
-                    match_found = True
-                    match_terms.append(term)
-            
-            if match_found:
-                context = find_context(page_text, query)
-                doc_matches.append({
-                    "page": page.get("page", 1),
+            matched_terms = [t for t in search_terms if t in page_text]
+            if matched_terms:
+                # Находим контекст вокруг первого совпадения
+                term = matched_terms[0]
+                idx = page_text.find(term)
+                start = max(0, idx - 100)
+                end = min(len(page_text), idx + 200)
+                context = "..." + page_text[start:end].strip() + "..."
+                # Подсвечиваем все совпавшие термины
+                for t in matched_terms:
+                    context = re.sub(
+                        re.escape(t), f"**{t.upper()}**", context, flags=re.IGNORECASE
+                    )
+                matches.append({
+                    "page": page["page"],
                     "context": context,
-                    "match_terms": match_terms
+                    "matched_terms": matched_terms,
                 })
-        
-        if doc_matches:
+
+        if matches:
             results.append({
-                "document": doc,
-                "matches": doc_matches,
-                "total_matches": len(doc_matches)
+                "doc": doc,
+                "matches": matches,
+                "total_matches": len(matches),
             })
 
     results.sort(key=lambda x: x["total_matches"], reverse=True)
     return results
 
-def generate_synonyms(query):
-    """Генерирует синонимы для поиска (тарифная тематика)"""
-    synonym_dict = {
-        "счет": ["invoice", "счет-фактура", "счет на оплату"],
-        "акт": ["act", "акт выполненных работ", "авр"],
-        "договор": ["contract", "соглашение", "контракт"],
-        "накладная": ["товарная накладная", "торг-12", "упд"],
-        "тариф": ["цена", "ставка", "тарифный план"],
-        "затраты": ["расходы", "издержки", "costs"],
-        "выручка": ["доход", "revenue", "прибыль"],
-        "амортизация": ["аморт", "износ", "depreciation"],
-        "численность": ["штат", "сотрудники", "personnel", "кадры"],
-        "ремонт": ["repair", "восстановление", "то"],
-        "электроэнергия": ["электричество", "electric", "квт", "квтч"],
-        "тепло": ["thermal", "гкал", "отопление"],
-        "вода": ["water", "водоснабжение", "м3", "куб"],
-        "тко": ["отходы", "мусор", "waste", "твердые коммунальные отходы"]
-    }
-
-    synonyms = [query]
-    query_lower = query.lower()
-
-    for key, syns in synonym_dict.items():
-        if key in query_lower:
-            synonyms.extend(syns)
-
-    if query_lower.endswith("а"):
-        synonyms.append(query_lower[:-1] + "у")
-        synonyms.append(query_lower[:-1] + "е")
-    elif query_lower.endswith("ы"):
-        synonyms.append(query_lower[:-1] + "у")
-        synonyms.append(query_lower[:-1])
-
-    return list(set(synonyms))
-
-def find_context(text, query, window=100):
-    """Находит контекст вокруг найденного запроса"""
-    text_lower = text.lower()
-    query_lower = query.lower()
-
-    idx = text_lower.find(query_lower)
-    if idx == -1:
-        return text[:200] + "..." if len(text) > 200 else text
-
-    start = max(0, idx - window)
-    end = min(len(text), idx + len(query) + window)
-
-    context = text[start:end]
-    if start > 0:
-        context = "..." + context
-    if end < len(text):
-        context = context + "..."
-
-    context = context.replace(query, f"**{query}**")
-    return context
-
-def export_search_results(results, output_format="txt"):
-    """Экспортирует результаты поиска"""
-    if output_format == "txt":
-        output = io.StringIO()
-        output.write("РЕЗУЛЬТАТЫ ПОИСКА\n")
-        output.write("=" * 80 + "\n\n")
-        
-        for res in results:
-            doc = res["document"]
-            output.write(f"Документ: {doc['file_name']}\n")
-            output.write(f"Совпадений: {res['total_matches']}\n")
-            output.write(f"Тип: {doc['doc_type']}\n")
-            output.write(f"Обработан: {doc['processed_at'][:10]}\n")
-            output.write("-" * 80 + "\n")
-            
-            for match in res["matches"]:
-                output.write(f"  Страница {match['page']}: {match['context']}\n")
-            output.write("\n")
-        
-        return output.getvalue().encode('utf-8')
-
-    elif output_format == "docx":
-        doc = DocxDocument()
-        p = doc.add_paragraph("РЕЗУЛЬТАТЫ ПОИСКА")
-        p.alignment = 1
-        run = p.runs[0]
-        run.bold = True
-        run.font.size = 16
-        
-        for res in results:
-            d = res["document"]
-            p = doc.add_paragraph(f"Документ: {d['file_name']}")
-            p.runs[0].bold = True
-            doc.add_paragraph(f"Совпадений: {res['total_matches']}")
-            doc.add_paragraph(f"Тип: {d['doc_type']}")
-            
-            for match in res["matches"]:
-                doc.add_paragraph(f"  Страница {match['page']}: {match['context']}")
-            doc.add_paragraph("-" * 80)
-        
-        output = io.BytesIO()
-        doc.save(output)
-        output.seek(0)
-        return output
-
-    return None
 
 # =============================================================================
-# Интерфейс Streamlit
+# Пересказ через LM Studio
+# =============================================================================
+def summarize_document(text: str, length: str = "средний", model: str = None) -> str:
+    """
+    Пересказывает текст через LM Studio.
+    length: "краткий" (300 токенов), "средний" (800), "подробный" (2000)
+    """
+    length_map = {
+        "краткий":    (300,  "в 3-5 предложениях, только главное"),
+        "средний":    (800,  "в 1-2 абзацах с ключевыми деталями"),
+        "подробный":  (2000, "подробно, с перечислением всех важных пунктов"),
+    }
+    max_tokens, instruction = length_map.get(length, length_map["средний"])
+
+    # Обрезаем текст до разумного размера (≈ 6000 символов → ~1500 токенов)
+    text_for_llm = text[:6000] + ("..." if len(text) > 6000 else "")
+
+    prompt = (
+        f"Перескажи содержание документа {instruction}. "
+        f"Отвечай на русском языке, без лишних вступлений.\n\n"
+        f"ДОКУМЕНТ:\n{text_for_llm}"
+    )
+
+    try:
+        from openai import OpenAI
+        config_path = os.path.join("config", "advisor_config.json")
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+        lm_url = config.get("lm_studio_url", "http://127.0.0.1:1234/v1")
+        model  = model or config.get("default_model", "qwen/qwen3.5-9b")
+
+        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=120.0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Ты помощник для анализа документов. Отвечаешь кратко и по делу."},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
+        return response.choices[0].message.content or "[Пустой ответ]"
+    except Exception as e:
+        return f"[Ошибка пересказа: {e}]"
+
+
+# =============================================================================
+# Экспорт результатов
+# =============================================================================
+def export_txt(doc: Dict) -> bytes:
+    """Экспорт в TXT."""
+    _pc = doc.get("page_count") or len(doc.get("pages", []))
+    lines = [
+        f"Документ: {_fname(doc)}",
+        f"Обработан: {(doc.get('processed_at') or '')[:16]}",
+        f"Страниц: {_pc} | Слов: {doc.get('word_count', 0)}",
+        "=" * 60,
+        "",
+    ]
+    for page in doc.get("pages", []):
+        lines.append(f"--- Страница {page.get('page',1)} ({page.get('method','')}) ---")
+        lines.append(page.get("text", ""))
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def export_docx(doc: Dict, summary: str = None) -> io.BytesIO:
+    """Экспорт в DOCX."""
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        d = Document()
+        _pc = doc.get("page_count") or len(doc.get("pages", []))
+
+        h = d.add_heading(_fname(doc), level=1)
+        h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        d.add_paragraph(f"Обработан: {(doc.get('processed_at') or '')[:16]}")
+        d.add_paragraph(f"Страниц: {_pc} | Слов: {doc.get('word_count', 0)}")
+        d.add_paragraph(f"OCR-страниц: {doc.get('ocr_pages', 0)}")
+
+        if summary:
+            d.add_heading("Краткое содержание", level=2)
+            d.add_paragraph(summary)
+
+        d.add_heading("Текст документа", level=2)
+        for page in doc.get("pages", []):
+            d.add_heading(f"Страница {page.get('page',1)}", level=3)
+            d.add_paragraph(page.get("text", ""))
+
+        buf = io.BytesIO()
+        d.save(buf)
+        buf.seek(0)
+        return buf
+    except ImportError:
+        raise RuntimeError("python-docx не установлен: pip install python-docx")
+
+
+# =============================================================================
+# UI — главная страница сканера
 # =============================================================================
 def show_doc_scanner():
-    """Страница AI-Сканера документов"""
     st.header("📸 AI-Сканер документов")
-    st.info("📌 Распознавание через EasyOCR + Поиск по содержимому + GPU ускорение")
+    st.caption("EasyOCR · PDF · DOCX · DOC · XLSX · JPG · PNG · Пересказ · Поиск")
 
-    # Инициализация session_state
-    if "scan_db" not in st.session_state:
-        st.session_state.scan_db = load_scans_db()
-    if "search_results" not in st.session_state:
-        st.session_state.search_results = []
-    if "selected_doc" not in st.session_state:
-        st.session_state.selected_doc = None
-    if "current_summary" not in st.session_state:
-        st.session_state.current_summary = None
-    if "selected_folder_summary" not in st.session_state:
-        st.session_state.selected_folder_summary = None
+    # Инициализация OCR один раз
+    if "ocr_initialized" not in st.session_state:
+        with st.spinner("⚙️ Инициализация OCR..."):
+            _init_ocr()
+        st.session_state["ocr_initialized"] = True
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 1: Выбор режима (Файл ИЛИ Папка)
-    # ─────────────────────────────────────────────────────────────────────
-    st.subheader("1. Выбор источника документов")
-    
-    scan_mode = st.radio(
-        "Режим работы",
-        ["📄 Один файл", "📁 Папка с документами"],
-        horizontal=True,
-        key="scan_mode_select"
-    )
-    
-    # Настройки GPU и МОДЕЛИ
-    with st.expander("⚙️ Настройки OCR и AI", expanded=False):
-        use_gpu = st.checkbox("Использовать GPU для OCR", value=True, help="Требуется NVIDIA CUDA")
-        st.caption("Если GPU не доступен — автоматически переключится на CPU")
-        
-        st.divider()
-        
-        # ✅ ВЫБОР МОДЕЛИ ДЛЯ СУММАРИЗАЦИИ
-        st.write("**🤖 Модель для суммаризации:**")
-        available_models = get_available_models()
-        selected_model = st.selectbox(
-            "Выберите модель",
-            options=available_models,
-            index=0 if "phi3" in available_models else 0,
-            key="scanner_model_select",
-            help="phi3 быстрее для 4GB VRAM, llama3.2 качественнее но требует больше памяти"
+    # Статус OCR — показываем что активно
+    if _EASYOCR_AVAILABLE:
+        st.success("✅ OCR: EasyOCR активен", icon="🔍")
+    elif _TESSERACT_AVAILABLE:
+        st.warning("⚠️ OCR: PaddleOCR недоступен, используется Tesseract (хуже качество). Установите: `pip install paddlepaddle paddleocr`")
+    else:
+        _ocr_err = st.session_state.get("ocr_init_error")
+        if _ocr_err:
+            st.error(f"❌ OCR ошибка инициализации:\n```\n{_ocr_err}\n```")
+        else:
+            st.error("❌ OCR не найден. Установите: `pip install paddlepaddle paddleocr pillow`")
+
+    # Загрузка базы
+    if "scanner_db" not in st.session_state:
+        st.session_state["scanner_db"] = load_db()
+
+    db = st.session_state["scanner_db"]
+
+    # ── Вкладки ──────────────────────────────────────────────────────────
+    tab_scan, tab_search, tab_docs = st.tabs([
+        "📤 Загрузка и распознавание",
+        "🔍 Поиск по содержимому",
+        "📚 База документов",
+    ])
+
+    # =========================================================================
+    # Вкладка 1 — Загрузка и распознавание
+    # =========================================================================
+    with tab_scan:
+        st.subheader("Загрузка файлов")
+
+        SUPPORTED = ["pdf", "docx", "doc", "xlsx", "xls", "jpg", "jpeg", "png", "bmp", "tiff"]
+        uploaded = st.file_uploader(
+            "Перетащите файлы или выберите из папки",
+            type=SUPPORTED,
+            accept_multiple_files=True,
+            help="Поддерживаются: PDF (текстовые и сканы), DOCX, DOC, XLSX, JPG, PNG",
         )
-        st.caption(f"✅ Доступные модели: {', '.join(available_models)}")
-    
-    files_to_process = []
-    folder_name = None
 
-    if scan_mode == "📄 Один файл":
-        uploaded_file = st.file_uploader(
-            "Загрузить файл",
-            type=['pdf', 'jpg', 'jpeg', 'png', 'tiff', 'tif', 'docx', 'doc', 'txt'],
-            key="scanner_single_upload"
-        )
-        
-        if uploaded_file:
-            temp_dir = os.path.join("data", "doc_scanner", "temp")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_path = os.path.join(temp_dir, uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            files_to_process = [temp_path]
-    
-    else:  # Папка
-        folder_path = st.text_input(
-            "📁 Путь к папке с документами",
-            placeholder="C:\\documents\\scans",
-            key="folder_path_input"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            batch_size = st.slider("Пакетная обработка", 1, 100, 20)
-        with col2:
-            folder_name = st.text_input("Название папки (для группировки)", value="")
-        
-        if folder_path and os.path.exists(folder_path):
-            if not folder_name:
-                folder_name = os.path.basename(folder_path)
-            
-            for root, dirs, files in os.walk(folder_path):
-                for file in files:
-                    if file.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.docx', '.doc', '.txt')):
-                        files_to_process.append(os.path.join(root, file))
-            
-            st.info(f"📊 Найдено документов: {len(files_to_process)}")
+        if uploaded:
+            st.info(f"📎 Загружено файлов: **{len(uploaded)}**")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Кнопка запуска распознавания
-    # ─────────────────────────────────────────────────────────────────────
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        if st.button("🚀 Запустить распознавание", use_container_width=True, type="primary", disabled=not files_to_process):
-            if files_to_process:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                processed = 0
-                errors = []
-                
-                for i, file_path in enumerate(files_to_process[:batch_size] if scan_mode == "📁 Папка" else files_to_process):
-                    try:
-                        status_text.text(f"🔄 Обработка: {os.path.basename(file_path)} ({i+1}/{len(files_to_process)})")
-                        text, pages_data = process_document(file_path, use_gpu=use_gpu)
-                        
-                        if text.startswith("#ERROR") or text.startswith("#WARNING"):
-                            errors.append(f"{os.path.basename(file_path)}: {text}")
-                        
-                        add_document_to_db(
-                            st.session_state.scan_db, 
-                            file_path, 
-                            text, 
-                            pages_data, 
-                            folder_name=folder_name
+            # Кнопка запуска
+            if st.button("🚀 Запустить распознавание", type="primary", key="scan_btn"):
+                progress = st.progress(0)
+                status   = st.empty()
+                new_ids  = []
+
+                for i, f in enumerate(uploaded):
+                    status.text(f"⏳ Обрабатываю {f.name} ({i+1}/{len(uploaded)})...")
+                    progress.progress((i) / len(uploaded))
+
+                    file_bytes = f.read()
+                    t0 = time.perf_counter()
+                    pages = extract_text(file_bytes, f.name)
+                    elapsed = time.perf_counter() - t0
+
+                    doc_id = add_to_db(db, f.name, pages)
+                    new_ids.append(doc_id)
+
+                    ocr_count = sum(1 for p in pages if p.get("method") == "ocr")
+                    words     = sum(p["word_count"] for p in pages)
+                    st.success(
+                        f"✅ **{f.name}** — {len(pages)} стр., {words} слов, "
+                        f"{ocr_count} OCR-стр., {elapsed:.1f} сек"
+                    )
+
+                progress.progress(1.0)
+                status.text("✅ Все файлы обработаны!")
+                save_db(db)
+                st.session_state["scanner_db"] = db
+                st.session_state["last_scanned_ids"] = new_ids
+
+        # ── Результаты последней обработки ──────────────────────────────
+        last_ids = st.session_state.get("last_scanned_ids", [])
+        if last_ids:
+            st.divider()
+            st.subheader("📄 Результаты распознавания")
+
+            last_docs = [d for d in db["documents"] if d["id"] in last_ids]
+
+            for doc in last_docs:
+                _pc2 = doc.get("page_count") or len(doc.get("pages", []))
+                _wc2 = doc.get("word_count", 0)
+                with st.expander(f"📄 {_fname(doc)} — {_pc2} стр., {_wc2} слов"):
+
+                    # ── Навигация по страницам ───────────────────────────
+                    pages_list = doc.get("pages", [])
+                    page_key   = f"page_idx_{doc['id']}"
+                    if page_key not in st.session_state:
+                        st.session_state[page_key] = 0
+
+                    cur_idx  = st.session_state[page_key]
+                    cur_idx  = max(0, min(cur_idx, len(pages_list) - 1))
+                    cur_page = pages_list[cur_idx] if pages_list else {}
+
+                    # Навигационная панель
+                    nav1, nav2, nav3 = st.columns([1, 4, 1])
+                    with nav1:
+                        if st.button("◀ Пред.", key=f"prev_btn_{doc['id']}",
+                                     disabled=(cur_idx == 0)):
+                            st.session_state[page_key] = cur_idx - 1
+                            st.rerun()
+                    with nav2:
+                        st.markdown(
+                            f"<div style='text-align:center; padding-top:6px;'>"
+                            f"Страница <b>{cur_idx+1}</b> из <b>{len(pages_list)}</b> "
+                            f"<span style='color:grey;font-size:0.85em;'>"
+                            f"({cur_page.get('method','')} · "
+                            f"{cur_page.get('word_count') or len(cur_page.get('text','').split())} слов)"
+                            f"</span></div>",
+                            unsafe_allow_html=True,
                         )
-                        processed += 1
-                        progress_bar.progress((i + 1) / len(files_to_process))
-                    except Exception as e:
-                        errors.append(f"{os.path.basename(file_path)}: {str(e)}")
-                
-                save_scans_db(st.session_state.scan_db)
-                status_text.text(f"✅ Обработано: {processed} документов")
-                
-                if processed > 0:
-                    st.success(f"✅ Готово! Обработано {processed} документов.")
-                
-                if errors:
-                    st.warning(f"⚠️ Ошибок: {len(errors)}")
-                    with st.expander("📋 Показать ошибки"):
-                        for err in errors[:10]:
-                            st.write(f"• {err}")
-                        if len(errors) > 10:
-                            st.write(f"... и ещё {len(errors) - 10} ошибок")
-                
-                st.rerun()
-            else:
-                st.warning("⚠️ Нет файлов для обработки")
-    
-    with col2:
-        if st.button("🗑 Очистить базу", use_container_width=True):
-            st.session_state.scan_db = {"documents": [], "folders": {}, "stats": {"total": 0, "processed": 0, "last_scan": None}}
-            save_scans_db(st.session_state.scan_db)
-            st.success("✅ База очищена")
-            st.rerun()
+                    with nav3:
+                        if st.button("След. ▶", key=f"next_btn_{doc['id']}",
+                                     disabled=(cur_idx >= len(pages_list) - 1)):
+                            st.session_state[page_key] = cur_idx + 1
+                            st.rerun()
 
-    st.divider()
+                    # Текст текущей страницы — уменьшенный шрифт
+                    st.markdown(
+                        f"<div style='font-size:0.87em; line-height:1.55; "
+                        f"background:#f8f9fa; border:1px solid #e0e0e0; "
+                        f"border-radius:6px; padding:12px 14px; "
+                        f"max-height:320px; overflow-y:auto; "
+                        f"white-space:pre-wrap; word-break:break-word;'>"
+                        f"{cur_page.get('text','').replace('<','&lt;').replace('>','&gt;')}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 2: Статистика и список документов
-    # ─────────────────────────────────────────────────────────────────────
-    st.subheader("2. База распознанных документов")
-
-    stats = st.session_state.scan_db.get("stats", {})
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📊 Всего", stats.get("total", 0))
-    col2.metric("✅ Обработано", stats.get("processed", 0))
-    col3.metric("📄 Страниц", sum(len(doc.get("pages", [])) for doc in st.session_state.scan_db.get("documents", [])))
-    col4.metric("🕐 Последний", stats.get("last_scan", "—")[:16] if stats.get("last_scan") else "—")
-
-    documents = st.session_state.scan_db.get("documents", [])
-    folders = st.session_state.scan_db.get("folders", {})
-
-    if documents:
-        st.write("**📋 Последние документы:**")
-        df_docs = pd.DataFrame([
-            {
-                "ID": doc.get("id", "")[:20],
-                "Файл": doc.get("file_name", ""),
-                "Тип": doc.get("doc_type", ""),
-                "Страниц": len(doc.get("pages", [])),
-                "Слов": doc.get("word_count", 0),
-                "Папка": doc.get("folder_name", "—"),
-                "Дата": doc.get("processed_at", "")[:10]
-            }
-            for doc in documents[-20:]
-        ])
-        st.dataframe(df_docs, use_container_width=True, hide_index=True)
-        
-        # Выбор режима просмотра
-        view_mode = st.radio("Просмотр", ["По документу", "По папке"], horizontal=True, key="view_mode_select")
-        
-        if view_mode == "По документу":
-            selected_doc_id = st.selectbox(
-                "📄 Просмотр документа",
-                options=[""] + [doc.get("id", "") for doc in documents],
-                format_func=lambda x: next((doc.get("file_name", "") for doc in documents if doc.get("id") == x), "") if x else "— Выберите —"
-            )
-            
-            if selected_doc_id:
-                selected_doc = next((doc for doc in documents if doc.get("id") == selected_doc_id), None)
-                if selected_doc:
-                    st.session_state.selected_doc = selected_doc
-                    st.session_state.selected_folder_summary = None
-                    
-                    st.write(f"**📄 {selected_doc['file_name']}**")
-                    st.write(f"**Тип:** {selected_doc.get('doc_type', '')}")
-                    st.write(f"**Страниц:** {len(selected_doc.get('pages', []))}")
-                    st.write(f"**Слов:** {selected_doc.get('word_count', 0)}")
-                    
-                    first_page_text = selected_doc.get("pages", [{}])[0].get("text", "")
-                    if first_page_text.startswith("#ERROR") or first_page_text.startswith("#WARNING"):
-                        st.warning(f"⚠️ {first_page_text}")
-                    
                     st.divider()
-                    
-                    # КНОПКА AI-СУММАРИЗАЦИИ (ОДИН ДОКУМЕНТ) С ВЫБОРОМ МОДЕЛИ
-                    col1, col2 = st.columns([3, 1])
-                    
+
+                    # ── Пересказ ─────────────────────────────────────────
+                    summary_key = f"summary_{doc['id']}"
+                    sum_len_key = f"sum_len_{doc['id']}"
+
+                    col1, col2 = st.columns([3, 2])
                     with col1:
-                        st.write("**📋 Содержимое:**")
-                    
+                        summary_length = st.radio(
+                            "Длина пересказа",
+                            ["краткий", "средний", "подробный"],
+                            horizontal=True,
+                            key=sum_len_key,
+                            index=1,
+                        )
                     with col2:
-                        summary_length = st.slider("Длина резюме", 200, 2000, 800, 100, key=f"sum_len_{selected_doc['id']}")
-                        
-                        # ✅ Модель выбирается из настроек выше
-                        if st.button("🤖 AI-Резюме", use_container_width=True, type="secondary", key=f"summarize_{selected_doc['id']}"):
-                            with st.spinner(f"🔄 AI создаёт краткое содержание ({selected_model})..."):
-                                full_text = "\n".join([page.get("text", "") for page in selected_doc.get("pages", [])])
-                                summary = get_document_summary_cached(
-                                    selected_doc["id"], 
-                                    full_text, 
-                                    max_length=summary_length,
-                                    model=selected_model  # ✅ Передаём выбранную модель
+                        if st.button("📝 Сгенерировать пересказ",
+                                     key=f"sum_btn_{doc['id']}", type="primary"):
+                            with st.spinner("🤖 Генерирую пересказ..."):
+                                summary = summarize_document(
+                                    doc.get("full_text", ""), summary_length
                                 )
-                                st.session_state.current_summary = summary
-                                st.session_state.selected_folder_summary = None
-                                st.success("✅ Резюме готово!")
-                    
-                    # Показываем содержимое по страницам
-                    for page in selected_doc.get("pages", [])[:5]:
-                        st.markdown(f"#### 📃 Страница {page.get('page', 1)}")
-                        page_text = page.get("text", "")
-                        if len(page_text) > 2000:
-                            with st.expander("Показать полностью"):
-                                st.text(page_text)
-                        else:
-                            st.text(page_text)
-                        st.divider()
-                    
-                    if len(selected_doc.get("pages", [])) > 5:
-                        if st.button(f"📖 Показать все {len(selected_doc['pages'])} страниц"):
-                            for page in selected_doc.get("pages", []):
-                                st.markdown(f"#### 📃 Страница {page.get('page', 1)}")
-                                st.text(page.get("text", ""))
-                                st.divider()
-                    
-                    # ОКНО С AI-РЕЗЮМЕ
-                    if st.session_state.current_summary and not st.session_state.selected_folder_summary:
-                        st.divider()
-                        st.subheader(f"🤖 AI-Резюме документа ({selected_model})")
-                        
-                        with st.expander("📄 Показать резюме", expanded=True):
-                            if st.session_state.current_summary.startswith("#ERROR"):
-                                st.error(st.session_state.current_summary)
-                            else:
-                                st.markdown(st.session_state.current_summary)
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    if st.button("🔄 Перегенерировать", key=f"regen_sum_{selected_doc['id']}"):
-                                        st.session_state.current_summary = None
-                                        st.rerun()
-                                with col2:
-                                    summary_text = st.session_state.current_summary
-                                    st.download_button(
-                                        label="📥 Скачать резюме (TXT)",
-                                        data=summary_text.encode('utf-8'),
-                                        file_name=f"Summary_{selected_doc['file_name'][:30]}.txt",
-                                        mime="text/plain",
-                                        use_container_width=True
-                                    )
-        
-        else:  # По папке
-            if folders:
-                selected_folder = st.selectbox(
-                    "📁 Выберите папку",
-                    options=[""] + list(folders.keys()),
-                    key="folder_summary_select"
-                )
-                
-                if selected_folder:
-                    folder_doc_ids = folders[selected_folder]
-                    folder_docs = [doc for doc in documents if doc.get("id") in folder_doc_ids]
-                    
-                    st.write(f"**📁 Папка:** {selected_folder}")
-                    st.write(f"**Документов:** {len(folder_docs)}")
-                    
+                            st.session_state[summary_key] = summary
+
+                    # Блок пересказа с кнопкой копирования
+                    _summary_text = st.session_state.get(summary_key)
+                    if _summary_text:
+                        st.markdown("**🤖 Пересказ:**")
+                        _sum_h = max(120, min(480, len(_summary_text) // 3))
+                        st.markdown(
+                            f"<div style='font-size:0.87em; line-height:1.6; "
+                            f"background:#f0f4f8; border:1px solid #d0d8e4; "
+                            f"border-radius:6px; padding:12px 14px; "
+                            f"max-height:{_sum_h}px; overflow-y:auto; "
+                            f"white-space:pre-wrap; word-break:break-word;'>"
+                            f"{_summary_text.replace('<','&lt;').replace('>','&gt;')}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                        # Кнопка копирования — через st.code в схлопнутом expander
+                        with st.expander("📋 Скопировать пересказ", expanded=False):
+                            st.code(_summary_text, language=None)
+
                     st.divider()
-                    
-                    # КНОПКА AI-СУММАРИЗАЦИИ (ПАПКА) С ВЫБОРОМ МОДЕЛИ
-                    if st.button("🤖 AI-Резюме по папке", type="primary", key=f"folder_summarize_{selected_folder}"):
-                        with st.spinner(f"🔄 AI создаёт сводное резюме по папке ({selected_model})..."):
-                            summary = summarize_folder_cached(
-                                selected_folder,
-                                folder_docs,
-                                max_length=1500,
-                                model=selected_model  # ✅ Передаём выбранную модель
+
+                    # ── Экспорт ──────────────────────────────────────────
+                    st.markdown("**💾 Сохранить результат:**")
+                    exp_col1, exp_col2 = st.columns(2)
+
+                    with exp_col1:
+                        txt_data = export_txt(doc)
+                        st.download_button(
+                            label="📄 Скачать TXT",
+                            data=txt_data,
+                            file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.txt",
+                            mime="text/plain",
+                            width="stretch",
+                            key=f"dl_txt_{doc['id']}",
+                        )
+
+                    with exp_col2:
+                        try:
+                            summary_text = st.session_state.get(f"summary_{doc['id']}")
+                            docx_buf = export_docx(doc, summary=summary_text)
+                            st.download_button(
+                                label="📝 Скачать DOCX",
+                                data=docx_buf,
+                                file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                width="stretch",
+                                key=f"dl_docx_{doc['id']}",
                             )
-                            st.session_state.selected_folder_summary = {
-                                "folder": selected_folder,
-                                "summary": summary,
-                                "docs": folder_docs
-                            }
-                            st.success("✅ Сводное резюме готово!")
-                    
-                    # Список документов в папке
-                    st.write("**📄 Документы в папке:**")
-                    for doc in folder_docs:
-                        with st.expander(f"📄 {doc['file_name']} ({doc.get('word_count', 0)} слов)"):
-                            st.write(f"**Тип:** {doc.get('doc_type', '')}")
-                            st.write(f"**Страниц:** {len(doc.get('pages', []))}")
-                            if st.button("Открыть", key=f"open_from_folder_{doc['id']}"):
-                                st.session_state.selected_doc = doc
-                                st.rerun()
-                    
-                    # ОКНО С AI-РЕЗЮМЕ ПО ПАПКЕ
-                    if st.session_state.selected_folder_summary:
-                        st.divider()
-                        st.subheader(f"🤖 AI-Резюме по папке: {st.session_state.selected_folder_summary['folder']} ({selected_model})")
-                        
-                        with st.expander("📄 Показать сводное резюме", expanded=True):
-                            if st.session_state.selected_folder_summary["summary"].startswith("#ERROR"):
-                                st.error(st.session_state.selected_folder_summary["summary"])
-                            else:
-                                st.markdown(st.session_state.selected_folder_summary["summary"])
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    if st.button("🔄 Перегенерировать", key="regen_folder_sum"):
-                                        st.session_state.selected_folder_summary = None
-                                        st.rerun()
-                                with col2:
-                                    summary_text = st.session_state.selected_folder_summary["summary"]
-                                    st.download_button(
-                                        label="📥 Скачать резюме (TXT)",
-                                        data=summary_text.encode('utf-8'),
-                                        file_name=f"Folder_Summary_{selected_folder[:30]}.txt",
-                                        mime="text/plain",
-                                        use_container_width=True
-                                    )
-            else:
-                st.info("📭 Нет сгруппированных папок. Обработайте документы в режиме 'Папка с документами'")
+                        except Exception as e:
+                            st.warning(f"DOCX недоступен: {e}")
 
-    st.divider()
+    # =========================================================================
+    # Вкладка 2 — Поиск
+    # =========================================================================
+    with tab_search:
+        st.subheader("🔍 Поиск по содержимому")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 3: Поиск по документам
-    # ─────────────────────────────────────────────────────────────────────
-    st.subheader("3. 🔍 Поиск по документам")
-    st.caption("💡 Поиск с синонимами: 'счет' найдёт 'invoice', 'счет-фактура'")
+        if not db.get("documents"):
+            st.info("📭 Сначала распознайте хотя бы один документ на вкладке «Загрузка».")
+        else:
+            search_col, btn_col = st.columns([5, 1])
+            with search_col:
+                search_query = st.text_input(
+                    "Введите запрос",
+                    placeholder="например: неподконтрольные расходы, ДМС, НДС",
+                    key="search_input",
+                    label_visibility="collapsed",
+                )
+            with btn_col:
+                do_search = st.button("🔍 Найти", type="primary", key="search_exec_btn", width="stretch")
 
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        search_query = st.text_input("Поисковый запрос", placeholder="Например: тариф, затраты, амортизация...", key="search_query_input")
-    with col2:
-        use_ai = st.checkbox("AI-синонимы", value=True)
+            if do_search and search_query.strip():
+                results = search_documents(db, search_query)
+                st.session_state["search_results"] = results
+                st.session_state["search_query"]   = search_query
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        doc_type_filter = st.selectbox("Фильтр по типу", ["all", "invoice", "act", "contract", "nakladnaya", "other"], format_func=lambda x: {"all": "Все типы", "invoice": "Счета", "act": "Акты", "contract": "Договоры", "nakladnaya": "Накладные", "other": "Прочее"}.get(x, x))
-    with col2:
-        if st.button("🔎 Найти", use_container_width=True, type="primary"):
-            if search_query:
-                results = search_in_documents(st.session_state.scan_db, search_query, use_ai)
-                if doc_type_filter != "all":
-                    results = [r for r in results if r["document"].get("doc_type") == doc_type_filter]
-                st.session_state.search_results = results
-            else:
-                st.warning("Введите поисковый запрос")
-    with col3:
-        if st.session_state.search_results:
-            if st.button("📥 Экспорт", use_container_width=True):
-                output = export_search_results(st.session_state.search_results, "txt")
-                filename = f"SearchResults_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                st.download_button(label="📄 Скачать TXT", data=output, file_name=filename, mime="text/plain", use_container_width=True)
+            results = st.session_state.get("search_results", [])
+            query   = st.session_state.get("search_query", "")
 
-    if st.session_state.search_results:
-        st.success(f"✅ Найдено документов: {len(st.session_state.search_results)}")
-        for i, res in enumerate(st.session_state.search_results, 1):
-            doc = res["document"]
-            with st.expander(f"🔍 {i}. {doc['file_name']} ({res['total_matches']} совпадений)", expanded=(i==1)):
-                col1, col2 = st.columns([2, 1])
-                with col1:
-                    st.write(f"**Тип:** {doc.get('doc_type', '')}")
-                    st.write(f"**Страниц:** {len(doc.get('pages', []))}")
-                    st.write(f"**Обработан:** {doc.get('processed_at', '')[:10]}")
-                with col2:
-                    if st.button(f"📄 Открыть", key=f"open_doc_{doc['id']}"):
-                        st.session_state.selected_doc = doc
-                        st.rerun()
-                st.write("**📍 Совпадения:**")
-                for match in res["matches"][:5]:
-                    st.info(f"📃 Страница {match['page']}: {match['context']}")
-                if len(res["matches"]) > 5:
-                    st.caption(f"... и ещё {len(res['matches']) - 5} совпадений")
+            if results:
+                st.success(f"Найдено совпадений в **{len(results)}** документах по запросу: _{query}_")
+                for res in results:
+                    doc = res["doc"]
+                    with st.expander(
+                        f"📄 {_fname(doc)} — {res['total_matches']} совпадений",
+                        expanded=(res == results[0]),
+                    ):
+                        for match in res["matches"]:
+                            st.markdown(f"**Стр. {match['page']}:** {match['context']}")
+                            st.caption(f"Найдено: {', '.join(match['matched_terms'])}")
+                            st.divider()
+            elif do_search and search_query.strip():
+                st.warning("🔎 Совпадений не найдено. Попробуйте другой запрос.")
 
-    st.divider()
+    # =========================================================================
+    # Вкладка 3 — База документов
+    # =========================================================================
+    with tab_docs:
+        st.subheader("📚 База распознанных документов")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 4: Управление базой
-    # ─────────────────────────────────────────────────────────────────────
-    st.subheader("4. ⚙️ Управление базой")
+        docs = db.get("documents", [])
+        stats = db.get("stats", {})
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Экспорт базы (JSON)", use_container_width=True):
-            json_str = json.dumps(st.session_state.scan_db, ensure_ascii=False, indent=2)
-            filename = f"ScansDB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            st.download_button(label="📄 Скачать JSON", data=json_str, file_name=filename, mime="application/json", use_container_width=True)
-    with col2:
-        uploaded_db = st.file_uploader("📥 Импорт базы", type=['json'], key="import_db")
-        if uploaded_db:
-            try:
-                db_data = json.load(uploaded_db)
-                st.session_state.scan_db = db_data
-                save_scans_db(st.session_state.scan_db)
-                st.success("✅ База импортирована")
+        # Метрики
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("📊 Документов", stats.get("total", 0))
+        m2.metric("📄 Страниц всего", sum(d.get("page_count", 0) for d in docs))
+        m3.metric("🔤 Слов всего", f"{sum(d.get('word_count', 0) for d in docs):,}")
+        m4.metric("🕐 Последний", (stats.get("last_scan") or "—")[:10])
+
+        if docs:
+            import pandas as pd
+            df = pd.DataFrame([
+                {
+                    "Файл": _fname(d),
+                    "Стр.": d.get("page_count") or len(d.get("pages", [])),
+                    "Слов": d.get("word_count", 0),
+                    "OCR":  d.get("ocr_pages", 0),
+                    "Дата": (d.get("processed_at") or d.get("scan_date") or "—")[:16],
+                }
+                for d in reversed(docs)
+            ])
+            st.dataframe(df, width="stretch", hide_index=True)
+
+            st.divider()
+
+            # Просмотр конкретного документа
+            doc_names = {d["id"]: _fname(d) for d in docs}
+            selected_id = st.selectbox(
+                "Просмотреть документ",
+                options=list(doc_names.keys()),
+                format_func=lambda x: doc_names[x],
+                key="db_doc_select",
+            )
+
+            if selected_id:
+                sel_doc = next((d for d in docs if d["id"] == selected_id), None)
+                if sel_doc:
+                    _pc = sel_doc.get("page_count") or len(sel_doc.get("pages", []))
+                    _wc = sel_doc.get("word_count", 0)
+                    _fn = _fname(sel_doc)
+                    st.markdown(f"**{_fn}** · {_pc} стр. · {_wc} слов")
+                    for page in sel_doc.get("pages", []):
+                        _pw = page.get("word_count") or len(page.get("text","").split())
+                        with st.expander(f"Страница {page.get('page',1)} ({page.get('method','')}) — {_pw} слов"):
+                            st.text_area("Текст", page.get("text",""), height=200, disabled=True,
+                                         key=f"db_view_{selected_id}_{page.get('page',1)}")
+
+                    # Экспорт из базы
+                    db_exp1, db_exp2 = st.columns(2)
+                    with db_exp1:
+                        st.download_button(
+                            "📄 Скачать TXT",
+                            data=export_txt(sel_doc),
+                            file_name=f"{os.path.splitext(_fn)[0]}.txt",
+                            mime="text/plain",
+                            key=f"db_dl_txt_{selected_id}",
+                        )
+                    with db_exp2:
+                        try:
+                            docx_buf = export_docx(sel_doc)
+                            st.download_button(
+                                "📝 Скачать DOCX",
+                                data=docx_buf,
+                                file_name=f"{os.path.splitext(sel__fname(doc))[0]}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"db_dl_docx_{selected_id}",
+                            )
+                        except Exception as e:
+                            st.warning(str(e))
+
+            st.divider()
+
+            # Очистка базы
+            if st.button("🗑️ Очистить базу сканов", type="secondary", key="clear_scan_db"):
+                st.session_state["scanner_db"] = {
+                    "documents": [], "stats": {"total": 0, "last_scan": None}
+                }
+                save_db(st.session_state["scanner_db"])
+                st.session_state.pop("last_scanned_ids", None)
+                st.session_state.pop("search_results", None)
+                st.success("✅ База очищена")
                 st.rerun()
-            except Exception as e:
-                st.error(f"❌ Ошибка импорта: {str(e)}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Справка
-    # ─────────────────────────────────────────────────────────────────────
-    with st.expander("💡 Как использовать", expanded=False):
-        st.write("""
-**Возможности:**
-- Распознавание через EasyOCR (PDF, JPG, PNG, TIFF, DOCX, TXT)
-- **GPU ускорение:** Включите в настройках OCR (требуется NVIDIA CUDA)
-- **Режимы:** Один файл ИЛИ Папка с документами
-- **Резюме:** По одному документу ИЛИ по всей папке (с указанием что в каком файле)
-- **🆕 Выбор модели:** phi3 (быстрее), llama3.2 (качественнее)
-- Поиск с синонимами: 'тариф' найдёт 'цена', 'ставка'
-- Экспорт: TXT, DOCX, JSON
-
-**Модели для суммаризации:**
-- **phi3** (2.3 GB) — ✅ Рекомендуется для 4GB VRAM, быстрее
-- **llama3.2** (3.2 GB) — ✅ Лучше качество, но требует больше памяти
-- **gemma2:2b** (1.6 GB) — ✅✅ Самый быстрый, но меньше качество
-
-**Хранение:**
-- База: `data/doc_scanner/scans_db.json`
-- Резюме: `data/doc_scanner/summaries/`
-- Временные файлы: `data/doc_scanner/temp/`
-        """)
-
-# =============================================================================
-# Запуск
-# =============================================================================
-if __name__ == "__main__":
-    show_doc_scanner()
+        else:
+            st.info("📭 База пуста. Загрузите документы на вкладке «Загрузка».")

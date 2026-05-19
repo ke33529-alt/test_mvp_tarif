@@ -73,6 +73,23 @@ def save_metadata(metadata):
 # =============================================================================
 # Функции для загрузки файлов
 # =============================================================================
+def _detect_encoding(file_path: str) -> str:
+    """
+    Автоопределение кодировки файла без внешних библиотек.
+    Перебирает кодировки в порядке приоритета: UTF-8 → CP1251 → Latin-1.
+    Latin-1 используется как fallback — никогда не падает.
+    """
+    with open(file_path, "rb") as f:
+        raw = f.read(32768)  # читаем первые 32KB для определения
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "cp866", "latin-1"):
+        try:
+            raw.decode(enc)
+            return enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return "latin-1"
+
+
 def get_loader(file_path):
     """Возвращает загрузчик для типа файла"""
     if file_path.endswith(".pdf"):
@@ -85,20 +102,57 @@ def get_loader(file_path):
             print(f"[WARN] docx2txt не установлен, пропускаем {file_path}")
             return None
     elif file_path.endswith(".txt"):
-        return TextLoader(file_path)
+        enc = _detect_encoding(file_path)
+        print(f"[ENCODE] {os.path.basename(file_path)}: определена кодировка {enc}")
+        return TextLoader(file_path, encoding=enc)
     return None
 
 # =============================================================================
 # 🆕 НОВЫЕ ФУНКЦИИ ДЛЯ СОВМЕСТИМОСТИ С APP.PY
 # =============================================================================
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+
+# =============================================================================
+# Кастомная embedding function с префиксами для multilingual-e5-large.
+# e5-модели требуют:
+#   "passage: <текст>"  — при индексации документов
+#   "query: <текст>"    — при поиске (в advisor.py, embed_query)
+# Без префиксов качество поиска значительно хуже.
+# =============================================================================
+class E5EmbeddingFunction:
+    """ChromaDB-совместимая embedding function для intfloat/multilingual-e5-large."""
+
+    def __init__(self, model_name: str = EMBEDDING_MODEL):
+        from sentence_transformers import SentenceTransformer
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = SentenceTransformer(model_name, device=device)
+        print(f"[EMBED] E5EmbeddingFunction загружена: {model_name} на {device}")
+
+    def __call__(self, input: list) -> list:
+        """ChromaDB вызывает эту функцию при upsert/query."""
+        prefixed = [f"passage: {text}" for text in input]
+        embeddings = self.model.encode(
+            prefixed,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return embeddings.tolist()
+
+
+_ef_instance = None
+_ef_lock     = __import__("threading").Lock()
+
 
 def get_embedding_function():
-    """Возвращает embedding function с единой моделью для всего проекта"""
-    from chromadb.utils import embedding_functions
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
-    )
+    """Синглтон E5EmbeddingFunction — создаётся один раз."""
+    global _ef_instance
+    if _ef_instance is not None:
+        return _ef_instance
+    with _ef_lock:
+        if _ef_instance is None:
+            _ef_instance = E5EmbeddingFunction(EMBEDDING_MODEL)
+    return _ef_instance
 
 # ── Синглтон клиента ChromaDB ─────────────────────────────────────────────────
 # PersistentClient нельзя открывать несколько раз на одну папку —
@@ -438,16 +492,40 @@ def get_index_stats():
         return {"status": "error", "message": str(e)}
 
 def clear_index():
-    """Очищает индекс (для совместимости с app.py)"""
+    """
+    Полностью очищает индекс: сносит папку vector_db и пересоздаёт её.
+    Это гарантирует что ChromaDB не сохраняет старую размерность эмбеддингов
+    (актуально при смене модели, например MiniLM-384 → e5-large-1024).
+    """
+    import shutil
+    global _chroma_client
+
+    # 1. Закрываем синглтон клиента перед удалением папки
+    with _chroma_client_lock:
+        _chroma_client = None
+
+    # 2. Сбрасываем коллекцию в advisor (если загружена)
     try:
+        from core.advisor import invalidate_chroma_collection
+        invalidate_chroma_collection()
+    except Exception:
+        pass
+
+    # 3. Физически сносим папку vector_db
+    vector_db_path = os.path.join("data", "vector_db")
+    try:
+        if os.path.exists(vector_db_path):
+            shutil.rmtree(vector_db_path)
+            print(f"[INDEX] Папка {vector_db_path} удалена")
+    except Exception as e:
+        return {"status": "error", "message": f"Не удалось удалить папку: {e}"}
+
+    # 4. Пересоздаём пустую папку и новую коллекцию
+    try:
+        os.makedirs(vector_db_path, exist_ok=True)
         client = _get_chroma_client()
-        try:
-            client.delete_collection(name="tariff_docs")
-        except Exception:
-            pass  # коллекции не было — не страшно
-        ef = get_embedding_function()
-        client.create_collection(name="tariff_docs", embedding_function=ef)
-        print("[INDEX] Индекс очищен и пересоздан")
+        client.create_collection(name="tariff_docs")
+        print("[INDEX] Индекс пересоздан с нуля")
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}

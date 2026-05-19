@@ -74,7 +74,7 @@ FAQ_PATH        = os.path.join("data", "faq", "faq.json")
 CACHE_PATH      = os.path.join("data", "cache", "llm_cache.json")
 CONFIG_FILE     = os.path.join("config", "advisor_config.json")
 PROMPTS_FILE    = os.path.join("config", "prompts.json")
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
  
 # =============================================================================
 # Промпты
@@ -226,11 +226,16 @@ def get_st_model():
  
  
 def embed_query(query: str):
-    """Возвращает [[float,...]] для ChromaDB или None при ошибке."""
+    """Возвращает [[float,...]] для ChromaDB или None при ошибке.
+    multilingual-e5-large требует префикс 'query: ' для запросов
+    и 'passage: ' для документов при индексации.
+    """
     model = get_st_model()
     if model is None:
         return None
-    return model.encode([query], normalize_embeddings=True).tolist()
+    # e5-модели требуют префикс для различения запроса и документа
+    prefixed = f"query: {query}"
+    return model.encode([prefixed], normalize_embeddings=True).tolist()
  
  
 # =============================================================================

@@ -3,5 +3,5 @@
   "candidates_per_var": 45,
   "context_max_chars": 30000,
   "reranker_enabled": true,
-  "reranker_model": "DiTy/cross-encoder-russian-msmarco"
+  "reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 }
