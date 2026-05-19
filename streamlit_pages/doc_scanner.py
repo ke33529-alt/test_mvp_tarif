@@ -352,51 +352,224 @@ def search_documents(db: Dict, query: str) -> List[Dict]:
 
 
 # =============================================================================
-# Пересказ через LM Studio
+# Пересказ через LM Studio — Map-Reduce для больших документов
 # =============================================================================
-def summarize_document(text: str, length: str = "средний", model: str = None) -> str:
-    """
-    Пересказывает текст через LM Studio.
-    length: "краткий" (300 токенов), "средний" (800), "подробный" (2000)
-    """
-    length_map = {
-        "краткий":    (300,  "в 3-5 предложениях, только главное"),
-        "средний":    (800,  "в 1-2 абзацах с ключевыми деталями"),
-        "подробный":  (2000, "подробно, с перечислением всех важных пунктов"),
-    }
-    max_tokens, instruction = length_map.get(length, length_map["средний"])
 
-    # Обрезаем текст до разумного размера (≈ 6000 символов → ~1500 токенов)
-    text_for_llm = text[:6000] + ("..." if len(text) > 6000 else "")
+# Порог (символов): документы длиннее этого значения обрабатываются чанками
+_LARGE_DOC_THRESHOLD = 12_000
+# Размер одного чанка (символов) — ~1500 токенов, комфортно для 8B модели
+_CHUNK_SIZE          = 6_000
+# Перекрытие между чанками — модель не теряет контекст на стыке частей
+_CHUNK_OVERLAP       = 300
 
-    prompt = (
-        f"Перескажи содержание документа {instruction}. "
-        f"Отвечай на русском языке, без лишних вступлений.\n\n"
-        f"ДОКУМЕНТ:\n{text_for_llm}"
-    )
 
+def _safe_print(msg: str):
+    """print(), безопасный для Windows-консоли (cp1252 и др.)."""    
     try:
-        from openai import OpenAI
-        config_path = os.path.join("config", "advisor_config.json")
-        config = {}
-        if os.path.exists(config_path):
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _load_lm_config() -> tuple:
+    """Возвращает (lm_url, model) из advisor_config.json."""
+    config_path = os.path.join("config", "advisor_config.json")
+    config = {}
+    if os.path.exists(config_path):
+        try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
+        except Exception:
+            pass
+    lm_url = config.get("lm_studio_url", "http://127.0.0.1:1234/v1")
+    model  = config.get("default_model", "qwen/qwen3.5-9b")
+    return lm_url, model
 
-        lm_url = config.get("lm_studio_url", "http://127.0.0.1:1234/v1")
-        model  = model or config.get("default_model", "qwen/qwen3.5-9b")
 
-        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=120.0)
-        response = client.chat.completions.create(
+def _split_text_chunks(text: str, chunk_size: int = _CHUNK_SIZE,
+                       overlap: int = _CHUNK_OVERLAP) -> List[str]:
+    """
+    Разбивает текст на чанки по границам абзацев/предложений.
+    Перекрытие `overlap` сохраняет контекст между соседними частями.
+
+    Ключевое правило: разделитель принимается только если он находится
+    в ПОСЛЕДНЕЙ ЧЕТВЕРТИ окна [start..end] — иначе чанк получался бы
+    крошечным (когда \n\n стоит близко к началу диапазона rfind).
+    """
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + chunk_size
+        if end >= len(text):
+            tail = text[start:].strip()
+            if tail:
+                chunks.append(tail)
+            break
+
+        # Ищем точку разрыва в последних 25% окна, чтобы чанк
+        # был не короче 75% chunk_size
+        min_pos = start + chunk_size * 3 // 4
+        split_end = end
+        for sep in ('\n\n', '. ', ' '):
+            pos = text.rfind(sep, min_pos, end)
+            if pos != -1:
+                split_end = pos + len(sep)
+                break
+
+        chunk = text[start:split_end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Следующий чанк начинается с перекрытием, но не раньше split_end//2
+        next_start = split_end - overlap
+        start = max(start + chunk_size // 2, next_start)
+
+    return chunks
+
+
+def _lm_call(client, model: str, system: str, user: str, max_tokens: int) -> str:
+    """Один вызов LM Studio; возвращает текст ответа или строку с ошибкой."""
+    try:
+        resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "Ты помощник для анализа документов. Отвечаешь кратко и по делу."},
-                {"role": "user",   "content": prompt},
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
             ],
             max_tokens=max_tokens,
             temperature=0.3,
         )
-        return response.choices[0].message.content or "[Пустой ответ]"
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"[Ошибка LM: {e}]"
+
+
+def summarize_document(text: str, length: str = "средний", model: str = None, _progress_cb=None) -> str:
+    """
+    Пересказывает текст через LM Studio.
+
+    Для коротких документов (< _LARGE_DOC_THRESHOLD символов) — один запрос.
+    Для длинных — Map-Reduce:
+      MAP    : каждый чанк (~6 000 симв.) суммаризируется отдельно
+      REDUCE : мини-резюме объединяются в итоговый пересказ
+
+    """
+    # length может быть строкой-ключом ИЛИ числом слов (int/str с цифрой)
+    # Строковые ключи → фиксированные пресеты
+    _PRESETS = {
+        "1 страница":  (500,  "примерно на 1 страницу (~250 слов). Только самое главное"),
+        "2 страницы":  (1000, "примерно на 2 страницы (~500 слов). Ключевые факты и детали"),
+        "5 страниц":   (2500, "примерно на 5 страниц (~1250 слов). Подробно, все важные пункты"),
+        "10 страниц":  (5000, "примерно на 10 страниц (~2500 слов). Максимально подробно"),
+        # Обратная совместимость со старыми ключами
+        "краткий":     (400,  "кратко, в 3-5 предложениях, только главное"),
+        "средний":     (1000, "в 1-2 абзацах с ключевыми деталями (~500 слов)"),
+        "подробный":   (2500, "подробно, с перечислением всех важных пунктов (~1000 слов)"),
+    }
+    # Числовой режим: length == "NNN слов" или int
+    _word_target = None
+    try:
+        _word_target = int(str(length).replace("слов", "").replace("слова", "").strip())
+    except (ValueError, TypeError):
+        pass
+
+    if _word_target:
+        # ~1.5 токена на слово для русского текста
+        max_tokens  = int(_word_target * 1.7)
+        instruction = f"ровно примерно {_word_target} слов. Следи за объёмом"
+    else:
+        max_tokens, instruction = _PRESETS.get(length, _PRESETS["2 страницы"])
+
+
+    try:
+        from openai import OpenAI
+        lm_url, default_model = _load_lm_config()
+        model  = model or default_model
+        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=180.0)
+
+        system_msg = "Ты помощник для анализа документов. Отвечаешь кратко и по делу на русском языке."
+
+        # ── Короткий документ: один запрос ───────────────────────────────
+        if len(text) <= _LARGE_DOC_THRESHOLD:
+            prompt = (
+                f"Перескажи содержание документа {instruction}. "
+                f"Отвечай на русском языке, без лишних вступлений.\n\n"
+                f"ДОКУМЕНТ:\n{text}"
+            )
+            result = _lm_call(client, model, system_msg, prompt, max_tokens)
+            return result
+
+        # ── Большой документ: Map-Reduce ─────────────────────────────────
+        chunks   = _split_text_chunks(text)
+        total    = len(chunks)
+        t_start  = time.perf_counter()
+        _safe_print(f"[MAP-REDUCE] {len(text)} chars -> {total} chunks, model: {model}")
+
+        # MAP: резюме каждого чанка
+        mini_summaries = []
+        chunk_times    = []   # храним время каждого чанка для ETA
+
+        for i, chunk in enumerate(chunks, 1):
+            t_chunk = time.perf_counter()
+
+            # Статус перед запросом
+            elapsed  = t_chunk - t_start
+            elapsed_fmt = f"{int(elapsed // 60)}м {int(elapsed % 60)}с"
+            if chunk_times:
+                avg_sec  = sum(chunk_times) / len(chunk_times)
+                remaining = avg_sec * (total - i + 1)
+                eta_fmt  = f"{int(remaining // 60)}м {int(remaining % 60)}с"
+                eta_str  = f"ещё ~{eta_fmt}"
+            else:
+                eta_str  = "считаю время..."
+
+            if _progress_cb:
+                _pct = (i - 1) / (total + 1)
+                _progress_cb(_pct, f"MAP — часть {i} / {total} | прошло: {elapsed_fmt} | {eta_str}")
+
+            map_prompt = (
+                f"Это часть {i} из {total} одного документа.\n"
+                f"Сделай краткое резюме этой части (3-5 пунктов), "
+                f"сохрани все факты, цифры, даты, названия.\n"
+                f"Отвечай на русском, без вступлений.\n\n"
+                f"ЧАСТЬ ДОКУМЕНТА:\n{chunk}"
+            )
+            mini = _lm_call(client, model, system_msg, map_prompt, 400)
+
+            chunk_done = time.perf_counter()
+            chunk_times.append(chunk_done - t_chunk)
+
+            if mini.startswith("[Ошибка"):
+                _safe_print(f"[MAP] chunk {i} error: {mini}")
+                mini = f"[Часть {i}: данные недоступны]"
+
+            mini_summaries.append(f"=== Часть {i}/{total} ===\n{mini}")
+            _safe_print(f"[MAP] chunk {i}/{total} done ({len(mini)} chars, {chunk_times[-1]:.1f}s)")
+
+        # REDUCE: финальный синтез
+        elapsed_map = time.perf_counter() - t_start
+        elapsed_fmt = f"{int(elapsed_map // 60)}м {int(elapsed_map % 60)}с"
+        _safe_print(f"[MAP-REDUCE] REDUCE start, map took {elapsed_fmt}")
+        if _progress_cb:
+            _progress_cb(total / (total + 1), f"REDUCE — финальный синтез {total} частей | MAP: {elapsed_fmt}")
+
+        combined = "\n\n".join(mini_summaries)
+        reduce_prompt = (
+            f"Ниже — резюме отдельных частей одного документа. "
+            f"Создай единый итоговый пересказ {instruction}.\n"
+            f"Объедини все части, устрани дублирование, сохрани все ключевые факты, "
+            f"цифры, даты, названия документов.\n"
+            f"Отвечай на русском, без вступлений и мета-комментариев.\n\n"
+            f"РЕЗЮМЕ ЧАСТЕЙ:\n{combined}"
+        )
+        result = _lm_call(client, model, system_msg, reduce_prompt, max_tokens)
+
+        total_fmt = f"{int((time.perf_counter()-t_start)//60)}м {int((time.perf_counter()-t_start)%60)}с"
+        _safe_print(f"[MAP-REDUCE] done in {total_fmt}. result: {len(result)} chars")
+        return result
+
     except Exception as e:
         return f"[Ошибка пересказа: {e}]"
 
@@ -601,46 +774,158 @@ def show_doc_scanner():
                     st.divider()
 
                     # ── Пересказ ─────────────────────────────────────────
-                    summary_key = f"summary_{doc['id']}"
-                    sum_len_key = f"sum_len_{doc['id']}"
+                    summary_key    = f"summary_{doc['id']}"
+                    sum_mode_key   = f"sum_mode_{doc['id']}"
+                    sum_words_key  = f"sum_words_{doc['id']}"
 
-                    col1, col2 = st.columns([3, 2])
-                    with col1:
-                        summary_length = st.radio(
-                            "Длина пересказа",
-                            ["краткий", "средний", "подробный"],
-                            horizontal=True,
-                            key=sum_len_key,
-                            index=1,
+                    st.markdown("**📝 Пересказ**")
+
+                    # Выбор объёма — вертикально (без колонок, иначе Streamlit
+                    # рендерит пересказ внутри одного из столбцов)
+                    sum_mode = st.selectbox(
+                        "Объём пересказа",
+                        ["1 страница", "2 страницы", "5 страниц", "10 страниц",
+                         "Точное кол-во слов"],
+                        index=1,
+                        key=sum_mode_key,
+                    )
+                    if sum_mode == "Точное кол-во слов":
+                        sum_words = st.number_input(
+                            "Количество слов",
+                            min_value=50, max_value=5000, value=300, step=50,
+                            key=sum_words_key,
                         )
-                    with col2:
-                        if st.button("📝 Сгенерировать пересказ",
-                                     key=f"sum_btn_{doc['id']}", type="primary"):
-                            with st.spinner("🤖 Генерирую пересказ..."):
-                                summary = summarize_document(
-                                    doc.get("full_text", ""), summary_length
-                                )
-                            st.session_state[summary_key] = summary
+                        summary_length = str(int(sum_words))
+                    else:
+                        summary_length = sum_mode
 
-                    # Блок пересказа с кнопкой копирования
+                    # Кнопка строго по центру
+                    _bL, _bC, _bR = st.columns([2, 3, 2])
+                    with _bC:
+                        _do_summary = st.button(
+                            "▶ Сгенерировать пересказ",
+                            key=f"sum_btn_{doc['id']}", type="primary",
+                            use_container_width=True,
+                        )
+
+                    if _do_summary:
+                        _full_text = doc.get("full_text", "")
+                        _n_chunks  = max(1, len(_full_text) // _CHUNK_SIZE + 1)
+                        _is_large  = len(_full_text) > _LARGE_DOC_THRESHOLD
+
+                        if _is_large:
+                            st.info(
+                                f"📄 Документ **{len(_full_text):,}** символов — "
+                                f"Map-Reduce: ~**{_n_chunks}** частей. "
+                                f"Ориентировочно 1-3 минуты."
+                            )
+
+                        _spinner_msg = (
+                            f"🤖 Map-Reduce: {_n_chunks} частей..."
+                            if _is_large else "🤖 Генерирую пересказ..."
+                        )
+
+                        # st.spinner() — гарантированно виден во время
+                        # блокирующей операции. Внутри него запускаем
+                        # summarize_document в потоке, а главный поток
+                        # обновляет прогресс-бар каждую секунду через
+                        # while-loop (time.sleep даёт Streamlit слот
+                        # для отправки обновлений браузеру).
+                        _state = {
+                            "done": False, "result": None,
+                            "pct": 0.0,   "msg": "⏳ Инициализация..."
+                        }
+
+                        def _run_in_thread():
+                            def _cb(pct, msg):
+                                _state["pct"] = pct
+                                _state["msg"] = msg
+                            _state["result"] = summarize_document(
+                                _full_text, summary_length, _progress_cb=_cb
+                            )
+                            _state["done"] = True
+
+                        _thread = threading.Thread(target=_run_in_thread, daemon=True)
+                        _thread.start()
+
+                        with st.spinner(_spinner_msg):
+                            _ph = st.empty()
+                            _t0 = time.perf_counter()
+                            while not _state["done"]:
+                                _el  = time.perf_counter() - _t0
+                                _em  = f"{int(_el//60)}м {int(_el%60)}с"
+                                _pct = int(min(_state["pct"], 1.0) * 100)
+                                _ph.markdown(
+                                    f"<div style='font-family:sans-serif;padding:4px 0'>"
+                                    f"<div style='background:#e8e8e8;border-radius:6px;"
+                                    f"height:10px;margin-bottom:6px'>"
+                                    f"<div style='background:#4c8ef5;width:{_pct}%;"
+                                    f"height:10px;border-radius:6px'></div></div>"
+                                    f"<div style='font-size:0.85em;color:#444'>"
+                                    f"{_state['msg']}</div>"
+                                    f"<div style='font-size:0.78em;color:#888;margin-top:2px'>"
+                                    f"прошло: {_em}</div></div>",
+                                    unsafe_allow_html=True,
+                                )
+                                time.sleep(1)
+                            _thread.join()
+                            _ph.empty()
+
+                        st.session_state[summary_key] = _state["result"]
+
+
+                    # ── Отображение пересказа ─────────────────────────────
                     _summary_text = st.session_state.get(summary_key)
                     if _summary_text:
-                        st.markdown("**🤖 Пересказ:**")
-                        _sum_h = max(120, min(480, len(_summary_text) // 3))
+                        import streamlit.components.v1 as _stc
+                        _wc = len(_summary_text.split())
+
+                        # Заголовок со счётчиком слов
                         st.markdown(
-                            f"<div style='font-size:0.87em; line-height:1.6; "
-                            f"background:#f0f4f8; border:1px solid #d0d8e4; "
-                            f"border-radius:6px; padding:12px 14px; "
-                            f"max-height:{_sum_h}px; overflow-y:auto; "
-                            f"white-space:pre-wrap; word-break:break-word;'>"
-                            f"{_summary_text.replace('<','&lt;').replace('>','&gt;')}"
-                            f"</div>",
+                            "<div style='display:flex;align-items:center;"
+                            "justify-content:space-between;margin-bottom:4px;'>"
+                            "<span style='font-weight:600;'>🤖 Пересказ</span>"
+                            f"<span style='color:#888;font-size:0.85em;'>{_wc} слов</span>"
+                            "</div>",
                             unsafe_allow_html=True,
                         )
-                        # Кнопка копирования — через st.code в схлопнутом expander
-                        with st.expander("📋 Скопировать пересказ", expanded=False):
-                            st.code(_summary_text, language=None)
 
+                        # Текст в одном прокручиваемом блоке
+                        _sum_h = max(200, min(600, _wc * 6))
+                        _body  = _summary_text.replace("<", "&lt;").replace(">", "&gt;")
+                        st.markdown(
+                            f"<div style='font-size:0.87em;line-height:1.65;"
+                            f"background:#f0f4f8;border:1px solid #d0d8e4;"
+                            f"border-radius:6px;padding:14px 16px;"
+                            f"max-height:{_sum_h}px;overflow-y:auto;"
+                            f"white-space:pre-wrap;word-break:break-word;'>"
+                            f"{_body}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # Кнопка копирования через iframe-компонент.
+                        # Текст хранится в скрытом <span> — кнопка читает textContent.
+                        # Безопаснее inline JS с backtick-строкой.
+                        _safe = (
+                            _summary_text
+                            .replace("&", "&amp;")
+                            .replace("<", "&lt;")
+                            .replace(">", "&gt;")
+                            .replace('"', "&quot;")
+                        )
+                        _stc.html(
+                            "<div style='font-family:sans-serif'>"
+                            f"<span id='t' style='display:none'>{_safe}</span>"
+                            "<button onclick=\"navigator.clipboard.writeText("
+                            "document.getElementById('t').textContent).then(()=>{"
+                            "this.textContent='✅ Скопировано';"
+                            "setTimeout(()=>this.textContent='📋 Скопировать пересказ',2000)})\" "
+                            "style='font-size:13px;padding:5px 16px;cursor:pointer;"
+                            "border:1px solid #d0d8e4;border-radius:5px;"
+                            "background:#fff;color:#333;margin-top:6px'>"
+                            "📋 Скопировать пересказ</button></div>",
+                            height=48,
+                        )
                     st.divider()
 
                     # ── Экспорт ──────────────────────────────────────────
