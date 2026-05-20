@@ -631,26 +631,26 @@ def export_docx(doc: Dict, summary: str = None) -> io.BytesIO:
 # UI — главная страница сканера
 # =============================================================================
 def show_doc_scanner():
-    st.header("📸 AI-Сканер документов")
-    st.caption("EasyOCR · PDF · DOCX · DOC · XLSX · JPG · PNG · Пересказ · Поиск")
+    st.header("Сканер документов")
+    st.caption("PDF · DOCX · DOC · XLSX · JPG · PNG — распознавание, пересказ, поиск")
 
     # Инициализация OCR один раз
     if "ocr_initialized" not in st.session_state:
-        with st.spinner("⚙️ Инициализация OCR..."):
+        with st.spinner("Инициализация OCR..."):
             _init_ocr()
         st.session_state["ocr_initialized"] = True
 
-    # Статус OCR — показываем что активно
+    # Статус OCR
     if _EASYOCR_AVAILABLE:
-        st.success("✅ OCR: EasyOCR активен", icon="🔍")
+        st.success("Распознавание текста активно")
     elif _TESSERACT_AVAILABLE:
-        st.warning("⚠️ OCR: PaddleOCR недоступен, используется Tesseract (хуже качество). Установите: `pip install paddlepaddle paddleocr`")
+        st.warning("Основной модуль OCR недоступен, используется резервный (хуже качество).")
     else:
         _ocr_err = st.session_state.get("ocr_init_error")
         if _ocr_err:
-            st.error(f"❌ OCR ошибка инициализации:\n```\n{_ocr_err}\n```")
+            st.error(f"Ошибка инициализации OCR:\n```\n{_ocr_err}\n```")
         else:
-            st.error("❌ OCR не найден. Установите: `pip install paddlepaddle paddleocr pillow`")
+            st.error("OCR не найден. Установите: `pip install paddlepaddle paddleocr pillow`")
 
     # Загрузка базы
     if "scanner_db" not in st.session_state:
@@ -660,9 +660,9 @@ def show_doc_scanner():
 
     # ── Вкладки ──────────────────────────────────────────────────────────
     tab_scan, tab_search, tab_docs = st.tabs([
-        "📤 Загрузка и распознавание",
-        "🔍 Поиск по содержимому",
-        "📚 База документов",
+        "Загрузка и распознавание",
+        "Поиск по содержимому",
+        "База документов",
     ])
 
     # =========================================================================
@@ -714,17 +714,71 @@ def show_doc_scanner():
                 st.session_state["last_scanned_ids"] = new_ids
 
         # ── Результаты последней обработки ──────────────────────────────
-        last_ids = st.session_state.get("last_scanned_ids", [])
+        _raw_ids = st.session_state.get("last_scanned_ids", [])
+        last_ids = list(dict.fromkeys(_raw_ids))
         if last_ids:
+            _seen = set()
+            last_docs = [
+                d for d in db["documents"]
+                if d["id"] in last_ids and d["id"] not in _seen
+                and not _seen.add(d["id"])
+            ]
+
+            # ── ГЕНЕРАЦИЯ ПЕРЕСКАЗА — вне цикла, в фиксированной позиции ──
+            # Проверяем gen_trigger для любого из документов списка.
+            # Это гарантирует ровно ОДИН рендер блока генерации.
+            for _gd in last_docs:
+                _gk = f"gen_trigger_{_gd['id']}"
+                if _gk in st.session_state:
+                    _gl      = st.session_state.pop(_gk)
+                    _gft     = _gd.get("full_text", "")
+                    _gnc     = max(1, len(_gft) // _CHUNK_SIZE + 1)
+                    _gisl    = len(_gft) > _LARGE_DOC_THRESHOLD
+                    _gskey   = f"summary_{_gd['id']}"
+
+                    st.divider()
+                    st.subheader("📄 Результаты распознавания")
+                    st.markdown(f"**Генерация пересказа:** {_gd.get('name','')}")
+
+                    # Прогресс-бар + текст.
+                    # Текстовые обновления через WebSocket работают (подтверждено).
+                    # st.progress() обновляется тем же механизмом.
+                    if _gisl:
+                        st.caption(
+                            f"Map-Reduce: ~{_gnc} частей · ~1-3 мин. · "
+                            f"{len(_gft):,} символов"
+                        )
+                    _gprog = st.progress(0.0)
+                    _gcap  = st.empty()
+                    _gcap.caption("Подготовка...")
+
+                    def _gcb(pct, msg, _p=_gprog, _c=_gcap):
+                        _pct = min(float(pct), 1.0)
+                        _p.progress(_pct)
+                        _c.caption(f"⏳ {msg}  ·  {int(_pct * 100)}%")
+
+                    _gresult = summarize_document(_gft, _gl, _progress_cb=_gcb)
+                    _gprog.progress(1.0)
+                    _gcap.caption("Готово")
+                    _gprog.empty()
+                    _gcap.empty()
+                    st.session_state[_gskey] = _gresult
+                    st.session_state[f"exp_open_{_gd['id']}"] = True
+                    st.rerun()
+
+            # ── Список документов ─────────────────────────────────────────
             st.divider()
             st.subheader("📄 Результаты распознавания")
 
-            last_docs = [d for d in db["documents"] if d["id"] in last_ids]
-
+            # ── Документы ────────────────────────────────────────────────
             for doc in last_docs:
                 _pc2 = doc.get("page_count") or len(doc.get("pages", []))
                 _wc2 = doc.get("word_count", 0)
-                with st.expander(f"📄 {_fname(doc)} — {_pc2} стр., {_wc2} слов"):
+                _exp_key = f"exp_open_{doc['id']}"
+                with st.expander(
+                    f"📄 {_fname(doc)} — {_pc2} стр., {_wc2} слов",
+                    expanded=st.session_state.get(_exp_key, False),
+                ):
 
                     # ── Навигация по страницам ───────────────────────────
                     pages_list = doc.get("pages", [])
@@ -808,70 +862,12 @@ def show_doc_scanner():
                             use_container_width=True,
                         )
 
+                    # Кнопка только выставляет флаг — генерация
+                    # происходит вне цикла (выше), в фиксированной позиции
                     if _do_summary:
-                        _full_text = doc.get("full_text", "")
-                        _n_chunks  = max(1, len(_full_text) // _CHUNK_SIZE + 1)
-                        _is_large  = len(_full_text) > _LARGE_DOC_THRESHOLD
-
-                        if _is_large:
-                            st.info(
-                                f"📄 Документ **{len(_full_text):,}** символов — "
-                                f"Map-Reduce: ~**{_n_chunks}** частей. "
-                                f"Ориентировочно 1-3 минуты."
-                            )
-
-                        _spinner_msg = (
-                            f"🤖 Map-Reduce: {_n_chunks} частей..."
-                            if _is_large else "🤖 Генерирую пересказ..."
-                        )
-
-                        # st.spinner() — гарантированно виден во время
-                        # блокирующей операции. Внутри него запускаем
-                        # summarize_document в потоке, а главный поток
-                        # обновляет прогресс-бар каждую секунду через
-                        # while-loop (time.sleep даёт Streamlit слот
-                        # для отправки обновлений браузеру).
-                        _state = {
-                            "done": False, "result": None,
-                            "pct": 0.0,   "msg": "⏳ Инициализация..."
-                        }
-
-                        def _run_in_thread():
-                            def _cb(pct, msg):
-                                _state["pct"] = pct
-                                _state["msg"] = msg
-                            _state["result"] = summarize_document(
-                                _full_text, summary_length, _progress_cb=_cb
-                            )
-                            _state["done"] = True
-
-                        _thread = threading.Thread(target=_run_in_thread, daemon=True)
-                        _thread.start()
-
-                        with st.spinner(_spinner_msg):
-                            _ph = st.empty()
-                            _t0 = time.perf_counter()
-                            while not _state["done"]:
-                                _el  = time.perf_counter() - _t0
-                                _em  = f"{int(_el//60)}м {int(_el%60)}с"
-                                _pct = int(min(_state["pct"], 1.0) * 100)
-                                _ph.markdown(
-                                    f"<div style='font-family:sans-serif;padding:4px 0'>"
-                                    f"<div style='background:#e8e8e8;border-radius:6px;"
-                                    f"height:10px;margin-bottom:6px'>"
-                                    f"<div style='background:#4c8ef5;width:{_pct}%;"
-                                    f"height:10px;border-radius:6px'></div></div>"
-                                    f"<div style='font-size:0.85em;color:#444'>"
-                                    f"{_state['msg']}</div>"
-                                    f"<div style='font-size:0.78em;color:#888;margin-top:2px'>"
-                                    f"прошло: {_em}</div></div>",
-                                    unsafe_allow_html=True,
-                                )
-                                time.sleep(1)
-                            _thread.join()
-                            _ph.empty()
-
-                        st.session_state[summary_key] = _state["result"]
+                        st.session_state[f"gen_trigger_{doc['id']}"] = summary_length
+                        st.session_state[f"exp_open_{doc['id']}"] = True
+                        st.rerun()
 
 
                     # ── Отображение пересказа ─────────────────────────────
@@ -961,6 +957,8 @@ def show_doc_scanner():
     # =========================================================================
     # Вкладка 2 — Поиск
     # =========================================================================
+
+
     with tab_search:
         st.subheader("🔍 Поиск по содержимому")
 

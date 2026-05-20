@@ -7,8 +7,8 @@ from core.advisor import ask_question, get_available_models
 
 def show_advisor():
     """Страница Советчика с выбором модели"""
-    st.header("🤝 Советчик по тарифам")
-    st.info("Задайте вопрос по тарифному регулированию — ИИ ответит со ссылками на НПА")
+    st.header("Советчик по нормативной базе")
+    st.info("Задайте вопрос по тарифному регулированию — система ответит со ссылками на актуальные НПА")
 
     # Инициализация session_state
     if "messages" not in st.session_state:
@@ -21,7 +21,7 @@ def show_advisor():
     # ─────────────────────────────────────────────────────────────────────
     # Настройки: Выбор модели и параметры
     # ─────────────────────────────────────────────────────────────────────
-    with st.expander("⚙️ Настройки", expanded=False):
+    with st.expander("Настройки", expanded=False):
         # ✅ Выбор модели
         available_models = get_available_models()
         model_names = [m["name"] for m in available_models] if available_models else ["phi3", "llama3.2"]
@@ -156,4 +156,5 @@ def show_advisor():
         st.sidebar.warning("⚠️ Векторная база не найдена")
 
 if __name__ == "__main__":
+    show_advisor()
     show_advisor()

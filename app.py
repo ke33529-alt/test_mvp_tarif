@@ -63,7 +63,7 @@ def get_live_answer_stats(days: int = 7):
 # =============================================================================
 # 🎨 Настройка страницы
 # =============================================================================
-st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚙")
 
 # =============================================================================
 # 🔐 Session state
@@ -81,59 +81,245 @@ def is_admin_logged() -> bool:
 # =============================================================================
 st.markdown("""
 <style>
-.stApp { background-color: #f8f9fa; }
-.main-title {
-    font-size: 3rem; font-weight: 700; color: #063971;
-    text-align: center; padding: 1.5rem 0; margin-bottom: 1rem;
-    background: linear-gradient(90deg, #3498db, #2c3e50);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+/* ── Переменные бренда ─────────────────────────────────────────────────── */
+:root {
+    --brand-primary:  #1B5C74;
+    --brand-mid:      #2E7A96;
+    --brand-light1:   #4FA3C0;
+    --brand-light2:   #c8e8f2;
+    --brand-bg:       #e8f4f8;
+    --brand-dark:     #063971;
+    --neutral-bg:     #f4f6f9;
+    --neutral-border: #dce3ec;
+    --text-primary:   #1a2a3a;
+    --text-secondary: #5a6a7a;
+    --radius:         6px;
 }
-.stSidebar { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
+
+/* ── Фон и шрифт ───────────────────────────────────────────────────────── */
+.stApp { background-color: var(--neutral-bg);
+         font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
+
+/* ── Боковая панель ────────────────────────────────────────────────────── */
+.stSidebar { background-color: #ffffff; border-right: 1px solid var(--neutral-border); }
 .stSidebar * { text-align: left !important; }
+
+/* ── Кнопки — без двойной границы ──────────────────────────────────────── */
+.stButton > button {
+    background-color: var(--brand-primary) !important;
+    color: #ffffff !important;
+    border-radius: var(--radius) !important;
+    border: 1px solid var(--brand-primary) !important;
+    outline: none !important;
+    box-shadow: none !important;
+    padding: 0.45rem 1rem !important;
+    width: 100% !important;
+    font-weight: 500 !important;
+    transition: background-color 0.15s ease !important;
+}
+.stButton > button:hover {
+    background-color: var(--brand-dark) !important;
+    border-color: var(--brand-dark) !important;
+    box-shadow: none !important;
+}
+.stButton > button:focus,
+.stButton > button:focus-visible {
+    box-shadow: 0 0 0 2px var(--brand-light2) !important;
+    outline: none !important;
+}
+.stButton > button[kind="secondary"] {
+    background-color: #ffffff !important;
+    color: var(--brand-primary) !important;
+    border: 1px solid var(--brand-primary) !important;
+}
+.stButton > button[kind="secondary"]:hover {
+    background-color: var(--brand-bg) !important;
+}
+
+/* ── Экспандеры — одиночная граница, без дублирования ──────────────────── */
+[data-testid="stExpander"] {
+    border: 1px solid var(--neutral-border) !important;
+    border-radius: var(--radius) !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+}
+[data-testid="stExpander"] > details,
+[data-testid="stExpander"] > details > summary,
+[data-testid="stExpander"] > details > div {
+    border: none !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+[data-testid="stExpander"] > details > summary {
+    border-bottom: 1px solid var(--neutral-border) !important;
+    border-radius: 0 !important;
+    padding: 0.6rem 0.9rem !important;
+}
+[data-testid="stExpander"] > details:not([open]) > summary {
+    border-bottom: none !important;
+}
+
+/* ── Ползунки (slider) — фирменный оттенок, только внутри stSlider ─────── */
+[data-testid="stSlider"] [role="slider"],
+[data-testid="stSlider"] [class*="thumb"] {
+    background-color: var(--brand-mid) !important;
+    border-color: var(--brand-mid) !important;
+    box-shadow: 0 0 0 3px var(--brand-light2) !important;
+}
+[data-testid="stSlider"] [class*="track"]:last-child,
+[data-testid="stSlider"] [class*="Track"]:last-child {
+    background-color: var(--brand-mid) !important;
+}
+
+/* ── Прогресс-бар st.progress() ────────────────────────────────────────── */
+[data-testid="stProgress"] > div {
+    background-color: var(--brand-light2) !important;
+    border-radius: 4px !important;
+}
+[data-testid="stProgress"] > div > div {
+    background-color: var(--brand-mid) !important;
+    border-radius: 4px !important;
+}
+/* Текст progress(text=...) — принудительно тёмный, перебиваем тему */
+[data-testid="stProgress"] p,
+[data-testid="stProgress"] span,
+[data-testid="stProgress"] div > p,
+[data-testid="stProgress"] + div p {
+    color: var(--text-primary) !important;
+    font-size: 0.82em !important;
+}
+
+/* ── Radio — фирменный акцент ───────────────────────────────────────────── */
+[data-testid="stRadio"] label:hover { color: var(--brand-primary) !important; }
+[data-testid="stRadio"] [data-baseweb="radio"] [class*="circle"],
+[data-testid="stRadio"] input[type="radio"]:checked + div {
+    border-color: var(--brand-primary) !important;
+    background-color: var(--brand-primary) !important;
+}
+/* baseweb radio outer ring on check */
+[data-baseweb="radio"] [class*="RadioMarkOuter"] {
+    border-color: var(--brand-primary) !important;
+}
+[data-baseweb="radio"] [class*="RadioMarkInner"] {
+    background: var(--brand-primary) !important;
+}
+/* selected radio row */
+[data-testid="stRadio"] label[data-selected="true"],
+[data-testid="stRadio"] div[aria-checked="true"] ~ label {
+    color: var(--brand-primary) !important;
+    font-weight: 600 !important;
+}
+
+/* ── Табы — активная вкладка фирменного цвета ───────────────────────────── */
+[data-baseweb="tab-list"] {
+    border-bottom: 2px solid var(--neutral-border) !important;
+    gap: 0 !important;
+}
+[data-baseweb="tab"] {
+    border-radius: var(--radius) var(--radius) 0 0 !important;
+    border: none !important;
+    color: var(--text-secondary) !important;
+    font-weight: 500 !important;
+    padding: 0.5rem 1.1rem !important;
+    transition: color 0.15s ease, background-color 0.15s ease !important;
+}
+[data-baseweb="tab"]:hover {
+    color: var(--brand-primary) !important;
+    background-color: var(--brand-bg) !important;
+}
+[aria-selected="true"][data-baseweb="tab"] {
+    color: var(--brand-primary) !important;
+    font-weight: 700 !important;
+    border-bottom: 3px solid var(--brand-primary) !important;
+    background-color: #ffffff !important;
+}
+[data-baseweb="tab-highlight"] {
+    background-color: var(--brand-primary) !important;
+    height: 3px !important;
+}
+
+/* ── Алерты info/success/warning — фирменная гамма вместо синего ────────── */
+[data-testid="stAlert"][data-baseweb="notification"] {
+    border-radius: var(--radius) !important;
+}
+/* info (голубой) → фирменный */
+div[data-testid="stAlert"][kind="info"],
+div.element-container div[data-baseweb="notification"][kind="info"] {
+    background-color: var(--brand-bg) !important;
+    border-left: 4px solid var(--brand-primary) !important;
+    color: var(--text-primary) !important;
+}
+/* Streamlit 1.3x+ selector */
+.stAlert > div[data-testid="stMarkdownContainer"] { color: var(--text-primary) !important; }
+[data-testid="stNotification"],
+[class*="AlertContainer"] {
+    background-color: var(--brand-bg) !important;
+    border-left: 4px solid var(--brand-primary) !important;
+    border-radius: var(--radius) !important;
+    color: var(--text-primary) !important;
+}
+[class*="AlertContainer"] svg { color: var(--brand-primary) !important; }
+
+/* ── Таблицы ───────────────────────────────────────────────────────────── */
 .stDataFrame { min-height: 200px; }
-.dataframe { border: 1px solid #e0e0e0; border-radius: 6px; }
-.stButton>button {
-    background-color: #6c757d; color: white; border-radius: 6px;
-    border: none; padding: 0.5rem 1rem; width: 100%;
-}
-.stButton>button:hover { background-color: #5a6268; }
-h1, h2, h3 { color: #343a40; }
-.stMetric { background: #ffffff; padding: 0.5rem; border-radius: 6px; }
-.stExpander { background: #ffffff; border: 1px solid #e0e0e0; border-radius: 6px; }
+.dataframe { border: 1px solid var(--neutral-border); border-radius: var(--radius); }
+
+/* ── Метрики ───────────────────────────────────────────────────────────── */
+.stMetric { background: #ffffff; padding: 0.5rem;
+            border-radius: var(--radius); border: 1px solid var(--neutral-border); }
+
+/* ── Кастомные блоки ───────────────────────────────────────────────────── */
 .redirect-box {
-    margin: 1rem 0; padding: 1rem; background: #e3f2fd;
-    border-left: 4px solid #1976d2; border-radius: 0 6px 6px 0;
+    margin: 1rem 0; padding: 1rem; background: var(--brand-bg);
+    border-left: 4px solid var(--brand-primary);
+    border-radius: 0 var(--radius) var(--radius) 0;
 }
+
+/* ── Логотип в сайдбаре ────────────────────────────────────────────────── */
 .sidebar-logo button {
     background: none !important; border: none !important;
     box-shadow: none !important; padding: 0.3rem 0 !important;
-    width: auto !important; font-size: 1.25rem !important;
-    font-weight: 800 !important; letter-spacing: 0.02em !important;
-    background: linear-gradient(90deg, #3498db, #063971) !important;
-    -webkit-background-clip: text !important;
-    -webkit-text-fill-color: transparent !important;
+    width: auto !important; font-size: 1.15rem !important;
+    font-weight: 800 !important; letter-spacing: 0.03em !important;
+    color: var(--brand-primary) !important;
+    -webkit-text-fill-color: var(--brand-primary) !important;
     cursor: pointer !important; transition: opacity 0.15s !important;
 }
-.sidebar-logo button:hover { opacity: 0.75 !important; background-color: transparent !important; }
+.sidebar-logo button:hover { opacity: 0.7 !important; background-color: transparent !important; }
+
+/* ── Плитки лендинга ───────────────────────────────────────────────────── */
 .landing-tile button {
-    min-height: 120px !important; text-align: left !important;
-    white-space: pre-line !important; background: #ffffff !important;
-    color: #1a3a5c !important; border: 1.5px solid #dde6f0 !important;
-    border-radius: 14px !important; padding: 1.2rem 1.4rem !important;
-    font-size: 1rem !important; font-weight: 600 !important;
-    line-height: 1.5 !important; box-shadow: 0 2px 10px rgba(0,0,0,0.05) !important;
-    transition: all 0.18s ease !important;
+    min-height: 52px !important; text-align: left !important;
+    background: #ffffff !important; color: var(--text-primary) !important;
+    border: 1.5px solid var(--neutral-border) !important;
+    border-radius: var(--radius) !important; padding: 0.9rem 1.1rem !important;
+    font-size: 0.95rem !important; font-weight: 600 !important;
+    line-height: 1.4 !important; box-shadow: 0 1px 4px rgba(0,0,0,0.06) !important;
+    transition: all 0.15s ease !important;
 }
 .landing-tile button:hover {
-    border-color: #3498db !important; background: #f3f8ff !important;
-    box-shadow: 0 6px 20px rgba(52,152,219,0.15) !important;
-    transform: translateY(-3px) !important; color: #063971 !important;
+    border-color: var(--brand-primary) !important;
+    background: var(--brand-bg) !important;
+    box-shadow: 0 4px 14px rgba(27,92,116,0.12) !important;
+    transform: translateY(-2px) !important;
+    color: var(--brand-dark) !important;
 }
 .landing-tile-desc {
-    font-size: 0.78rem !important; color: #8a97a8 !important;
-    margin-top: 0.1rem !important; margin-bottom: 1rem !important;
-    padding: 0 0.25rem !important; line-height: 1.4 !important;
+    font-size: 0.78rem; color: var(--text-secondary);
+    margin-top: 0.15rem; margin-bottom: 1rem;
+    padding: 0 0.15rem; line-height: 1.45; min-height: 3.6rem; display: block;
 }
+
+/* ── Метрики лендинга ──────────────────────────────────────────────────── */
+.landing-metric {
+    background: #ffffff; border: 1px solid var(--neutral-border);
+    border-radius: var(--radius); padding: 0.8rem 1rem;
+    text-align: center; margin-bottom: 0.5rem;
+}
+.landing-metric-value { font-size: 1.5rem; font-weight: 700; color: var(--brand-primary); }
+.landing-metric-label { font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem; }
+.main-title { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -141,24 +327,24 @@ h1, h2, h3 { color: #343a40; }
 # 🧭 Боковое меню
 # =============================================================================
 _ACTIVE_PRODUCTS = [
-    "🤝 Советчик", "📸 AI-Сканер документов", "🔍 Анализатор заявок",
-    "🔮 Предсказание решения регулятора", "📋 Робот-протокольщик", "🛠 Админка",
+    "Советчик", "Сканер документов", "Анализатор заявок",
+    "Прогноз решения регулятора", "Протокольщик", "Админка",
 ]
 _DEV_PRODUCTS = [
-    "⚖️ Позиция ФАС", "🔍 Поиск прецедентов", "👥 Сверка численности",
-    "🏭 Проверка амортизации", "📤 Экспорт ФГИС", "📝 Пояснительная записка",
-    "📊 Калькулятор рисков", "📝 Робот-жалобщик", "🔄 Трекер изменений законов",
-    "📊 Расчетный лист", "🔮 Прогнозист тарифов", "🌐 Сравнение с аналогами в регионе",
-    "🎓 Режим обучения для новичков", "🗂️ Наведение порядка в документах",
-    "🗓️ Планировщик тарифной кампании", "📊 Прогноз потребления",
+    "Позиция ФАС", "Поиск прецедентов", "Сверка численности",
+    "Проверка амортизации", "Экспорт ФГИС", "Пояснительная записка",
+    "Калькулятор рисков", "Жалобщик", "Трекер изменений законов",
+    "Расчетный лист", "Прогнозист тарифов", "Сравнение с аналогами",
+    "Режим обучения", "Наведение порядка в документах",
+    "Планировщик кампании", "Прогноз потребления",
 ]
 _PRODUCT_DESCRIPTIONS = {
-    "🤝 Советчик": "Ответы на вопросы по нормативной базе тарифного регулирования с опорой на актуальные НПА",
-    "📸 AI-Сканер документов": "Автоматическое распознавание и структурирование загружаемых документов",
-    "🔍 Анализатор заявок": "Проверка тарифных заявок на полноту комплекта и соответствие требованиям регулятора",
-    "🔮 Предсказание решения регулятора": "Оценка вероятности одобрения заявки на основе исторических данных",
-    "📋 Робот-протокольщик": "Автоматическое составление и форматирование протоколов заседаний",
-    "🛠 Админка": "Управление системой: промпты, статистика, обратная связь",
+    "Советчик": "Даёт ответы на вопросы по нормативной базе тарифного регулирования. Снижает нагрузку на специалистов на 30%. Ссылается на актуальные НПА.",
+    "Сканер документов": "Распознаёт текст из PDF, DOCX и сканов. Формирует базу из ваших документов. Позволяет делать краткий пересказ и полнотекстовый поиск.",
+    "Анализатор заявок": "Проверяет тарифную заявку на полноту комплекта. Подсвечивает риски по каждой статье затрат. Повышает проходимость заявок.",
+    "Прогноз решения регулятора": "Оценивает вероятность одобрения заявки регулятором на основе исторических данных. Снижает риски неодобрения статей.",
+    "Протокольщик": "Автоматически составляет протоколы заседаний из аудио или текста. Сокращает время подготовки протокола в несколько раз.",
+    "Админка": "Управление системой: загрузка документов, настройка параметров поиска, промпты, аналитика использования.",
 }
 
 if "main_choice" not in st.session_state:
@@ -172,12 +358,11 @@ def _on_dev_select():
 
 with st.sidebar:
     st.markdown('<div class="sidebar-logo">', unsafe_allow_html=True)
-    if st.button("⚡ REGULA.AI", key="sidebar_home_btn"):
+    if st.button("РЕГУЛА.AI — Главная", key="sidebar_home_btn"):
         st.session_state.show_landing = True
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
-    st.title("🧭 Меню")
-    st.markdown("**✅ Запущено**")
+    st.markdown("**Разделы**")
     _active_idx = (
         _ACTIVE_PRODUCTS.index(st.session_state.main_choice)
         if st.session_state.main_choice in _ACTIVE_PRODUCTS else None
@@ -186,8 +371,8 @@ with st.sidebar:
              label_visibility="collapsed", on_change=_on_active_select)
     st.divider()
     _dev_expanded = st.session_state.main_choice in _DEV_PRODUCTS
-    with st.expander("🚧 В разработке", expanded=_dev_expanded):
-        st.caption("Эти продукты находятся в стадии разработки и будут доступны позже.")
+    with st.expander("Наши планы", expanded=_dev_expanded):
+        st.caption("Продукты в активной разработке, доступны для ознакомления.")
         _dev_idx = (
             _DEV_PRODUCTS.index(st.session_state.main_choice)
             if st.session_state.main_choice in _DEV_PRODUCTS else None
@@ -196,8 +381,8 @@ with st.sidebar:
                  label_visibility="collapsed", on_change=_on_dev_select)
     st.divider()
     if is_admin_logged():
-        st.success("🔓 Админка: вход выполнен")
-        if st.button("🚪 Выйти"):
+        st.success("Админка: вход выполнен")
+        if st.button("Выйти"):
             st.session_state.admin_logged_in = False
             st.rerun()
 
@@ -214,22 +399,43 @@ if st.session_state.show_landing:
     </style>
     """, unsafe_allow_html=True)
     st.markdown("""
-    <div style="text-align:center; padding: 2.5rem 0 1rem;">
-        <div style="font-size:3rem; font-weight:900; letter-spacing:-0.02em;
-                    background: linear-gradient(100deg, #3498db 0%, #063971 100%);
-                    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-                    margin-bottom:0.5rem;">⚡ REGULA.AI</div>
-        <div style="font-size:1.05rem; color:#6b7a90; font-weight:400; max-width:560px; margin:0 auto; line-height:1.6;">
-            ИИ-система поддержки принятия решений<br>в области тарифного регулирования
+    <div style="text-align:center; padding: 2rem 0 1.5rem;">
+        <div style="font-size:2.6rem; font-weight:900; letter-spacing:0.02em;
+                    color:#1B5C74; margin-bottom:0.5rem;">РЕГУЛА.AI</div>
+        <div style="font-size:0.9rem; color:#1B5C74; font-weight:500; letter-spacing:0.08em;
+                    text-transform:uppercase; margin-bottom:1rem;">
+            Советчик в сфере тарифного регулирования РФ
         </div>
-        <div style="margin-top:0.8rem; font-size:0.82rem; color:#aab4c0; letter-spacing:0.04em;">
-            🔹 21 продукт &nbsp;·&nbsp; 🔹 2025–2026 &nbsp;·&nbsp; 🔹 Россия
+        <div style="font-size:1rem; color:#5a6a7a; max-width:580px; margin:0 auto; line-height:1.65;">
+            ИИ-система поддержки принятия решений в области тарифного регулирования
         </div>
     </div>
     """, unsafe_allow_html=True)
-    st.markdown("<hr style='border:none;border-top:1px solid #e8ecf2;margin:1rem 0 2rem;'>", unsafe_allow_html=True)
-    st.markdown("#### ✅ Запущенные продукты")
-    st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+
+    # Метрики — ценностное предложение
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.markdown("""
+        <div class="landing-metric">
+            <div class="landing-metric-value">–30%</div>
+            <div class="landing-metric-label">нагрузки на специалистов по регулированию</div>
+        </div>""", unsafe_allow_html=True)
+    with m2:
+        st.markdown("""
+        <div class="landing-metric">
+            <div class="landing-metric-value">+90%</div>
+            <div class="landing-metric-label">проходимость заявок с учётом подсвеченных рисков</div>
+        </div>""", unsafe_allow_html=True)
+    with m3:
+        st.markdown("""
+        <div class="landing-metric">
+            <div class="landing-metric-value">НПА</div>
+            <div class="landing-metric-label">ответы опираются на актуальную нормативную базу</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #dce3ec;margin:1.5rem 0 1rem;'>", unsafe_allow_html=True)
+    st.markdown("#### Функции")
+    st.markdown("<div style='height:0.3rem'></div>", unsafe_allow_html=True)
     _cols_per_row = 3
     for _row_start in range(0, len(_ACTIVE_PRODUCTS), _cols_per_row):
         _row_items = _ACTIVE_PRODUCTS[_row_start:_row_start + _cols_per_row]
@@ -249,22 +455,22 @@ if st.session_state.show_landing:
 # =============================================================================
 # 🚧 Диалог "В разработке"
 # =============================================================================
-@st.dialog("🚧 Продукт в разработке")
+@st.dialog("Продукт в разработке")
 def show_dev_dialog(product_name: str):
     st.markdown(f"### {product_name}")
     st.markdown("""
 Этот продукт **находится в активной разработке** и пока не готов к полноценному использованию.
 В интерфейсе представлен **прототип решения** — демонстрация концепции и будущего функционала.
-> 💡 Если у вас есть пожелания — свяжитесь с командой разработки.
+> Если у вас есть пожелания — свяжитесь с командой разработки.
     """)
     st.divider()
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("✅ Понятно, продолжить", type="primary", use_container_width=True):
+        if st.button("Понятно, продолжить", type="primary", use_container_width=True):
             st.session_state._dev_dialog_confirmed = product_name
             st.rerun()
     with col2:
-        if st.button("← Вернуться", use_container_width=True):
+        if st.button("Вернуться", use_container_width=True):
             st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
             st.session_state._dev_dialog_confirmed = None
             st.rerun()
@@ -278,14 +484,7 @@ else:
 # =============================================================================
 # 🎯 Заголовок
 # =============================================================================
-st.markdown("""
-<div class="main-title">
-RegulaAI<br>
-<span style="font-size: 1.5rem; font-weight: 400;">ИИ-Система поддержки принятия решений в области тарифного регулирования</span><br>
-<span style="font-size: 1rem; font-weight: 400; opacity: 0.8;">🔹 21 продукт | 🔹 2025-2026 | 🔹 Россия</span>
-</div>
-""", unsafe_allow_html=True)
-st.divider()
+# (заголовок убран — каждый раздел имеет собственный st.header)
 
 # =============================================================================
 # 📊 Тестовые данные
@@ -315,9 +514,9 @@ df_art  = example_data["articles"]
 # =============================================================================
 # Вкладка 1: Анализатор заявок
 # =============================================================================
-if main_choice == "🔍 Анализатор заявок":
-    st.header("🔍 Анализатор тарифных заявок")
-    st.info("📌 Загрузите расчётную модель и документы для проверки")
+if main_choice == "Анализатор заявок":
+    st.header("Анализатор тарифных заявок")
+    st.info("Загрузите расчётную модель и документы для проверки комплектности и выявления рисков")
     uploaded_files = st.file_uploader("Загрузите файлы", type=['xlsx','xls','pdf','docx'], accept_multiple_files=True)
     if uploaded_files:
         st.success(f"✅ Загружено: {len(uploaded_files)} файл(ов)")
@@ -362,9 +561,9 @@ if main_choice == "🔍 Анализатор заявок":
 # =============================================================================
 # Вкладка 2: Советчик — со стримингом ответа
 # =============================================================================
-elif main_choice == "🤝 Советчик":
-    st.header("🤝 Советчик по нормативной базе")
-    st.info("📌 Задайте вопрос по тарифному регулированию — ИИ найдёт ответ в базе НПА")
+elif main_choice == "Советчик":
+    st.header("Советчик по нормативной базе")
+    st.info("Задайте вопрос по тарифному регулированию — система найдёт ответ в актуальной базе НПА")
 
     # Инициализация session_state
     # Загружаем сохранённые настройки советчика
@@ -400,14 +599,14 @@ elif main_choice == "🤝 Советчик":
         st.info(f"📂 Ожидаемый путь: {db_file}")
         st.stop()
 
-    with st.expander("💡 Примеры вопросов", expanded=False):
+    with st.expander("Варианты использования", expanded=False):
         st.write("• Можно ли включать затраты на ДМС в тариф?")
         st.write("• Какие документы нужны для тарифной заявки по теплоснабжению?")
         st.write("• Как ФАС трактует расходы на программное обеспечение?")
         st.write("• Что такое валовая выручка и как она рассчитывается?")
 
     # ── Настройки ────────────────────────────────────────────────────────────
-    with st.expander("⚙️ Настройки", expanded=False):
+    with st.expander("Настройки", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             top_k = st.slider(
@@ -494,7 +693,7 @@ elif main_choice == "🤝 Советчик":
         st.warning("🧪 **Режим тестов чанков активен:** LLM отключён, показываются только источники")
 
     # ── Кнопка поиска — стриминг ────────────────────────────────────────────
-    if st.button("🔎 Найти ответ", type="primary", key="search_btn"):
+    if st.button("Найти ответ", type="primary", key="search_btn"):
         if query.strip():
             try:
                 from core.advisor import (
@@ -684,138 +883,138 @@ elif main_choice == "🤝 Советчик":
                     st.rerun()
 
     elif not st.session_state.search_triggered:
-        st.info("💡 Задайте вопрос и нажмите «🔎 Найти ответ»")
+        st.info("Введите вопрос и нажмите «Найти ответ»")
 
 # =============================================================================
 # Остальные продукты
 # =============================================================================
-elif main_choice == "⚖️ Позиция ФАС":
+elif main_choice == "Позиция ФАС":
     try:
         from streamlit_pages.fas_position import show_fas_position
         show_fas_position()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🔍 Поиск прецедентов":
+elif main_choice == "Поиск прецедентов":
     try:
         from streamlit_pages.court_precedents import show_court_precedents
         show_court_precedents()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "👥 Сверка численности":
+elif main_choice == "Сверка численности":
     try:
         from streamlit_pages.numeracy_check import show_numeracy_check
         show_numeracy_check()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🏭 Проверка амортизации":
+elif main_choice == "Проверка амортизации":
     try:
         from streamlit_pages.amortization_check import show_amortization_check
         show_amortization_check()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📤 Экспорт ФГИС":
+elif main_choice == "Экспорт ФГИС":
     try:
         from streamlit_pages.fgis_export import show_fgis_export
         show_fgis_export()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📝 Пояснительная записка":
+elif main_choice == "Пояснительная записка":
     try:
         from streamlit_pages.explanatory_note import show_explanatory_note
         show_explanatory_note()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📊 Калькулятор рисков":
+elif main_choice == "Калькулятор рисков":
     try:
         from streamlit_pages.risk_calculator import show_risk_calculator
         show_risk_calculator()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📝 Робот-жалобщик":
+elif main_choice == "Жалобщик":
     try:
         from streamlit_pages.complaint_bot import show_complaint_bot
         show_complaint_bot()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🔄 Трекер изменений законов":
+elif main_choice == "Трекер изменений законов":
     try:
         from streamlit_pages.law_tracker import show_law_tracker
         show_law_tracker()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📊 Расчетный лист":
+elif main_choice == "Расчетный лист":
     try:
         from streamlit_pages.calc_sheet import show_calc_sheet
         show_calc_sheet()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📸 AI-Сканер документов":
+elif main_choice == "Сканер документов":
     try:
         from streamlit_pages.doc_scanner import show_doc_scanner
         show_doc_scanner()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📋 Робот-протокольщик":
+elif main_choice == "Протокольщик":
     try:
         from streamlit_pages.protocol_bot import show_protocol_bot
         show_protocol_bot()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🔮 Предсказание решения регулятора":
+elif main_choice == "Прогноз решения регулятора":
     try:
         from streamlit_pages.predictor import show_predictor
         show_predictor()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🔮 Прогнозист тарифов":
+elif main_choice == "Прогнозист тарифов":
     try:
         from streamlit_pages.tariff_forecaster import show_tariff_forecaster
         show_tariff_forecaster()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🌐 Сравнение с аналогами в регионе":
+elif main_choice == "Сравнение с аналогами":
     try:
         from streamlit_pages.peer_comparison import show_peer_comparison
         show_peer_comparison()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🎓 Режим обучения для новичков":
+elif main_choice == "Режим обучения":
     try:
         from streamlit_pages.training_mode import show_training_mode
         show_training_mode()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🗂️ Наведение порядка в документах":
+elif main_choice == "Наведение порядка в документах":
     try:
         from streamlit_pages.document_organizer import show_document_organizer
         show_document_organizer()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "🗓️ Планировщик тарифной кампании":
+elif main_choice == "Планировщик кампании":
     try:
         from streamlit_pages.tariff_planner import show_tariff_planner
         show_tariff_planner()
     except ImportError as e:
-        st.error(f"❌ {e}")
+        st.error(f"Ошибка: {e}")
 
-elif main_choice == "📊 Прогноз потребления":
+elif main_choice == "Прогноз потребления":
     try:
         from streamlit_pages.consumption_forecast import show_consumption_forecast
         show_consumption_forecast()
@@ -825,8 +1024,8 @@ elif main_choice == "📊 Прогноз потребления":
 # =============================================================================
 # Вкладка: Админка
 # =============================================================================
-elif main_choice == "🛠 Админка":
-    st.header("🛠 Панель администратора")
+elif main_choice == "Админка":
+    st.header("Панель администратора")
 
     if not is_admin_logged():
         st.warning("🔒 Требуется вход администратора")
