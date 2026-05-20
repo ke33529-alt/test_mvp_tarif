@@ -21,18 +21,44 @@ import streamlit as st
 # =============================================================================
 # Утилиты — загрузка/сохранение базы сканов
 # =============================================================================
-_DB_PATH = os.path.join("data", "doc_scanner", "scans_db.json")
+_DB_PATH      = os.path.join("data", "doc_scanner", "scans_db.json")
+_ORIGINALS_DIR = os.path.join("data", "doc_scanner", "originals")
 _DB_LOCK = threading.Lock()
 
 
 def _ensure_dir():
     os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+    os.makedirs(_ORIGINALS_DIR, exist_ok=True)
 
 
 def _fname(doc: Dict) -> str:
     """Совместимость: старые документы используют 'file_name', новые — 'filename'."""
     return doc.get("filename") or doc.get("file_name") or "неизвестный файл"
 
+
+
+
+def _summary_path(original_path: str) -> str:
+    """Путь к txt-файлу пересказа рядом с оригиналом."""
+    if not original_path:
+        return ""
+    base = os.path.splitext(original_path)[0]
+    return base + "_пересказ.txt"
+
+def save_summary_file(original_path: str, summary: str):
+    """Сохраняет пересказ в txt рядом с оригиналом."""
+    path = _summary_path(original_path)
+    if path:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(summary)
+
+def load_summary_file(original_path: str) -> str:
+    """Читает пересказ из txt, возвращает пустую строку если нет."""
+    path = _summary_path(original_path)
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
 def load_db() -> Dict:
     _ensure_dir()
@@ -271,7 +297,8 @@ def extract_text(file_bytes: bytes, filename: str) -> List[Dict]:
 # =============================================================================
 # База документов
 # =============================================================================
-def add_to_db(db: Dict, filename: str, pages: List[Dict]) -> str:
+def add_to_db(db: Dict, filename: str, pages: List[Dict],
+              original_path: str = "") -> str:
     doc_id = hashlib.md5(
         f"{filename}_{datetime.now().isoformat()}".encode()
     ).hexdigest()[:12]
@@ -288,6 +315,7 @@ def add_to_db(db: Dict, filename: str, pages: List[Dict]) -> str:
         "page_count": len(pages),
         "ocr_pages": ocr_pages,
         "processed_at": datetime.now().isoformat(),
+        "original_path": original_path,
     }
     db["documents"].append(doc)
     db["stats"]["total"] = len(db["documents"])
@@ -298,17 +326,16 @@ def add_to_db(db: Dict, filename: str, pages: List[Dict]) -> str:
 # =============================================================================
 # Поиск с синонимами
 # =============================================================================
-def search_documents(db: Dict, query: str) -> List[Dict]:
-    """Поиск по всем документам с синонимами через QueryExpander."""
+def search_documents(db: Dict, query: str,
+                     include_summary: bool = False) -> List[Dict]:
+    """Поиск по документам. include_summary — искать и в тексте пересказа."""
     if not query.strip():
         return []
 
-    # Расширяем запрос синонимами
     search_terms = [query.lower()]
     try:
         from core.query_expander import QueryExpander
         variants = QueryExpander().expand(query)
-        # Берём только словарные варианты (без тарифного суффикса)
         search_terms += [
             v.lower() for v in variants
             if v != query and not v.endswith("тарифное регулирование")
@@ -319,26 +346,51 @@ def search_documents(db: Dict, query: str) -> List[Dict]:
     results = []
     for doc in db.get("documents", []):
         matches = []
+
+        # Поиск по страницам
         for page in doc.get("pages", []):
             page_text = page.get("text", "").lower()
             matched_terms = [t for t in search_terms if t in page_text]
             if matched_terms:
-                # Находим контекст вокруг первого совпадения
                 term = matched_terms[0]
                 idx = page_text.find(term)
                 start = max(0, idx - 100)
                 end = min(len(page_text), idx + 200)
                 context = "..." + page_text[start:end].strip() + "..."
-                # Подсвечиваем все совпавшие термины
                 for t in matched_terms:
                     context = re.sub(
                         re.escape(t), f"**{t.upper()}**", context, flags=re.IGNORECASE
                     )
                 matches.append({
                     "page": page["page"],
+                    "source": "текст",
                     "context": context,
                     "matched_terms": matched_terms,
                 })
+
+        # Поиск по пересказу (опционально)
+        if include_summary:
+            _sum_text = load_summary_file(doc.get("original_path", ""))
+            if _sum_text:
+                _sum_lower = _sum_text.lower()
+                matched_terms = [t for t in search_terms if t in _sum_lower]
+                if matched_terms:
+                    term = matched_terms[0]
+                    idx = _sum_lower.find(term)
+                    start = max(0, idx - 100)
+                    end = min(len(_sum_lower), idx + 200)
+                    context = "..." + _sum_text[start:end].strip() + "..."
+                    for t in matched_terms:
+                        context = re.sub(
+                            re.escape(t), f"**{t.upper()}**", context,
+                            flags=re.IGNORECASE
+                        )
+                    matches.append({
+                        "page": None,
+                        "source": "пересказ",
+                        "context": context,
+                        "matched_terms": matched_terms,
+                    })
 
         if matches:
             results.append({
@@ -697,7 +749,15 @@ def show_doc_scanner():
                     pages = extract_text(file_bytes, f.name)
                     elapsed = time.perf_counter() - t0
 
-                    doc_id = add_to_db(db, f.name, pages)
+                    # Сохраняем оригинал на диск
+                    _orig_path = os.path.join(_ORIGINALS_DIR, f.name)
+                    try:
+                        with open(_orig_path, "wb") as _of:
+                            _of.write(file_bytes)
+                    except Exception:
+                        _orig_path = ""
+
+                    doc_id = add_to_db(db, f.name, pages, original_path=_orig_path)
                     new_ids.append(doc_id)
 
                     ocr_count = sum(1 for p in pages if p.get("method") == "ocr")
@@ -723,6 +783,13 @@ def show_doc_scanner():
                 if d["id"] in last_ids and d["id"] not in _seen
                 and not _seen.add(d["id"])
             ]
+            # Восстанавливаем пересказы из файлов в session_state
+            for _ld in last_docs:
+                _sk = f"summary_{_ld['id']}"
+                if _sk not in st.session_state:
+                    _loaded = load_summary_file(_ld.get("original_path", ""))
+                    if _loaded:
+                        st.session_state[_sk] = _loaded
 
 
             # ── Список документов ─────────────────────────────────────────
@@ -889,6 +956,10 @@ def show_doc_scanner():
                 _gprog.empty()
                 _gcap.empty()
                 st.session_state[summary_key] = _gresult
+                # Сохраняем пересказ как txt рядом с оригиналом
+                _orig_p = doc.get("original_path", "")
+                if _orig_p:
+                    save_summary_file(_orig_p, _gresult)
                 st.rerun()
 
             # ── Результат пересказа ───────────────────────────────────────
@@ -966,133 +1037,456 @@ def show_doc_scanner():
 
 
     with tab_search:
-        st.subheader("🔍 Поиск по содержимому")
+        st.subheader("Поиск по содержимому")
 
         if not db.get("documents"):
-            st.info("📭 Сначала распознайте хотя бы один документ на вкладке «Загрузка».")
+            st.info("Сначала распознайте хотя бы один документ на вкладке «Загрузка».")
         else:
+            # Строка поиска + кнопка
             search_col, btn_col = st.columns([5, 1])
             with search_col:
                 search_query = st.text_input(
-                    "Введите запрос",
+                    "Запрос",
                     placeholder="например: неподконтрольные расходы, ДМС, НДС",
                     key="search_input",
                     label_visibility="collapsed",
                 )
             with btn_col:
-                do_search = st.button("🔍 Найти", type="primary", key="search_exec_btn", width="stretch")
+                do_search = st.button(
+                    "Найти", type="primary", key="search_exec_btn",
+                    use_container_width=True
+                )
+
+            # Настройки поиска
+            _src_opt = st.radio(
+                "Искать в:",
+                ["Только в тексте документов",
+                 "В тексте и пересказах"],
+                horizontal=True,
+                key="search_scope",
+                label_visibility="visible",
+            )
+            _inc_sum = (_src_opt == "В тексте и пересказах")
 
             if do_search and search_query.strip():
-                results = search_documents(db, search_query)
+                results = search_documents(db, search_query,
+                                           include_summary=_inc_sum)
                 st.session_state["search_results"] = results
                 st.session_state["search_query"]   = search_query
+                st.session_state["search_scope_saved"] = _src_opt
 
             results = st.session_state.get("search_results", [])
             query   = st.session_state.get("search_query", "")
 
             if results:
-                st.success(f"Найдено совпадений в **{len(results)}** документах по запросу: _{query}_")
+                st.success(
+                    f"Найдено в **{len(results)}** документах по запросу: _{query}_"
+                )
                 for res in results:
                     doc = res["doc"]
                     with st.expander(
-                        f"📄 {_fname(doc)} — {res['total_matches']} совпадений",
+                        f"{_fname(doc)} — {res['total_matches']} совпадений",
                         expanded=(res == results[0]),
                     ):
                         for match in res["matches"]:
-                            st.markdown(f"**Стр. {match['page']}:** {match['context']}")
-                            st.caption(f"Найдено: {', '.join(match['matched_terms'])}")
+                            _src_badge = (
+                                f"**Пересказ:**" if match["source"] == "пересказ"
+                                else f"**Стр. {match['page']}:**"
+                            )
+                            st.markdown(f"{_src_badge} {match['context']}")
+                            st.caption(
+                                f"Источник: {match['source']}  ·  "
+                                f"Совпадения: {', '.join(match['matched_terms'])}"
+                            )
                             st.divider()
             elif do_search and search_query.strip():
-                st.warning("🔎 Совпадений не найдено. Попробуйте другой запрос.")
+                st.warning("Совпадений не найдено. Попробуйте другой запрос.")
 
     # =========================================================================
     # Вкладка 3 — База документов
     # =========================================================================
     with tab_docs:
-        st.subheader("📚 База распознанных документов")
+        st.subheader("База распознанных документов")
 
         docs = db.get("documents", [])
         stats = db.get("stats", {})
 
-        # Метрики
+        # ── Метрики ──────────────────────────────────────────────────────────
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("📊 Документов", stats.get("total", 0))
-        m2.metric("📄 Страниц всего", sum(d.get("page_count", 0) for d in docs))
-        m3.metric("🔤 Слов всего", f"{sum(d.get('word_count', 0) for d in docs):,}")
-        m4.metric("🕐 Последний", (stats.get("last_scan") or "—")[:10])
+        m1.metric("Документов", stats.get("total", 0))
+        m2.metric("Страниц", sum(d.get("page_count", 0) for d in docs))
+        m3.metric("Слов", f"{sum(d.get('word_count', 0) for d in docs):,}")
+        m4.metric("Последний", (stats.get("last_scan") or "—")[:10])
 
         if docs:
-            import pandas as pd
-            df = pd.DataFrame([
-                {
-                    "Файл": _fname(d),
-                    "Стр.": d.get("page_count") or len(d.get("pages", [])),
-                    "Слов": d.get("word_count", 0),
-                    "OCR":  d.get("ocr_pages", 0),
-                    "Дата": (d.get("processed_at") or d.get("scan_date") or "—")[:16],
-                }
-                for d in reversed(docs)
-            ])
-            st.dataframe(df, width="stretch", hide_index=True)
+            st.divider()
+
+            # ── Хранилище: метрики занятого места ────────────────────────────
+            _sz_orig = _sz_sum = _sz_db = 0
+            for _sd in docs:
+                _op = _sd.get("original_path", "")
+                if _op and os.path.exists(_op):
+                    _sz_orig += os.path.getsize(_op)
+                _sp2 = _summary_path(_op)
+                if _sp2 and os.path.exists(_sp2):
+                    _sz_sum += os.path.getsize(_sp2)
+            try:
+                _sz_db = os.path.getsize(_DB_PATH) if os.path.exists(_DB_PATH) else 0
+            except Exception:
+                pass
+            def _fmt_sz(b):
+                if b < 1024: return f"{b} Б"
+                if b < 1024**2: return f"{b/1024:.1f} КБ"
+                return f"{b/1024**2:.2f} МБ"
+            _sz_total = _sz_orig + _sz_sum + _sz_db
+            _sw1, _sw2, _sw3, _sw4 = st.columns(4)
+            _sw1.metric("Итого на диске", _fmt_sz(_sz_total))
+            _sw2.metric("Оригиналы", _fmt_sz(_sz_orig))
+            _sw3.metric("Пересказы (txt)", _fmt_sz(_sz_sum))
+            _sw4.metric("База (json)", _fmt_sz(_sz_db))
 
             st.divider()
 
-            # Просмотр конкретного документа
-            doc_names = {d["id"]: _fname(d) for d in docs}
-            selected_id = st.selectbox(
-                "Просмотреть документ",
-                options=list(doc_names.keys()),
-                format_func=lambda x: doc_names[x],
-                key="db_doc_select",
-            )
+            # ── Фильтры ───────────────────────────────────────────────────────
+            ff1, ff2, ff3 = st.columns([2, 2, 1])
+            with ff1:
+                _db_search = st.text_input(
+                    "Поиск по имени",
+                    placeholder="Поиск по имени файла...",
+                    key="db_search",
+                )
+            with ff2:
+                _all_exts = sorted({
+                    os.path.splitext(_fname(d))[1].lower().lstrip(".")
+                    for d in docs
+                    if os.path.splitext(_fname(d))[1]
+                })
+                _db_fmt = st.multiselect(
+                    "Формат файла",
+                    options=_all_exts,
+                    key="db_fmt",
+                    placeholder="Все форматы",
+                )
+            with ff3:
+                _db_only_sum = st.toggle("Только с пересказом", key="db_only_sum")
 
-            if selected_id:
-                sel_doc = next((d for d in docs if d["id"] == selected_id), None)
-                if sel_doc:
-                    _pc = sel_doc.get("page_count") or len(sel_doc.get("pages", []))
-                    _wc = sel_doc.get("word_count", 0)
-                    _fn = _fname(sel_doc)
-                    st.markdown(f"**{_fn}** · {_pc} стр. · {_wc} слов")
-                    for page in sel_doc.get("pages", []):
-                        _pw = page.get("word_count") or len(page.get("text","").split())
-                        with st.expander(f"Страница {page.get('page',1)} ({page.get('method','')}) — {_pw} слов"):
-                            st.text_area("Текст", page.get("text",""), height=200, disabled=True,
-                                         key=f"db_view_{selected_id}_{page.get('page',1)}")
+            ff4, ff5 = st.columns([2, 2])
+            with ff4:
+                _days_opts = [1, 3, 7, 14, 30, 90, 0]
+                _days_labels = {1:"Сегодня",3:"3 дня",7:"7 дней",
+                                14:"2 недели",30:"Месяц",90:"3 месяца",0:"Все время"}
+                _db_days = st.select_slider(
+                    "Период загрузки",
+                    options=_days_opts,
+                    value=7,
+                    format_func=lambda x: _days_labels[x],
+                    key="db_days",
+                )
+            with ff5:
+                _db_sort = st.selectbox(
+                    "Сортировка",
+                    ["По дате (новые)", "По дате (старые)", "По имени А-Я",
+                     "По размеру (больше)", "Сначала с пересказом"],
+                    key="db_sort",
+                )
 
-                    # Экспорт из базы
-                    db_exp1, db_exp2 = st.columns(2)
-                    with db_exp1:
-                        st.download_button(
-                            "📄 Скачать TXT",
-                            data=export_txt(sel_doc),
-                            file_name=f"{os.path.splitext(_fn)[0]}.txt",
-                            mime="text/plain",
-                            key=f"db_dl_txt_{selected_id}",
-                        )
-                    with db_exp2:
+            # ── Применяем фильтры ─────────────────────────────────────────────
+            from datetime import datetime as _dt, timedelta as _td
+            _filtered = list(reversed(docs))
+
+            # Фильтр по дате
+            if _db_days > 0:
+                _cutoff = _dt.now() - _td(days=_db_days)
+                def _doc_date(d):
+                    try:
+                        return _dt.fromisoformat(d.get("processed_at","1970-01-01"))
+                    except Exception:
+                        return _dt(1970,1,1)
+                _filtered = [d for d in _filtered if _doc_date(d) >= _cutoff]
+
+            # Фильтр по формату
+            if _db_fmt:
+                _filtered = [
+                    d for d in _filtered
+                    if os.path.splitext(_fname(d))[1].lower().lstrip(".") in _db_fmt
+                ]
+
+            # Фильтр по имени
+            if _db_search.strip():
+                _q = _db_search.strip().lower()
+                _filtered = [d for d in _filtered if _q in _fname(d).lower()]
+
+            # Фильтр "только с пересказом"
+            if _db_only_sum:
+                _filtered = [
+                    d for d in _filtered
+                    if st.session_state.get(f"summary_{d['id']}")
+                    or load_summary_file(d.get("original_path", ""))
+                ]
+
+            # Сортировка
+            if _db_sort == "По дате (старые)":
+                _filtered = list(reversed(_filtered))
+            elif _db_sort == "По имени А-Я":
+                _filtered.sort(key=lambda d: _fname(d).lower())
+            elif _db_sort == "По размеру (больше)":
+                _filtered.sort(key=lambda d: d.get("word_count", 0), reverse=True)
+            elif _db_sort == "Сначала с пересказом":
+                def _has_sum(d):
+                    return bool(
+                        st.session_state.get(f"summary_{d['id']}")
+                        or load_summary_file(d.get("original_path", ""))
+                    )
+                _filtered.sort(key=_has_sum, reverse=True)
+
+            # Подсказка активных фильтров
+            _active = []
+            if _db_days > 0:
+                _active.append(f"за {_days_labels[_db_days].lower()}")
+            if _db_fmt:
+                _active.append(f"форматы: {', '.join(_db_fmt)}")
+            if _db_only_sum:
+                _active.append("только с пересказом")
+            _flt_hint = "  ·  ".join(_active) if _active else "все документы"
+            st.caption(f"Показано: {len(_filtered)} из {len(docs)}  ·  {_flt_hint}")
+
+            # ── Список карточек ──────────────────────────────────────────────
+            _open_key = "db_open_card"
+            if _open_key not in st.session_state:
+                st.session_state[_open_key] = None
+
+            for _d in _filtered:
+                _did  = _d["id"]
+                _dfn  = _fname(_d)
+                _dpc  = _d.get("page_count") or len(_d.get("pages", []))
+                _dwc  = _d.get("word_count", 0)
+                _docr = _d.get("ocr_pages", 0)
+                _ddt  = (_d.get("processed_at") or "")[:10]
+                _dorig = _d.get("original_path", "")
+                _dsum  = (
+                    st.session_state.get(f"summary_{_did}")
+                    or load_summary_file(_dorig)
+                )
+                _has_s  = bool(_dsum)
+                _orig_ok = bool(_dorig and os.path.exists(_dorig))
+                _is_open = st.session_state[_open_key] == _did
+
+                # Карточка — шапка
+                _badge = "✅ пересказ" if _has_s else "— пересказа нет"
+                _orig_badge = "" if not _dorig else (
+                    "  ·  файл доступен" if _orig_ok else "  ·  ⚠ файл перемещён"
+                )
+                st.markdown(
+                    f"<div style='background:#ffffff;border:1px solid #dce3ec;"
+                    f"border-radius:6px;padding:10px 14px;margin-bottom:4px;'>"
+                    f"<div style='font-weight:600;font-size:0.95rem;"
+                    f"color:#1a2a3a;word-break:break-all;'>{_dfn}</div>"
+                    f"<div style='font-size:0.75rem;color:#5a6a7a;margin-top:3px;'>"
+                    f"{_dpc} стр. · {_dwc:,} слов · OCR: {_docr} · {_ddt}"
+                    f"  ·  {_badge}{_orig_badge}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Кнопки-действия в строке
+                _ca, _cb_btn, _cc, _cd = st.columns([2, 1, 1, 1])
+                with _ca:
+                    _btn_label = "Скрыть детали" if _is_open else "Показать детали"
+                    if st.button(_btn_label, key=f"db_toggle_{_did}",
+                                 use_container_width=True):
+                        st.session_state[_open_key] = None if _is_open else _did
+                        st.rerun()
+                with _cb_btn:
+                    _file_label = "Открыть файл" if _orig_ok else "Файл недоступен"
+                    if st.button(_file_label, key=f"db_open_{_did}",
+                                 disabled=not _orig_ok, use_container_width=True):
                         try:
-                            docx_buf = export_docx(sel_doc)
+                            import subprocess as _sp, sys as _sys
+                            if _sys.platform == "win32":
+                                os.startfile(_dorig)
+                            elif _sys.platform == "darwin":
+                                _sp.Popen(["open", _dorig])
+                            else:
+                                _sp.Popen(["xdg-open", _dorig])
+                        except Exception as _oe:
+                            st.error(str(_oe))
+                with _cc:
+                    if _has_s:
+                        _sfname = os.path.basename(_summary_path(_dorig))                                   or f"{os.path.splitext(_dfn)[0]}_пересказ.txt"
+                        st.download_button(
+                            "Скачать пересказ",
+                            data=_dsum.encode("utf-8"),
+                            file_name=_sfname,
+                            mime="text/plain",
+                            key=f"db_dl_sum_{_did}",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.button("Пересказа нет", key=f"db_nosum_{_did}",
+                                  disabled=True, use_container_width=True)
+                with _cd:
+                    _ce, _cf = st.columns(2)
+                    with _ce:
+                        st.download_button(
+                            "Скачать TXT",
+                            data=export_txt(_d),
+                            file_name=f"{os.path.splitext(_dfn)[0]}_распознан.txt",
+                            mime="text/plain",
+                            key=f"db_dl_txt2_{_did}",
+                            use_container_width=True,
+                        )
+                    with _cf:
+                        try:
+                            _docx_buf = export_docx(_d, summary=_dsum or None)
                             st.download_button(
-                                "📝 Скачать DOCX",
-                                data=docx_buf,
-                                file_name=f"{os.path.splitext(sel__fname(doc))[0]}.docx",
+                                "Скачать DOCX",
+                                data=_docx_buf,
+                                file_name=f"{os.path.splitext(_dfn)[0]}_распознан.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                key=f"db_dl_docx_{selected_id}",
+                                key=f"db_dl_docx_{_did}",
+                                use_container_width=True,
                             )
-                        except Exception as e:
-                            st.warning(str(e))
+                        except Exception:
+                            pass
+
+                # Развёрнутая карточка
+                if _is_open:
+                    with st.container():
+                        st.markdown(
+                            "<div style='border:1px solid #dce3ec;border-top:none;"
+                            "border-radius:0 0 6px 6px;padding:14px 16px;"
+                            "background:#fafbfc;margin-bottom:12px;'>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # Навигация по страницам
+                        _pages  = _d.get("pages", [])
+                        _pkey   = f"db_page_{_did}"
+                        if _pkey not in st.session_state:
+                            st.session_state[_pkey] = 0
+                        _pidx = max(0, min(st.session_state[_pkey], len(_pages)-1))
+                        _pcur = _pages[_pidx] if _pages else {}
+
+                        _n1, _n2, _n3 = st.columns([1, 4, 1])
+                        with _n1:
+                            if st.button("◀", key=f"db_prev_{_did}",
+                                         disabled=(_pidx == 0)):
+                                st.session_state[_pkey] = _pidx - 1
+                                st.rerun()
+                        with _n2:
+                            _pw = _pcur.get("word_count") or len(_pcur.get("text","").split())
+                            st.markdown(
+                                f"<div style='text-align:center;padding-top:6px;'>"
+                                f"Страница <b>{_pidx+1}</b> из <b>{len(_pages)}</b> "
+                                f"<span style='color:#888;font-size:0.82em;'>"
+                                f"({_pcur.get('method','')} · {_pw} слов)</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _n3:
+                            if st.button("▶", key=f"db_next_{_did}",
+                                         disabled=(_pidx >= len(_pages)-1)):
+                                st.session_state[_pkey] = _pidx + 1
+                                st.rerun()
+
+                        st.markdown(
+                            f"<div style='font-size:0.85em;line-height:1.55;"
+                            f"background:#f8f9fa;border:1px solid #e0e0e0;"
+                            f"border-radius:6px;padding:10px 12px;margin-top:6px;"
+                            f"max-height:280px;overflow-y:auto;"
+                            f"white-space:pre-wrap;word-break:break-word;'>"
+                            f"{_pcur.get('text','').replace('<','&lt;').replace('>','&gt;')}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # Пересказ
+                        if _dsum:
+                            st.divider()
+                            _swc = len(_dsum.split())
+                            st.markdown(
+                                f"<div style='display:flex;justify-content:space-between;"
+                                f"align-items:center;margin-bottom:4px;'>"
+                                f"<span style='font-weight:600;'>Пересказ</span>"
+                                f"<span style='color:#5a6a7a;font-size:0.78em;'>{_swc} слов</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                            _sh = max(120, min(400, _swc * 6))
+                            st.markdown(
+                                f"<div style='font-size:0.85em;line-height:1.6;"
+                                f"background:#f0f4f8;border:1px solid #d0d8e4;"
+                                f"border-radius:6px;padding:12px 14px;"
+                                f"max-height:{_sh}px;overflow-y:auto;"
+                                f"white-space:pre-wrap;word-break:break-word;'>"
+                                f"{_dsum.replace('<','&lt;').replace('>','&gt;')}"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='margin-bottom:8px;'></div>",
+                                unsafe_allow_html=True)
 
             st.divider()
 
             # Очистка базы
-            if st.button("🗑️ Очистить базу сканов", type="secondary", key="clear_scan_db"):
-                st.session_state["scanner_db"] = {
-                    "documents": [], "stats": {"total": 0, "last_scan": None}
-                }
-                save_db(st.session_state["scanner_db"])
-                st.session_state.pop("last_scanned_ids", None)
-                st.session_state.pop("search_results", None)
-                st.success("✅ База очищена")
-                st.rerun()
+            _clr_key = "confirm_clear_db"
+            _clr_pending = st.session_state.get(_clr_key, False)
+
+            if not _clr_pending:
+                if st.button("Очистить базу документов", type="secondary",
+                             key="clear_scan_db", use_container_width=True):
+                    st.session_state[_clr_key] = True
+                    st.rerun()
+            else:
+                st.warning(
+                    "Будут удалены все оригиналы файлов, результаты распознавания "
+                    "и пересказы. Это действие необратимо."
+                )
+                _cy, _cn = st.columns(2)
+                if _cy.button("Да, удалить всё", key="clear_confirm_yes",
+                              type="primary", use_container_width=True):
+                    # Удаляем файлы originals + пересказы
+                    _del_ok, _del_err = 0, 0
+                    for _ddoc in docs:
+                        for _fpath in [
+                            _ddoc.get("original_path", ""),
+                            _summary_path(_ddoc.get("original_path", "")),
+                        ]:
+                            if _fpath and os.path.exists(_fpath):
+                                try:
+                                    os.remove(_fpath)
+                                    _del_ok += 1
+                                except Exception:
+                                    _del_err += 1
+
+                    # Сбрасываем БД
+                    _empty_db = {"documents": [], "stats": {"total": 0, "last_scan": None}}
+                    st.session_state["scanner_db"] = _empty_db
+                    save_db(_empty_db)
+
+                    # Очищаем session_state от пересказов и прочего
+                    for _k in list(st.session_state.keys()):
+                        if any(_k.startswith(p) for p in (
+                            "summary_", "gen_trigger_", "pending_confirm_",
+                            "exp_open_", "page_idx_", "sum_mode_", "sum_words_",
+                        )):
+                            st.session_state.pop(_k, None)
+                    st.session_state.pop("last_scanned_ids", None)
+                    st.session_state.pop("search_results", None)
+                    st.session_state.pop("scan_sel_id", None)
+                    st.session_state[_clr_key] = False
+
+                    _msg = f"База очищена. Удалено файлов: {_del_ok}."
+                    if _del_err:
+                        _msg += f" Не удалось удалить: {_del_err}."
+                    st.success(_msg)
+                    st.rerun()
+
+                if _cn.button("Отмена", key="clear_confirm_no",
+                              use_container_width=True):
+                    st.session_state[_clr_key] = False
+                    st.rerun()
         else:
             st.info("📭 База пуста. Загрузите документы на вкладке «Загрузка».")
