@@ -5,6 +5,26 @@ import json
 from datetime import datetime
 import traceback
 
+# =============================================================================
+# Патч совместимости с NumPy 2.0
+# В NumPy 2.0 удалены устаревшие алиасы np.float_, np.int_, np.complex_ и др.
+# ChromaDB / hnswlib / sentence-transformers могут использовать старые алиасы.
+# Патч должен быть применён ДО импорта любых зависимостей.
+# =============================================================================
+import numpy as np
+_NP2_ALIASES = {
+    "float_":   np.float64,
+    "int_":     np.int64,
+    "complex_": np.complex128,
+    "bool8":    np.bool_,
+    "object0":  np.object_,
+    "str0":     np.str_,
+    "bytes0":   np.bytes_,
+}
+for _alias, _target in _NP2_ALIASES.items():
+    if not hasattr(np, _alias):
+        setattr(np, _alias, _target)
+
 # Добавляем корень проекта в путь для корректного импорта модуля core
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

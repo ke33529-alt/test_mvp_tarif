@@ -160,17 +160,7 @@ h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
     border-bottom: none !important;
 }
 
-/* ── Ползунки (slider) — фирменный оттенок, только внутри stSlider ─────── */
-[data-testid="stSlider"] [role="slider"],
-[data-testid="stSlider"] [class*="thumb"] {
-    background-color: var(--brand-mid) !important;
-    border-color: var(--brand-mid) !important;
-    box-shadow: 0 0 0 3px var(--brand-light2) !important;
-}
-[data-testid="stSlider"] [class*="track"]:last-child,
-[data-testid="stSlider"] [class*="Track"]:last-child {
-    background-color: var(--brand-mid) !important;
-}
+/* ── Ползунки — цвет управляется через .streamlit/config.toml primaryColor */
 
 /* ── Прогресс-бар st.progress() ────────────────────────────────────────── */
 [data-testid="stProgress"] > div {
@@ -190,26 +180,10 @@ h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
     font-size: 0.82em !important;
 }
 
-/* ── Radio — фирменный акцент ───────────────────────────────────────────── */
+/* ── Radio — цвет управляется через .streamlit/config.toml primaryColor ─── */
+/* Hover на лейбле */
 [data-testid="stRadio"] label:hover { color: var(--brand-primary) !important; }
-[data-testid="stRadio"] [data-baseweb="radio"] [class*="circle"],
-[data-testid="stRadio"] input[type="radio"]:checked + div {
-    border-color: var(--brand-primary) !important;
-    background-color: var(--brand-primary) !important;
-}
-/* baseweb radio outer ring on check */
-[data-baseweb="radio"] [class*="RadioMarkOuter"] {
-    border-color: var(--brand-primary) !important;
-}
-[data-baseweb="radio"] [class*="RadioMarkInner"] {
-    background: var(--brand-primary) !important;
-}
-/* selected radio row */
-[data-testid="stRadio"] label[data-selected="true"],
-[data-testid="stRadio"] div[aria-checked="true"] ~ label {
-    color: var(--brand-primary) !important;
-    font-weight: 600 !important;
-}
+
 
 /* ── Табы — активная вкладка фирменного цвета ───────────────────────────── */
 [data-baseweb="tab-list"] {
