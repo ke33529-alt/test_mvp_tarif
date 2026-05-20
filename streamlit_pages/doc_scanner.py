@@ -683,7 +683,7 @@ def show_doc_scanner():
             st.info(f"📎 Загружено файлов: **{len(uploaded)}**")
 
             # Кнопка запуска
-            if st.button("🚀 Запустить распознавание", type="primary", key="scan_btn"):
+            if st.button("▶ Запустить распознавание", type="primary", key="scan_btn"):
                 progress = st.progress(0)
                 status   = st.empty()
                 new_ids  = []
@@ -724,235 +724,241 @@ def show_doc_scanner():
                 and not _seen.add(d["id"])
             ]
 
-            # ── ГЕНЕРАЦИЯ ПЕРЕСКАЗА — вне цикла, в фиксированной позиции ──
-            # Проверяем gen_trigger для любого из документов списка.
-            # Это гарантирует ровно ОДИН рендер блока генерации.
-            for _gd in last_docs:
-                _gk = f"gen_trigger_{_gd['id']}"
-                if _gk in st.session_state:
-                    _gl      = st.session_state.pop(_gk)
-                    _gft     = _gd.get("full_text", "")
-                    _gnc     = max(1, len(_gft) // _CHUNK_SIZE + 1)
-                    _gisl    = len(_gft) > _LARGE_DOC_THRESHOLD
-                    _gskey   = f"summary_{_gd['id']}"
-
-                    st.divider()
-                    st.subheader("📄 Результаты распознавания")
-                    st.markdown(f"**Генерация пересказа:** {_gd.get('name','')}")
-
-                    # Прогресс-бар + текст.
-                    # Текстовые обновления через WebSocket работают (подтверждено).
-                    # st.progress() обновляется тем же механизмом.
-                    if _gisl:
-                        st.caption(
-                            f"Map-Reduce: ~{_gnc} частей · ~1-3 мин. · "
-                            f"{len(_gft):,} символов"
-                        )
-                    _gprog = st.progress(0.0)
-                    _gcap  = st.empty()
-                    _gcap.caption("Подготовка...")
-
-                    def _gcb(pct, msg, _p=_gprog, _c=_gcap):
-                        _pct = min(float(pct), 1.0)
-                        _p.progress(_pct)
-                        _c.caption(f"⏳ {msg}  ·  {int(_pct * 100)}%")
-
-                    _gresult = summarize_document(_gft, _gl, _progress_cb=_gcb)
-                    _gprog.progress(1.0)
-                    _gcap.caption("Готово")
-                    _gprog.empty()
-                    _gcap.empty()
-                    st.session_state[_gskey] = _gresult
-                    st.session_state[f"exp_open_{_gd['id']}"] = True
-                    st.rerun()
 
             # ── Список документов ─────────────────────────────────────────
             st.divider()
             st.subheader("📄 Результаты распознавания")
 
-            # ── Документы ────────────────────────────────────────────────
-            for doc in last_docs:
-                _pc2 = doc.get("page_count") or len(doc.get("pages", []))
-                _wc2 = doc.get("word_count", 0)
-                _exp_key = f"exp_open_{doc['id']}"
-                with st.expander(
-                    f"📄 {_fname(doc)} — {_pc2} стр., {_wc2} слов",
-                    expanded=st.session_state.get(_exp_key, False),
-                ):
+            # ── Выбор документа — selectbox со встроенным поиском ───────
+            def _short(name, n=45):
+                return name if len(name) <= n else name[:n] + "…"
 
-                    # ── Навигация по страницам ───────────────────────────
-                    pages_list = doc.get("pages", [])
-                    page_key   = f"page_idx_{doc['id']}"
-                    if page_key not in st.session_state:
-                        st.session_state[page_key] = 0
+            _doc_ids   = [d["id"] for d in last_docs]
+            _doc_labels = {
+                d["id"]: _short(_fname(d)) + f"  ·  {d.get('page_count') or len(d.get('pages',[]))} стр."
+                for d in last_docs
+            }
 
-                    cur_idx  = st.session_state[page_key]
-                    cur_idx  = max(0, min(cur_idx, len(pages_list) - 1))
-                    cur_page = pages_list[cur_idx] if pages_list else {}
+            # Сохраняем выбранный документ в session_state
+            if "scan_sel_id" not in st.session_state or                st.session_state.scan_sel_id not in _doc_ids:
+                st.session_state.scan_sel_id = _doc_ids[0]
 
-                    # Навигационная панель
-                    nav1, nav2, nav3 = st.columns([1, 4, 1])
-                    with nav1:
-                        if st.button("◀ Пред.", key=f"prev_btn_{doc['id']}",
-                                     disabled=(cur_idx == 0)):
-                            st.session_state[page_key] = cur_idx - 1
-                            st.rerun()
-                    with nav2:
-                        st.markdown(
-                            f"<div style='text-align:center; padding-top:6px;'>"
-                            f"Страница <b>{cur_idx+1}</b> из <b>{len(pages_list)}</b> "
-                            f"<span style='color:grey;font-size:0.85em;'>"
-                            f"({cur_page.get('method','')} · "
-                            f"{cur_page.get('word_count') or len(cur_page.get('text','').split())} слов)"
-                            f"</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                    with nav3:
-                        if st.button("След. ▶", key=f"next_btn_{doc['id']}",
-                                     disabled=(cur_idx >= len(pages_list) - 1)):
-                            st.session_state[page_key] = cur_idx + 1
-                            st.rerun()
+            _n_docs = len(_doc_ids)
+            sel_id = st.selectbox(
+                f"Выберите документ  ({_n_docs} {'документ' if _n_docs == 1 else 'документа' if 2 <= _n_docs <= 4 else 'документов'})",
+                options=_doc_ids,
+                format_func=lambda x: _doc_labels[x],
+                key="scan_sel_id",
+            )
 
-                    # Текст текущей страницы — уменьшенный шрифт
-                    st.markdown(
-                        f"<div style='font-size:0.87em; line-height:1.55; "
-                        f"background:#f8f9fa; border:1px solid #e0e0e0; "
-                        f"border-radius:6px; padding:12px 14px; "
-                        f"max-height:320px; overflow-y:auto; "
-                        f"white-space:pre-wrap; word-break:break-word;'>"
-                        f"{cur_page.get('text','').replace('<','&lt;').replace('>','&gt;')}"
-                        f"</div>",
-                        unsafe_allow_html=True,
+            doc = next((d for d in last_docs if d["id"] == sel_id), last_docs[0])
+
+            # ── Шапка выбранного документа ────────────────────────────────
+            _pc2 = doc.get("page_count") or len(doc.get("pages", []))
+            _wc2 = doc.get("word_count", 0)
+            _has_summary = bool(st.session_state.get(f"summary_{doc['id']}"))
+            st.markdown(
+                f"<div style='background:#ffffff;border:1px solid #dce3ec;"
+                f"border-radius:6px;padding:12px 16px;margin-bottom:12px;"
+                f"display:flex;align-items:center;justify-content:space-between;'>"
+                f"<div>"
+                f"<div style='font-size:1rem;font-weight:700;color:#1a2a3a;"
+                f"word-break:break-all;'>{_fname(doc)}</div>"
+                f"<div style='font-size:0.78rem;color:#5a6a7a;margin-top:3px;'>"
+                f"{_pc2} стр. · {_wc2:,} слов"
+                f"{'  ·  ✅ пересказ готов' if _has_summary else ''}</div>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+
+            # ── Навигация по страницам ────────────────────────────────────
+            pages_list = doc.get("pages", [])
+            page_key   = f"page_idx_{doc['id']}"
+            if page_key not in st.session_state:
+                st.session_state[page_key] = 0
+
+            cur_idx  = st.session_state[page_key]
+            cur_idx  = max(0, min(cur_idx, len(pages_list) - 1))
+            cur_page = pages_list[cur_idx] if pages_list else {}
+
+            nav1, nav2, nav3 = st.columns([1, 4, 1])
+            with nav1:
+                if st.button("◀ Пред.", key=f"prev_btn_{doc['id']}",
+                             disabled=(cur_idx == 0)):
+                    st.session_state[page_key] = cur_idx - 1
+                    st.rerun()
+            with nav2:
+                st.markdown(
+                    f"<div style='text-align:center;padding-top:6px;'>"
+                    f"Страница <b>{cur_idx+1}</b> из <b>{len(pages_list)}</b> "
+                    f"<span style='color:grey;font-size:0.85em;'>"
+                    f"({cur_page.get('method','')} · "
+                    f"{cur_page.get('word_count') or len(cur_page.get('text','').split())} слов)"
+                    f"</span></div>",
+                    unsafe_allow_html=True,
+                )
+            with nav3:
+                if st.button("След. ▶", key=f"next_btn_{doc['id']}",
+                             disabled=(cur_idx >= len(pages_list) - 1)):
+                    st.session_state[page_key] = cur_idx + 1
+                    st.rerun()
+
+            st.markdown(
+                f"<div style='font-size:0.87em;line-height:1.55;"
+                f"background:#f8f9fa;border:1px solid #e0e0e0;"
+                f"border-radius:6px;padding:12px 14px;"
+                f"max-height:320px;overflow-y:auto;"
+                f"white-space:pre-wrap;word-break:break-word;'>"
+                f"{cur_page.get('text','').replace('<','&lt;').replace('>','&gt;')}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            st.divider()
+
+            # ── Пересказ ──────────────────────────────────────────────────
+            summary_key  = f"summary_{doc['id']}"
+            sum_mode_key = f"sum_mode_{doc['id']}"
+            sum_words_key= f"sum_words_{doc['id']}"
+
+            st.markdown("**Пересказ**")
+            sum_mode = st.selectbox(
+                "Объём пересказа",
+                ["1 страница", "2 страницы", "5 страниц", "10 страниц",
+                 "Точное кол-во слов"],
+                index=1,
+                key=sum_mode_key,
+            )
+            if sum_mode == "Точное кол-во слов":
+                sum_words = st.number_input(
+                    "Количество слов",
+                    min_value=50, max_value=5000, value=300, step=50,
+                    key=sum_words_key,
+                )
+                summary_length = str(int(sum_words))
+            else:
+                summary_length = sum_mode
+
+            _already_has = bool(st.session_state.get(summary_key))
+
+            _bL, _bC, _bR = st.columns([2, 3, 2])
+            with _bC:
+                _do_summary = st.button(
+                    "▶ Сгенерировать пересказ",
+                    key=f"sum_btn_{doc['id']}", type="primary",
+                    use_container_width=True,
+                )
+
+            if _already_has:
+                st.caption(
+                    "Пересказ уже создан. Повторное нажатие запустит процесс заново."
+                )
+
+            if _do_summary:
+                st.session_state[f"gen_trigger_{doc['id']}"] = summary_length
+
+            # ── Генерация пересказа — ПОСЛЕ рендера текста документа ─────
+            # Запускается в том же рендере: документ уже виден, кнопка одна.
+            _gk = f"gen_trigger_{doc['id']}"
+            if _gk in st.session_state:
+                _gl   = st.session_state.pop(_gk)
+                _gft  = doc.get("full_text", "")
+                _gnc  = max(1, len(_gft) // _CHUNK_SIZE + 1)
+                _gisl = len(_gft) > _LARGE_DOC_THRESHOLD
+
+                st.info(
+                    "Генерация идёт — не переключайтесь на другой документ "
+                    "и не покидайте страницу: прогресс пропадёт."
+                )
+                if _gisl:
+                    st.caption(
+                        f"Map-Reduce: ~{_gnc} частей · ~1-3 мин. · {len(_gft):,} символов"
                     )
+                _gprog = st.progress(0.0)
+                _gcap  = st.empty()
+                _gcap.caption("Подготовка...")
 
-                    st.divider()
+                def _gcb(pct, msg, _p=_gprog, _c=_gcap):
+                    _pct = min(float(pct), 1.0)
+                    _p.progress(_pct)
+                    _c.caption(f"⏳ {msg}  ·  {int(_pct * 100)}%")
 
-                    # ── Пересказ ─────────────────────────────────────────
-                    summary_key    = f"summary_{doc['id']}"
-                    sum_mode_key   = f"sum_mode_{doc['id']}"
-                    sum_words_key  = f"sum_words_{doc['id']}"
+                _gresult = summarize_document(_gft, _gl, _progress_cb=_gcb)
+                _gprog.progress(1.0)
+                _gcap.caption("Готово")
+                _gprog.empty()
+                _gcap.empty()
+                st.session_state[summary_key] = _gresult
+                st.rerun()
 
-                    st.markdown("**📝 Пересказ**")
+            # ── Результат пересказа ───────────────────────────────────────
+            _summary_text = st.session_state.get(summary_key)
+            if _summary_text:
+                import streamlit.components.v1 as _stc
+                _wc = len(_summary_text.split())
+                st.markdown(
+                    "<div style='display:flex;align-items:center;"
+                    "justify-content:space-between;margin-bottom:4px;'>"
+                    "<span style='font-weight:600;'>Пересказ</span>"
+                    f"<span style='color:#888;font-size:0.85em;'>{_wc} слов</span>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                _sum_h = max(200, min(600, _wc * 6))
+                _body  = _summary_text.replace("<", "&lt;").replace(">", "&gt;")
+                st.markdown(
+                    f"<div style='font-size:0.87em;line-height:1.65;"
+                    f"background:#f0f4f8;border:1px solid #d0d8e4;"
+                    f"border-radius:6px;padding:14px 16px;"
+                    f"max-height:{_sum_h}px;overflow-y:auto;"
+                    f"white-space:pre-wrap;word-break:break-word;'>"
+                    f"{_body}</div>",
+                    unsafe_allow_html=True,
+                )
+                _safe = (_summary_text
+                    .replace("&","&amp;").replace("<","&lt;")
+                    .replace(">","&gt;").replace('"',"&quot;"))
+                _stc.html(
+                    "<div style='font-family:sans-serif'>"
+                    f"<span id='t' style='display:none'>{_safe}</span>"
+                    "<button onclick=\"navigator.clipboard.writeText("
+                    "document.getElementById('t').textContent).then(()=>{"
+                    "this.textContent='✅ Скопировано';"
+                    "setTimeout(()=>this.textContent='📋 Скопировать пересказ',2000)})\" "
+                    "style='font-size:13px;padding:5px 16px;cursor:pointer;"
+                    "border:1px solid #d0d8e4;border-radius:5px;"
+                    "background:#fff;color:#333;margin-top:6px'>"
+                    "📋 Скопировать пересказ</button></div>",
+                    height=48,
+                )
 
-                    # Выбор объёма — вертикально (без колонок, иначе Streamlit
-                    # рендерит пересказ внутри одного из столбцов)
-                    sum_mode = st.selectbox(
-                        "Объём пересказа",
-                        ["1 страница", "2 страницы", "5 страниц", "10 страниц",
-                         "Точное кол-во слов"],
-                        index=1,
-                        key=sum_mode_key,
+            st.divider()
+
+            # ── Экспорт ───────────────────────────────────────────────────
+            st.markdown("**Сохранить результат:**")
+            exp_col1, exp_col2 = st.columns(2)
+            with exp_col1:
+                st.download_button(
+                    label="Скачать TXT",
+                    data=export_txt(doc),
+                    file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.txt",
+                    mime="text/plain",
+                    key=f"dl_txt_{doc['id']}",
+                    use_container_width=True,
+                )
+            with exp_col2:
+                try:
+                    docx_buf = export_docx(doc, summary=st.session_state.get(summary_key))
+                    st.download_button(
+                        label="Скачать DOCX",
+                        data=docx_buf,
+                        file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"dl_docx_{doc['id']}",
+                        use_container_width=True,
                     )
-                    if sum_mode == "Точное кол-во слов":
-                        sum_words = st.number_input(
-                            "Количество слов",
-                            min_value=50, max_value=5000, value=300, step=50,
-                            key=sum_words_key,
-                        )
-                        summary_length = str(int(sum_words))
-                    else:
-                        summary_length = sum_mode
-
-                    # Кнопка строго по центру
-                    _bL, _bC, _bR = st.columns([2, 3, 2])
-                    with _bC:
-                        _do_summary = st.button(
-                            "▶ Сгенерировать пересказ",
-                            key=f"sum_btn_{doc['id']}", type="primary",
-                            use_container_width=True,
-                        )
-
-                    # Кнопка только выставляет флаг — генерация
-                    # происходит вне цикла (выше), в фиксированной позиции
-                    if _do_summary:
-                        st.session_state[f"gen_trigger_{doc['id']}"] = summary_length
-                        st.session_state[f"exp_open_{doc['id']}"] = True
-                        st.rerun()
-
-
-                    # ── Отображение пересказа ─────────────────────────────
-                    _summary_text = st.session_state.get(summary_key)
-                    if _summary_text:
-                        import streamlit.components.v1 as _stc
-                        _wc = len(_summary_text.split())
-
-                        # Заголовок со счётчиком слов
-                        st.markdown(
-                            "<div style='display:flex;align-items:center;"
-                            "justify-content:space-between;margin-bottom:4px;'>"
-                            "<span style='font-weight:600;'>🤖 Пересказ</span>"
-                            f"<span style='color:#888;font-size:0.85em;'>{_wc} слов</span>"
-                            "</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Текст в одном прокручиваемом блоке
-                        _sum_h = max(200, min(600, _wc * 6))
-                        _body  = _summary_text.replace("<", "&lt;").replace(">", "&gt;")
-                        st.markdown(
-                            f"<div style='font-size:0.87em;line-height:1.65;"
-                            f"background:#f0f4f8;border:1px solid #d0d8e4;"
-                            f"border-radius:6px;padding:14px 16px;"
-                            f"max-height:{_sum_h}px;overflow-y:auto;"
-                            f"white-space:pre-wrap;word-break:break-word;'>"
-                            f"{_body}</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Кнопка копирования через iframe-компонент.
-                        # Текст хранится в скрытом <span> — кнопка читает textContent.
-                        # Безопаснее inline JS с backtick-строкой.
-                        _safe = (
-                            _summary_text
-                            .replace("&", "&amp;")
-                            .replace("<", "&lt;")
-                            .replace(">", "&gt;")
-                            .replace('"', "&quot;")
-                        )
-                        _stc.html(
-                            "<div style='font-family:sans-serif'>"
-                            f"<span id='t' style='display:none'>{_safe}</span>"
-                            "<button onclick=\"navigator.clipboard.writeText("
-                            "document.getElementById('t').textContent).then(()=>{"
-                            "this.textContent='✅ Скопировано';"
-                            "setTimeout(()=>this.textContent='📋 Скопировать пересказ',2000)})\" "
-                            "style='font-size:13px;padding:5px 16px;cursor:pointer;"
-                            "border:1px solid #d0d8e4;border-radius:5px;"
-                            "background:#fff;color:#333;margin-top:6px'>"
-                            "📋 Скопировать пересказ</button></div>",
-                            height=48,
-                        )
-                    st.divider()
-
-                    # ── Экспорт ──────────────────────────────────────────
-                    st.markdown("**💾 Сохранить результат:**")
-                    exp_col1, exp_col2 = st.columns(2)
-
-                    with exp_col1:
-                        txt_data = export_txt(doc)
-                        st.download_button(
-                            label="📄 Скачать TXT",
-                            data=txt_data,
-                            file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.txt",
-                            mime="text/plain",
-                            width="stretch",
-                            key=f"dl_txt_{doc['id']}",
-                        )
-
-                    with exp_col2:
-                        try:
-                            summary_text = st.session_state.get(f"summary_{doc['id']}")
-                            docx_buf = export_docx(doc, summary=summary_text)
-                            st.download_button(
-                                label="📝 Скачать DOCX",
-                                data=docx_buf,
-                                file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.docx",
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                width="stretch",
-                                key=f"dl_docx_{doc['id']}",
-                            )
-                        except Exception as e:
-                            st.warning(f"DOCX недоступен: {e}")
+                except Exception as e:
+                    st.warning(f"DOCX недоступен: {e}")
 
     # =========================================================================
     # Вкладка 2 — Поиск
