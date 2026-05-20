@@ -160,7 +160,17 @@ h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
     border-bottom: none !important;
 }
 
-/* ── Ползунки — цвет управляется через .streamlit/config.toml primaryColor */
+/* ── Ползунки (slider) — фирменный оттенок, только внутри stSlider ─────── */
+[data-testid="stSlider"] [role="slider"],
+[data-testid="stSlider"] [class*="thumb"] {
+    background-color: var(--brand-mid) !important;
+    border-color: var(--brand-mid) !important;
+    box-shadow: 0 0 0 3px var(--brand-light2) !important;
+}
+[data-testid="stSlider"] [class*="track"]:last-child,
+[data-testid="stSlider"] [class*="Track"]:last-child {
+    background-color: var(--brand-mid) !important;
+}
 
 /* ── Прогресс-бар st.progress() ────────────────────────────────────────── */
 [data-testid="stProgress"] > div {
@@ -180,9 +190,42 @@ h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
     font-size: 0.82em !important;
 }
 
-/* ── Radio — цвет управляется через .streamlit/config.toml primaryColor ─── */
-/* Hover на лейбле */
+/* ── Radio — фирменный цвет, перебиваем красный baseweb ─────────────────── */
+/* Невыбранный кружок */
+[data-baseweb="radio"] [class*="RadioMarkOuter"],
+[data-baseweb="radio"] > div:first-child {
+    border-color: #aab4c0 !important;
+    background-color: transparent !important;
+}
+/* Выбранный кружок — внешний ring */
+[data-baseweb="radio"][aria-checked="true"] [class*="RadioMarkOuter"],
+[data-baseweb="radio"][aria-checked="true"] > div:first-child,
+[role="radio"][aria-checked="true"] [class*="RadioMarkOuter"],
+[role="radio"][aria-checked="true"] > div:first-child {
+    border-color: var(--brand-primary) !important;
+    background-color: transparent !important;
+}
+/* Выбранный кружок — внутренняя точка */
+[data-baseweb="radio"][aria-checked="true"] [class*="RadioMarkInner"],
+[data-baseweb="radio"][aria-checked="true"] > div:first-child > div,
+[role="radio"][aria-checked="true"] [class*="RadioMarkInner"],
+[role="radio"][aria-checked="true"] > div:first-child > div {
+    background-color: var(--brand-primary) !important;
+}
+/* Через SVG/fill если baseweb рисует через fill */
+[data-baseweb="radio"][aria-checked="true"] svg circle,
+[role="radio"][aria-checked="true"] svg circle {
+    fill: var(--brand-primary) !important;
+    stroke: var(--brand-primary) !important;
+}
+/* Hover */
 [data-testid="stRadio"] label:hover { color: var(--brand-primary) !important; }
+/* Подсветка выбранного лейбла */
+[data-testid="stRadio"] div[aria-checked="true"] ~ label,
+[data-testid="stRadio"] label[data-selected="true"] {
+    color: var(--brand-primary) !important;
+    font-weight: 600 !important;
+}
 
 
 /* ── Табы — активная вкладка фирменного цвета ───────────────────────────── */
