@@ -295,7 +295,13 @@ div.element-container div[data-baseweb="notification"][kind="info"] {
 .landing-tile-desc {
     font-size: 0.78rem; color: var(--text-secondary);
     margin-top: 0.15rem; margin-bottom: 1rem;
-    padding: 0 0.15rem; line-height: 1.45; min-height: 3.6rem; display: block;
+    padding: 0 0.15rem; line-height: 1.45; display: block;
+}
+.landing-tile-desc ul {
+    margin: 0.2rem 0 0 0; padding-left: 1.1rem; list-style: disc;
+}
+.landing-tile-desc ul li {
+    margin-bottom: 0.2rem;
 }
 
 /* ── Метрики лендинга ──────────────────────────────────────────────────── */
@@ -303,6 +309,8 @@ div.element-container div[data-baseweb="notification"][kind="info"] {
     background: #ffffff; border: 1px solid var(--neutral-border);
     border-radius: var(--radius); padding: 0.8rem 1rem;
     text-align: center; margin-bottom: 0.5rem;
+    min-height: 160px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
 }
 .landing-metric-value { font-size: 1.5rem; font-weight: 700; color: var(--brand-primary); }
 .landing-metric-label { font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem; }
@@ -326,12 +334,30 @@ _DEV_PRODUCTS = [
     "Планировщик кампании", "Прогноз потребления",
 ]
 _PRODUCT_DESCRIPTIONS = {
-    "Советчик": "Даёт ответы на вопросы по нормативной базе тарифного регулирования. Снижает нагрузку на специалистов на 30%. Ссылается на актуальные НПА.",
-    "Сканер документов": "Распознаёт текст из PDF, DOCX и сканов. Формирует базу из ваших документов. Позволяет делать краткий пересказ и полнотекстовый поиск.",
-    "Анализатор заявок": "Проверяет тарифную заявку на полноту комплекта. Подсвечивает риски по каждой статье затрат. Повышает проходимость заявок.",
-    "Прогноз решения регулятора": "Оценивает вероятность одобрения заявки регулятором на основе исторических данных. Снижает риски неодобрения статей.",
-    "Протокольщик": "Автоматически составляет протоколы заседаний из аудио или текста. Сокращает время подготовки протокола в несколько раз.",
-    "Админка": "Управление системой: загрузка документов, настройка параметров поиска, промпты, аналитика использования.",
+    "Советчик":
+        "<ul><li>Отвечает на вопросы по нормативной базе тарифного регулирования</li>"
+        "<li>Снижает нагрузку на специалистов на 30%</li>"
+        "<li>Ссылается на актуальные НПА с точными цитатами</li></ul>",
+    "Сканер документов":
+        "<ul><li>Распознаёт текст из PDF, DOCX и сканов</li>"
+        "<li>Формирует базу знаний из ваших документов</li>"
+        "<li>Поддерживает пересказ и полнотекстовый поиск</li></ul>",
+    "Анализатор заявок":
+        "<ul><li>Проверяет комплектность тарифной заявки</li>"
+        "<li>Подсвечивает риски по каждой статье затрат</li>"
+        "<li>Повышает проходимость заявок у регулятора</li></ul>",
+    "Прогноз решения регулятора":
+        "<ul><li>Оценивает вероятность одобрения заявки</li>"
+        "<li>Опирается на исторические данные решений</li>"
+        "<li>Снижает риски отклонения статей затрат</li></ul>",
+    "Протокольщик":
+        "<ul><li>Составляет протоколы заседаний из аудио или текста</li>"
+        "<li>Структурирует и форматирует содержание автоматически</li>"
+        "<li>Сокращает время подготовки протокола в разы</li></ul>",
+    "Админка":
+        "<ul><li>Загрузка и индексация документов базы знаний</li>"
+        "<li>Настройка параметров поиска и промптов</li>"
+        "<li>Аналитика использования и качества ответов</li></ul>",
 }
 
 if "main_choice" not in st.session_state:
@@ -999,16 +1025,14 @@ elif main_choice == "Админка":
             else:
                 st.error("❌ Неверный пароль")
     else:
-        admin_subtab = st.radio(
-            "Раздел админки",
-            ["📈 Аналитика ИИ", "📚 Документы", "⚙️ Настройки чанкования", "🎯 Поиск и реранкинг", "📝 Промпты", "📝 Отзывы", "⚙️ Настройки"],
-            horizontal=True,
+        tab_analytics, tab_docs, tab_chunking, tab_search, tab_prompts = st.tabs(
+            ["📈 Аналитика ИИ", "Документы", "Настройки чанкования", "Поиск и реранкинг", "📝 Промпты"]
         )
 
-        if admin_subtab == "📈 Аналитика ИИ":
+        with tab_analytics:
             col1, col2 = st.columns([4, 1])
             with col1:
-                st.header("📊 Качество работы ИИ-советчика")
+                st.header("Качество работы ИИ-советчика")
             with col2:
                 if st.button("🔄 Обновить", key="refresh_stats"):
                     st.rerun()
@@ -1024,17 +1048,17 @@ elif main_choice == "Админка":
                     col3.metric("👍 Полезно",      stats["rating_3"])
                     col4.metric("👎 Не помогло",   stats["rating_1"])
                     quality_pct = round((stats["rating_3"] / stats["total"]) * 100)
-                    st.subheader("📈 Процент полезных ответов")
+                    st.subheader("Процент полезных ответов")
                     st.progress(quality_pct / 100)
-                    st.caption(f"{quality_pct}% ответов оценены как 👍 Полезно (цель: 85%)")
-                    st.subheader("📊 Распределение оценок")
+                    st.caption(f"{quality_pct}% ответов оценены как полезно (цель: 85%)")
+                    st.subheader("Распределение оценок")
                     rating_df = pd.DataFrame({
                         "Оценка": ["👍 Полезно","😐 Нормально","👎 Не помогло"],
                         "Количество": [stats["rating_3"],stats["rating_2"],stats["rating_1"]],
                     })
                     st.bar_chart(rating_df.set_index("Оценка"))
                     if stats["top_bad_questions"]:
-                        st.subheader("❓ Топ вопросов для улучшения")
+                        st.subheader("Топ вопросов для улучшения")
                         for i, item in enumerate(stats["top_bad_questions"], 1):
                             with st.expander(f"{i}. «{item['question']}...»"):
                                 st.write(f"**Ответ ИИ:** {item['answer']}")
@@ -1045,8 +1069,8 @@ elif main_choice == "Админка":
             except Exception as e:
                 st.error(f"Ошибка загрузки статистики: {e}")
 
-        elif admin_subtab == "📚 Документы":
-            st.header("📚 База знаний — документы")
+        with tab_docs:
+            st.header("База знаний — документы")
             SPHERES = ["🔥 Теплоснабжение","💧 Водоснабжение/водоотведение","🗑️ Обращение с ТКО","🔵 Газ","⚡ Электрика","📁 Иные сферы"]
             CATEGORY_FOLDERS = {"📜 Общие НПА":"npa","⚖️ Документы ФАС":"fas","🏛️ Судебная практика":"court","📋 Методички и разъяснения":"methodics"}
             SPHERES_FILE = os.path.join("config","doc_spheres.json")
@@ -1320,8 +1344,8 @@ elif main_choice == "Админка":
                     st.success(st.session_state["_mass_clear_msg"])
                     del st.session_state["_mass_clear_msg"]
 
-        elif admin_subtab == "⚙️ Настройки чанкования":
-            st.header("⚙️ Настройки чанкования документов")
+        with tab_chunking:
+            st.header("Настройки чанкования документов")
             config_dir  = os.path.join("config")
             os.makedirs(config_dir, exist_ok=True)
             config_file = os.path.join(config_dir,"chunking_patterns.json")
@@ -1335,7 +1359,7 @@ elif main_choice == "Админка":
                     "metadata_patterns":{"doc_number":r"(\d+[А-Я]?-\d+[А-Я]?)","doc_date":r"(\d{2}\.\d{2}\.\d{4})","doc_year":r"(\d{4})"},
                     "chunking_settings":{"chunk_size":500,"chunk_overlap":50,"min_chunk_length":100},
                 }
-            tab4, tab5 = st.tabs(["⚙️ Параметры чанкования","🔍 Просмотр и тест чанков"])
+            tab4, tab5 = st.tabs(["Параметры чанкования", "Просмотр и тест чанков"])
             with tab4:
                 st.subheader("Параметры чанкования")
                 settings = config.get("chunking_settings",{})
@@ -1616,8 +1640,8 @@ elif main_choice == "Админка":
                 except Exception as e:
                     st.error(f"❌ {type(e).__name__}: {e}")
 
-        elif admin_subtab == "🎯 Поиск и реранкинг":
-            st.header("🎯 Настройки поиска и реранкинга")
+        with tab_search:
+            st.header("Настройки поиска и реранкинга")
             st.info("Изменения применяются сразу к следующему запросу. Перезапуск не нужен.")
 
             _sr_file = os.path.join("config", "search_settings.json")
@@ -1867,9 +1891,9 @@ elif main_choice == "Админка":
                 st.info("🔄 Настройки сброшены к умолчаниям.")
                 del st.session_state["_sr_reset"]
 
-        elif admin_subtab == "📝 Промпты":
-            st.header("📝 Управление промптами")
-            st.info("💡 Изменения применяются сразу. Кэш LLM сбрасывается при сохранении.")
+        with tab_prompts:
+            st.header("Управление промптами")
+            st.info("Изменения применяются сразу. Кэш LLM сбрасывается при сохранении.")
             PROMPTS_FILE_ADMIN = os.path.join("config","prompts.json")
             DEFAULT_PROMPTS_ADMIN = {
                 "advisor_system": (
@@ -1937,168 +1961,164 @@ elif main_choice == "Админка":
             else:
                 current_prompts = dict(DEFAULT_PROMPTS_ADMIN)
 
-            st.subheader("🤝 Советчик")
-            with st.expander("ℹ️ Переменные"):
-                st.markdown("**Пользовательский промпт:** `{query}` — вопрос, `{context}` — чанки из RAG")
-            col1,col2 = st.columns(2)
-            with col1: st.caption("Загружен из: " + ("📁 prompts.json" if os.path.exists(PROMPTS_FILE_ADMIN) else "⚙️ дефолт"))
-            with col2:
-                is_mod = (current_prompts.get("advisor_system") != DEFAULT_PROMPTS_ADMIN["advisor_system"] or
-                          current_prompts.get("advisor_user")   != DEFAULT_PROMPTS_ADMIN["advisor_user"])
-                if is_mod: st.warning("✏️ Промпты изменены")
-                else:      st.success("✅ Дефолтные промпты")
+            # ── Выбор раздела промптов ────────────────────────────────────
+            prompt_section = st.radio(
+                "Раздел",
+                ["Советчик", "Анализатор заявок"],
+                horizontal=True,
+                key="prompt_section_radio",
+            )
             st.divider()
-            new_system = st.text_area("🧠 Системный промпт", value=current_prompts.get("advisor_system",DEFAULT_PROMPTS_ADMIN["advisor_system"]), height=280, key="prompt_advisor_system")
-            st.divider()
-            new_user   = st.text_area("💬 Пользовательский промпт", value=current_prompts.get("advisor_user",DEFAULT_PROMPTS_ADMIN["advisor_user"]), height=120, key="prompt_advisor_user")
-            if "{query}" not in new_user or "{context}" not in new_user:
-                st.error("⚠️ Промпт должен содержать {query} и {context}")
-            else:
-                st.caption("✅ Переменные присутствуют")
-            st.divider()
-            col1,col2,col3 = st.columns([2,2,1])
-            with col1:
-                if st.button("💾 Сохранить промпты", type="primary", use_container_width=True, key="save_prompts_btn"):
-                    if "{query}" in new_user and "{context}" in new_user:
-                        os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN),exist_ok=True)
-                        with open(PROMPTS_FILE_ADMIN,'w',encoding='utf-8') as f:
-                            json.dump({**current_prompts,"advisor_system":new_system,"advisor_user":new_user,
-                                       "updated_at":datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
-                        try:
-                            from core.advisor import _llm_cache, save_llm_cache
-                            _llm_cache.clear(); save_llm_cache()
-                            st.success("✅ Промпты сохранены. Кэш сброшен.")
-                        except Exception:
-                            st.success("✅ Промпты сохранены.")
-                        st.rerun()
-                    else:
-                        st.error("❌ Исправьте ошибки")
-            with col2:
-                if st.button("🔄 Сбросить к дефолтным", use_container_width=True, key="reset_prompts_btn"):
-                    st.session_state._confirm_reset_prompts = True
-                @st.dialog("⚠️ Сброс промптов")
-                def confirm_reset_prompts_dialog():
-                    st.warning("Промпты вернутся к дефолтным значениям.")
-                    ca,cb = st.columns(2)
-                    with ca:
-                        if st.button("🗑️ Да, сбросить", type="primary", use_container_width=True, key="dialog_confirm_reset"):
-                            if os.path.exists(PROMPTS_FILE_ADMIN):
-                                try:
-                                    with open(PROMPTS_FILE_ADMIN,'r',encoding='utf-8') as f: saved = json.load(f)
-                                    saved.pop("advisor_system",None); saved.pop("advisor_user",None)
-                                    with open(PROMPTS_FILE_ADMIN,'w',encoding='utf-8') as f: json.dump(saved,f,ensure_ascii=False,indent=2)
-                                except Exception: pass
-                            st.session_state._confirm_reset_prompts = False; st.rerun()
-                    with cb:
-                        if st.button("← Отмена", use_container_width=True, key="dialog_cancel_reset"):
-                            st.session_state._confirm_reset_prompts = False; st.rerun()
-                if st.session_state.get("_confirm_reset_prompts"):
-                    confirm_reset_prompts_dialog()
-            with col3:
-                prompts_json = json.dumps({"advisor_system":new_system,"advisor_user":new_user},ensure_ascii=False,indent=2)
-                st.download_button("📥 Скачать", data=prompts_json.encode("utf-8"),
-                                   file_name="prompts_backup.json", mime="application/json",
-                                   use_container_width=True, key="download_prompts_btn")
 
-            # ── Анализатор заявок ─────────────────────────────────────────
-            st.divider()
-            st.subheader("🔍 Анализатор заявок")
-            st.caption("Промпты суммаризатора (Map-Reduce) и анализа рисков")
+            if prompt_section == "Советчик":
+                with st.expander("ℹ️ Переменные"):
+                    st.markdown("**Пользовательский промпт:** `{query}` — вопрос, `{context}` — чанки из RAG")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.caption("Загружен из: " + ("📁 prompts.json" if os.path.exists(PROMPTS_FILE_ADMIN) else "⚙️ дефолт"))
+                with col2:
+                    is_mod = (current_prompts.get("advisor_system") != DEFAULT_PROMPTS_ADMIN["advisor_system"] or
+                              current_prompts.get("advisor_user")   != DEFAULT_PROMPTS_ADMIN["advisor_user"])
+                    if is_mod: st.warning("✏️ Промпты изменены")
+                    else:      st.success("✅ Дефолтные промпты")
+                st.divider()
+                new_system = st.text_area("Системный промпт", value=current_prompts.get("advisor_system", DEFAULT_PROMPTS_ADMIN["advisor_system"]), height=280, key="prompt_advisor_system")
+                st.divider()
+                new_user   = st.text_area("Пользовательский промпт", value=current_prompts.get("advisor_user", DEFAULT_PROMPTS_ADMIN["advisor_user"]), height=120, key="prompt_advisor_user")
+                if "{query}" not in new_user or "{context}" not in new_user:
+                    st.error("⚠️ Промпт должен содержать {query} и {context}")
+                else:
+                    st.caption("✅ Переменные присутствуют")
+                st.divider()
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    if st.button("💾 Сохранить промпты", type="primary", use_container_width=True, key="save_prompts_btn"):
+                        if "{query}" in new_user and "{context}" in new_user:
+                            os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
+                            with open(PROMPTS_FILE_ADMIN, 'w', encoding='utf-8') as f:
+                                json.dump({**current_prompts, "advisor_system": new_system, "advisor_user": new_user,
+                                           "updated_at": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+                            try:
+                                from core.advisor import _llm_cache, save_llm_cache
+                                _llm_cache.clear(); save_llm_cache()
+                                st.success("✅ Промпты сохранены. Кэш сброшен.")
+                            except Exception:
+                                st.success("✅ Промпты сохранены.")
+                            st.rerun()
+                        else:
+                            st.error("❌ Исправьте ошибки")
+                with col2:
+                    if st.button("🔄 Сбросить к дефолтным", use_container_width=True, key="reset_prompts_btn"):
+                        st.session_state._confirm_reset_prompts = True
+                    @st.dialog("⚠️ Сброс промптов")
+                    def confirm_reset_prompts_dialog():
+                        st.warning("Промпты вернутся к дефолтным значениям.")
+                        ca, cb = st.columns(2)
+                        with ca:
+                            if st.button("🗑️ Да, сбросить", type="primary", use_container_width=True, key="dialog_confirm_reset"):
+                                if os.path.exists(PROMPTS_FILE_ADMIN):
+                                    try:
+                                        with open(PROMPTS_FILE_ADMIN, 'r', encoding='utf-8') as f: saved = json.load(f)
+                                        saved.pop("advisor_system", None); saved.pop("advisor_user", None)
+                                        with open(PROMPTS_FILE_ADMIN, 'w', encoding='utf-8') as f: json.dump(saved, f, ensure_ascii=False, indent=2)
+                                    except Exception: pass
+                                st.session_state._confirm_reset_prompts = False; st.rerun()
+                        with cb:
+                            if st.button("← Отмена", use_container_width=True, key="dialog_cancel_reset"):
+                                st.session_state._confirm_reset_prompts = False; st.rerun()
+                    if st.session_state.get("_confirm_reset_prompts"):
+                        confirm_reset_prompts_dialog()
+                with col3:
+                    prompts_json = json.dumps({"advisor_system": new_system, "advisor_user": new_user}, ensure_ascii=False, indent=2)
+                    st.download_button("📥 Скачать", data=prompts_json.encode("utf-8"),
+                                       file_name="prompts_backup.json", mime="application/json",
+                                       use_container_width=True, key="download_prompts_btn")
 
-            with st.expander("ℹ️ Переменные анализатора"):
-                st.markdown(
-                    "**MAP:** `{i}` — номер части, `{total}` — всего частей, `{chunk}` — текст фрагмента\n\n"
-                    "**REDUCE:** `{target_words}` — целевой объём, `{combined}` — результаты MAP\n\n"
-                    "**РИСКИ:** `{calc_context}` — данные расчётного файла, `{summary}` — резюме заявки"
+            elif prompt_section == "Анализатор заявок":
+                st.caption("Промпты суммаризатора (Map-Reduce) и анализа рисков")
+                with st.expander("ℹ️ Переменные анализатора"):
+                    st.markdown(
+                        "**MAP:** `{i}` — номер части, `{total}` — всего частей, `{chunk}` — текст фрагмента\n\n"
+                        "**REDUCE:** `{target_words}` — целевой объём, `{combined}` — результаты MAP\n\n"
+                        "**РИСКИ:** `{calc_context}` — данные расчётного файла, `{summary}` — резюме заявки"
+                    )
+
+                st.markdown("**Суммаризатор MAP — системный промпт**")
+                new_claim_map_sys = st.text_area(
+                    "", value=current_prompts.get("claim_map_system", DEFAULT_PROMPTS_ADMIN["claim_map_system"]),
+                    height=100, key="prompt_claim_map_sys", label_visibility="collapsed"
+                )
+                st.markdown("**Суммаризатор MAP — пользовательский промпт**")
+                new_claim_map_usr = st.text_area(
+                    "", value=current_prompts.get("claim_map_user", DEFAULT_PROMPTS_ADMIN["claim_map_user"]),
+                    height=120, key="prompt_claim_map_usr", label_visibility="collapsed"
+                )
+                for v, name in [("{i}", "MAP user"), ("{total}", "MAP user"), ("{chunk}", "MAP user")]:
+                    if v not in new_claim_map_usr:
+                        st.error(f"⚠️ {name} промпт должен содержать {v}")
+
+                st.divider()
+                st.markdown("**Суммаризатор REDUCE — системный промпт**")
+                new_claim_red_sys = st.text_area(
+                    "", value=current_prompts.get("claim_reduce_system", DEFAULT_PROMPTS_ADMIN["claim_reduce_system"]),
+                    height=80, key="prompt_claim_red_sys", label_visibility="collapsed"
+                )
+                st.markdown("**Суммаризатор REDUCE — пользовательский промпт**")
+                new_claim_red_usr = st.text_area(
+                    "", value=current_prompts.get("claim_reduce_user", DEFAULT_PROMPTS_ADMIN["claim_reduce_user"]),
+                    height=120, key="prompt_claim_red_usr", label_visibility="collapsed"
                 )
 
-            st.markdown("**🗺️ Суммаризатор MAP — системный промпт**")
-            new_claim_map_sys = st.text_area(
-                "", value=current_prompts.get("claim_map_system", DEFAULT_PROMPTS_ADMIN["claim_map_system"]),
-                height=100, key="prompt_claim_map_sys", label_visibility="collapsed"
-            )
-            st.markdown("**🗺️ Суммаризатор MAP — пользовательский промпт**")
-            new_claim_map_usr = st.text_area(
-                "", value=current_prompts.get("claim_map_user", DEFAULT_PROMPTS_ADMIN["claim_map_user"]),
-                height=120, key="prompt_claim_map_usr", label_visibility="collapsed"
-            )
-            for v, name in [("{i}", "MAP user"), ("{total}", "MAP user"), ("{chunk}", "MAP user")]:
-                if v not in new_claim_map_usr:
-                    st.error(f"⚠️ {name} промпт должен содержать {v}")
+                st.divider()
+                st.markdown("**Анализ рисков — системный промпт**")
+                new_claim_risk_sys = st.text_area(
+                    "", value=current_prompts.get("claim_risks_system", DEFAULT_PROMPTS_ADMIN["claim_risks_system"]),
+                    height=100, key="prompt_claim_risk_sys", label_visibility="collapsed"
+                )
+                st.markdown("**Анализ рисков — пользовательский промпт**")
+                new_claim_risk_usr = st.text_area(
+                    "", value=current_prompts.get("claim_risks_user", DEFAULT_PROMPTS_ADMIN["claim_risks_user"]),
+                    height=180, key="prompt_claim_risk_usr", label_visibility="collapsed"
+                )
+                for v, name in [("{calc_context}", "Риски user"), ("{summary}", "Риски user")]:
+                    if v not in new_claim_risk_usr:
+                        st.error(f"⚠️ {name} промпт должен содержать {v}")
 
-            st.markdown("**📦 Суммаризатор REDUCE — системный промпт**")
-            new_claim_red_sys = st.text_area(
-                "", value=current_prompts.get("claim_reduce_system", DEFAULT_PROMPTS_ADMIN["claim_reduce_system"]),
-                height=80, key="prompt_claim_red_sys", label_visibility="collapsed"
-            )
-            st.markdown("**📦 Суммаризатор REDUCE — пользовательский промпт**")
-            new_claim_red_usr = st.text_area(
-                "", value=current_prompts.get("claim_reduce_user", DEFAULT_PROMPTS_ADMIN["claim_reduce_user"]),
-                height=120, key="prompt_claim_red_usr", label_visibility="collapsed"
-            )
-
-            st.markdown("**⚠️ Анализ рисков — системный промпт**")
-            new_claim_risk_sys = st.text_area(
-                "", value=current_prompts.get("claim_risks_system", DEFAULT_PROMPTS_ADMIN["claim_risks_system"]),
-                height=100, key="prompt_claim_risk_sys", label_visibility="collapsed"
-            )
-            st.markdown("**⚠️ Анализ рисков — пользовательский промпт**")
-            new_claim_risk_usr = st.text_area(
-                "", value=current_prompts.get("claim_risks_user", DEFAULT_PROMPTS_ADMIN["claim_risks_user"]),
-                height=180, key="prompt_claim_risk_usr", label_visibility="collapsed"
-            )
-            for v, name in [("{calc_context}", "Риски user"), ("{summary}", "Риски user")]:
-                if v not in new_claim_risk_usr:
-                    st.error(f"⚠️ {name} промпт должен содержать {v}")
-
-            col1c, col2c = st.columns([2, 1])
-            with col1c:
-                if st.button("💾 Сохранить промпты анализатора", type="primary",
-                             use_container_width=True, key="save_claim_prompts_btn"):
-                    os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
-                    updated = {
-                        **current_prompts,
+                st.divider()
+                col1c, col2c = st.columns([2, 1])
+                with col1c:
+                    if st.button("💾 Сохранить промпты анализатора", type="primary",
+                                 use_container_width=True, key="save_claim_prompts_btn"):
+                        os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
+                        updated = {
+                            **current_prompts,
+                            "claim_map_system":    new_claim_map_sys,
+                            "claim_map_user":      new_claim_map_usr,
+                            "claim_reduce_system": new_claim_red_sys,
+                            "claim_reduce_user":   new_claim_red_usr,
+                            "claim_risks_system":  new_claim_risk_sys,
+                            "claim_risks_user":    new_claim_risk_usr,
+                            "updated_at":          datetime.now().isoformat(),
+                        }
+                        with open(PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as f:
+                            json.dump(updated, f, ensure_ascii=False, indent=2)
+                        st.success("✅ Промпты анализатора сохранены.")
+                        st.rerun()
+                with col2c:
+                    claim_prompts_json = json.dumps({
                         "claim_map_system":    new_claim_map_sys,
                         "claim_map_user":      new_claim_map_usr,
                         "claim_reduce_system": new_claim_red_sys,
                         "claim_reduce_user":   new_claim_red_usr,
                         "claim_risks_system":  new_claim_risk_sys,
                         "claim_risks_user":    new_claim_risk_usr,
-                        "updated_at":          datetime.now().isoformat(),
-                    }
-                    with open(PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as f:
-                        json.dump(updated, f, ensure_ascii=False, indent=2)
-                    st.success("✅ Промпты анализатора сохранены.")
-                    st.rerun()
-            with col2c:
-                claim_prompts_json = json.dumps({
-                    "claim_map_system":    new_claim_map_sys,
-                    "claim_map_user":      new_claim_map_usr,
-                    "claim_reduce_system": new_claim_red_sys,
-                    "claim_reduce_user":   new_claim_red_usr,
-                    "claim_risks_system":  new_claim_risk_sys,
-                    "claim_risks_user":    new_claim_risk_usr,
-                }, ensure_ascii=False, indent=2)
-                st.download_button("📥 Скачать", data=claim_prompts_json.encode("utf-8"),
-                                   file_name="claim_prompts_backup.json",
-                                   mime="application/json",
-                                   use_container_width=True, key="dl_claim_prompts_btn")
+                    }, ensure_ascii=False, indent=2)
+                    st.download_button("📥 Скачать", data=claim_prompts_json.encode("utf-8"),
+                                       file_name="claim_prompts_backup.json",
+                                       mime="application/json",
+                                       use_container_width=True, key="dl_claim_prompts_btn")
 
-        elif admin_subtab == "📝 Отзывы":
-            st.header("📝 Отзывы пользователей")
-            feedbacks = get_feedback(limit=200)
-            if feedbacks:
-                for fb in feedbacks:
-                    icon = {3:"👍",2:"😐",1:"👎"}.get(fb.get("rating"),"📝")
-                    with st.expander(f"{icon} {fb['id']} — {fb['timestamp'][:10]} — {fb['feedback_type']}"):
-                        if fb.get("question"): st.write(f"**Вопрос:** {fb['question']}")
-                        st.write(f"**Комментарий:** {fb.get('description','—')}")
-            else:
-                st.info("Нет отзывов")
 
-        elif admin_subtab == "⚙️ Настройки":
-            st.header("⚙️ Настройки системы")
-            st.info("Здесь будут настройки порога FAQ, модели, параметров поиска...")
 
 if __name__ == "__main__":
     pass
