@@ -275,6 +275,84 @@ div.element-container div[data-baseweb="notification"][kind="info"] {
 }
 .sidebar-logo button:hover { opacity: 0.7 !important; background-color: transparent !important; }
 
+/* ── Навигация сайдбара ─────────────────────────────────────────────────── */
+
+/* Сброс ВСЕХ кнопок в сайдбаре → nav-стиль */
+[data-testid="stSidebar"] .stButton > button {
+    background-color: transparent !important;
+    color: var(--text-secondary) !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0.28rem 0.75rem !important;
+    font-weight: 400 !important;
+    font-size: 0.88rem !important;
+    border-radius: var(--radius) !important;
+    width: 100% !important;
+    min-height: 0 !important;
+    height: auto !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    transition: background-color 0.12s ease, color 0.12s ease !important;
+}
+/* Текст внутри кнопки (Streamlit рендерит через <p>) */
+[data-testid="stSidebar"] .stButton > button p,
+[data-testid="stSidebar"] .stButton > button span,
+[data-testid="stSidebar"] .stButton > button div {
+    text-align: left !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    background-color: var(--brand-bg) !important;
+    color: var(--brand-primary) !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+[data-testid="stSidebar"] .stButton > button:focus,
+[data-testid="stSidebar"] .stButton > button:focus-visible {
+    box-shadow: none !important;
+    border: none !important;
+    outline: none !important;
+}
+
+/* Активная nav-кнопка (type="primary") */
+[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background-color: rgba(27, 92, 116, 0.1) !important;
+    color: var(--brand-primary) !important;
+    font-weight: 600 !important;
+    border-left: 3px solid var(--brand-primary) !important;
+    border-radius: 0 var(--radius) var(--radius) 0 !important;
+    padding: 0.28rem 0.6rem 0.28rem 0.55rem !important;
+    justify-content: space-between !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    background-color: rgba(27, 92, 116, 0.16) !important;
+    border-left: 3px solid var(--brand-primary) !important;
+    box-shadow: none !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"]::after {
+    content: "›";
+    font-size: 1rem;
+    font-weight: 300;
+    opacity: 0.55;
+    flex-shrink: 0;
+    padding-left: 0.3rem;
+}
+
+/* Убираем отступы между nav-элементами */
+[data-testid="stSidebar"] .element-container {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+
+.nav-section-label {
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--text-secondary);
+    padding: 0.6rem 0.75rem 0.2rem; margin-top: 0.2rem;
+}
+
 /* ── Плитки лендинга ───────────────────────────────────────────────────── */
 .landing-tile button {
     min-height: 52px !important; text-align: left !important;
@@ -363,45 +441,46 @@ _PRODUCT_DESCRIPTIONS = {
 if "main_choice" not in st.session_state:
     st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
 
-def _on_active_select():
-    st.session_state.main_choice = st.session_state._sidebar_active
-
-def _on_dev_select():
-    st.session_state.main_choice = st.session_state._sidebar_dev
-
 with st.sidebar:
     st.markdown('<div class="sidebar-logo">', unsafe_allow_html=True)
     if st.button("РЕГУЛА.AI — Главная", key="sidebar_home_btn"):
         st.session_state.show_landing = True
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown("**Разделы**")
-    # Синхронизируем radio-ключи с main_choice: при переходе с лендинга
-    # session_state[key] имеет приоритет над index, поэтому обновляем явно.
-    if st.session_state.main_choice in _ACTIVE_PRODUCTS:
-        st.session_state["_sidebar_active"] = st.session_state.main_choice
-    _active_idx = (
-        _ACTIVE_PRODUCTS.index(st.session_state.main_choice)
-        if st.session_state.main_choice in _ACTIVE_PRODUCTS else None
-    )
-    st.radio("active", _ACTIVE_PRODUCTS, index=_active_idx, key="_sidebar_active",
-             label_visibility="collapsed", on_change=_on_active_select)
+    st.divider()
+    _on_product_page = not st.session_state.get("show_landing", True)
+    for _product in _ACTIVE_PRODUCTS:
+        _is_active = _on_product_page and st.session_state.main_choice == _product
+        if st.button(
+            _product,
+            key=f"nav_active_{_product}",
+            use_container_width=True,
+            type="primary" if _is_active else "secondary",
+        ):
+            st.session_state.main_choice = _product
+            st.session_state.show_landing = False
+            st.rerun()
+
     st.divider()
     _dev_expanded = st.session_state.main_choice in _DEV_PRODUCTS
     with st.expander("Наши планы", expanded=_dev_expanded):
         st.caption("Продукты в активной разработке, доступны для ознакомления.")
-        if st.session_state.main_choice in _DEV_PRODUCTS:
-            st.session_state["_sidebar_dev"] = st.session_state.main_choice
-        _dev_idx = (
-            _DEV_PRODUCTS.index(st.session_state.main_choice)
-            if st.session_state.main_choice in _DEV_PRODUCTS else None
-        )
-        st.radio("dev", _DEV_PRODUCTS, index=_dev_idx, key="_sidebar_dev",
-                 label_visibility="collapsed", on_change=_on_dev_select)
+        for _product in _DEV_PRODUCTS:
+            _is_active = _on_product_page and st.session_state.main_choice == _product
+            if st.button(
+                _product,
+                key=f"nav_dev_{_product}",
+                use_container_width=True,
+                type="primary" if _is_active else "secondary",
+            ):
+                st.session_state.main_choice = _product
+                st.session_state.show_landing = False
+                st.rerun()
+
     st.divider()
     if is_admin_logged():
         st.success("Админка: вход выполнен")
-        if st.button("Выйти"):
+        if st.button("Выйти", key="sidebar_logout_btn"):
             st.session_state.admin_logged_in = False
             st.rerun()
 
@@ -423,10 +502,7 @@ if st.session_state.show_landing:
                     color:#1B5C74; margin-bottom:0.5rem;">РЕГУЛА.AI</div>
         <div style="font-size:0.9rem; color:#1B5C74; font-weight:500; letter-spacing:0.08em;
                     text-transform:uppercase; margin-bottom:1rem;">
-            Советчик в сфере тарифного регулирования РФ
-        </div>
-        <div style="font-size:1rem; color:#5a6a7a; max-width:580px; margin:0 auto; line-height:1.65;">
-            ИИ-система поддержки принятия решений в области тарифного регулирования
+            ИИ-система в сфере тарифного регулирования РФ
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -529,7 +605,7 @@ st.markdown("""
         letter-spacing: 0.08em;
         text-transform: uppercase;
         opacity: 0.7;
-    ">регулирование сегодня</span>
+    ">ИИ-система в сфере тарифного регулирования РФ</span>
 </div>
 """, unsafe_allow_html=True)
 
