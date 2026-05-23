@@ -1085,9 +1085,9 @@ def show_protocol_bot():
                     st.session_state.proto_saved_id  = None
                     st.rerun()
 
-            # Предпросмотр (форматированный)
-            with st.expander("👁️ Предпросмотр форматированного текста"):
-                st.markdown(edited.replace("\n", "  \n"))
+            # Предпросмотр (форматированный) — всегда открыт
+            st.markdown("**Предпросмотр:**")
+            st.markdown(edited.replace("\n", "  \n"))
 
     # =========================================================================
     # =========================================================================
@@ -1431,31 +1431,41 @@ def show_protocol_bot():
                 "подробный": "подробный",
             }.get(proto.get("detail_level", ""), proto.get("detail_level", "—"))
 
+            # Читаем превью текста заранее — чистый plain text
+            _preview_txt = ""
+            if txt_ok:
+                try:
+                    import re as _re
+                    with open(proto["txt_path"], encoding="utf-8") as _pf:
+                        _raw = _pf.read(800)
+                    # Убираем все markdown-символы
+                    _clean = _re.sub(r"^#{1,6} *", "", _raw, flags=_re.MULTILINE)
+                    _clean = _re.sub(r"[*_]{1,3}", "", _clean)
+                    _clean = _re.sub(r"^[-=]{3,} *$", "", _clean, flags=_re.MULTILINE)
+                    # Берём непустые строки, склеиваем через разделитель
+                    _lines = [l.strip() for l in _clean.splitlines() if l.strip()]
+                    _preview_txt = "  ·  ".join(_lines[:8])[:350]
+                except Exception:
+                    _preview_txt = ""
+
             st.markdown(
                 f"<div style='background:#ffffff;border:1px solid #dce3ec;"
                 f"border-radius:6px;padding:10px 14px;margin-bottom:4px;'>"
-                f"<div style='font-weight:600;font-size:0.95rem;color:#1B5C74;'>"
+                f"<div style='font-weight:600;font-size:0.95rem;color:#1B5C74;margin-bottom:8px;'>"
                 f"{proto.get('meeting_name', 'Без названия')}</div>"
-                f"<div style='font-size:0.78rem;color:#5a6a7a;margin-top:4px;'>"
-                f"{proto.get('organization', '—')} &nbsp;·&nbsp; "
-                f"{proto.get('meeting_date', '')[:10]} &nbsp;·&nbsp; "
-                f"{proto.get('meeting_time', '')} &nbsp;·&nbsp; "
-                f"{detail_badge} &nbsp;·&nbsp; "
-                f"{proto.get('word_count', 0):,} слов"
-                f"</div>"
-                f"<div style='font-size:0.74rem;color:#7a8a9a;margin-top:3px;'>"
-                f"Участники: {att_names[:90]}{'…' if len(att_names) > 90 else ''}"
-                f"</div>"
-                + (
-                    "<div style='font-size:0.78rem;color:#5a6a7a;margin-top:6px;"
-                    "border-top:1px solid #eef1f5;padding-top:6px;"
-                    "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
-                    + (open(proto["txt_path"], encoding="utf-8").read()[:200].replace("<","&lt;").replace(">","&gt;") + "…"
-                       if txt_ok else "<i style='color:#aaa'>текст недоступен</i>")
-                    + "</div>"
-                    if True else ""
-                )
-                + f"</div>",
+                f"<div style='display:flex;gap:16px;'>"
+                f"<div style='flex:0 0 30%;min-width:0;font-size:0.78rem;color:#5a6a7a;line-height:1.7;'>"
+                f"{proto.get('organization', '—')}<br>"
+                f"{proto.get('meeting_date', '')[:10]} &nbsp;·&nbsp; {proto.get('meeting_time', '')}<br>"
+                f"{detail_badge} &nbsp;·&nbsp; {proto.get('word_count', 0):,} слов<br>"
+                f"<span style='font-size:0.74rem;color:#9aa5b4;'>"
+                f"Участники: {att_names[:60]}{'…' if len(att_names) > 60 else ''}"
+                f"</span></div>"
+                f"<div style='flex:1;min-width:0;border-left:2px solid #eef1f5;padding-left:12px;"
+                f"font-size:0.78rem;color:#6b7a8d;line-height:1.6;overflow:hidden;"
+                f"display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;'>"
+                f"{ _preview_txt if _preview_txt else '—' }"
+                f"</div></div></div>",
                 unsafe_allow_html=True,
             )
 
