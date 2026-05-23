@@ -1042,65 +1042,207 @@ def show_doc_scanner():
         if not db.get("documents"):
             st.info("Сначала распознайте хотя бы один документ на вкладке «Загрузка».")
         else:
-            # Строка поиска + кнопка
-            search_col, btn_col = st.columns([5, 1])
-            with search_col:
-                search_query = st.text_input(
-                    "Запрос",
-                    placeholder="например: неподконтрольные расходы, ДМС, НДС",
-                    key="search_input",
-                    label_visibility="collapsed",
-                )
-            with btn_col:
-                do_search = st.button(
-                    "Найти", type="primary", key="search_exec_btn",
-                    use_container_width=True
-                )
-
-            # Настройки поиска
-            _src_opt = st.radio(
-                "Искать в:",
-                ["Только в тексте документов",
-                 "В тексте и пересказах"],
-                horizontal=True,
-                key="search_scope",
-                label_visibility="visible",
+            _sq = st.text_input(
+                "Поисковый запрос",
+                placeholder="например: неподконтрольные расходы, ДМС, НДС",
+                key="search_input",
             )
-            _inc_sum = (_src_opt == "В тексте и пересказах")
 
-            if do_search and search_query.strip():
-                results = search_documents(db, search_query,
-                                           include_summary=_inc_sum)
-                st.session_state["search_results"] = results
-                st.session_state["search_query"]   = search_query
-                st.session_state["search_scope_saved"] = _src_opt
-
-            results = st.session_state.get("search_results", [])
-            query   = st.session_state.get("search_query", "")
-
-            if results:
-                st.success(
-                    f"Найдено в **{len(results)}** документах по запросу: _{query}_"
+            so1, so2, so3 = st.columns(3)
+            with so1:
+                _match_type = st.radio(
+                    "Тип совпадения",
+                    ["Точное", "По словам", "Нечёткое"],
+                    key="search_match_type",
+                    help=(
+                        "Точное — ищет фразу целиком. "
+                        "По словам — все слова должны присутствовать. "
+                        "Нечёткое — находит похожие слова (по началу)."
+                    ),
                 )
-                for res in results:
-                    doc = res["doc"]
-                    with st.expander(
-                        f"{_fname(doc)} — {res['total_matches']} совпадений",
-                        expanded=(res == results[0]),
-                    ):
-                        for match in res["matches"]:
-                            _src_badge = (
-                                f"**Пересказ:**" if match["source"] == "пересказ"
-                                else f"**Стр. {match['page']}:**"
+            with so2:
+                _scope = st.radio(
+                    "Где искать",
+                    ["Текст документов", "Пересказы", "Везде"],
+                    key="search_scope_adv",
+                )
+            with so3:
+                _presence = st.radio(
+                    "Наличие",
+                    ["Содержит", "Не содержит"],
+                    key="search_presence",
+                    help="Найти документы где запрос присутствует или отсутствует",
+                )
+
+            _do_search = st.button("Найти", key="search_exec_btn", type="primary")
+            st.divider()
+
+            # ── Функция поиска с типами совпадения ───────────────────────────
+            def _doc_matches(doc: dict, query: str, match_type: str, scope: str) -> list:
+                """Возвращает список [(контекст, источник)] или [] если не найдено."""
+                import re as _re
+                q = query.strip()
+                if not q:
+                    return []
+
+                def _search_in(text: str, src: str) -> list:
+                    hits = []
+                    if match_type == "Точное":
+                        idx = 0
+                        while True:
+                            pos = text.lower().find(q.lower(), idx)
+                            if pos < 0:
+                                break
+                            start   = max(0, pos - 80)
+                            end     = min(len(text), pos + len(q) + 80)
+                            snippet = (
+                                ("..." if start > 0 else "")
+                                + text[start:end]
+                                + ("..." if end < len(text) else "")
                             )
-                            st.markdown(f"{_src_badge} {match['context']}")
-                            st.caption(
-                                f"Источник: {match['source']}  ·  "
-                                f"Совпадения: {', '.join(match['matched_terms'])}"
+                            hi = _re.sub(f"(?i)({_re.escape(q)})", r"**\1**", snippet)
+                            hits.append((hi, src))
+                            idx = pos + 1
+                            if len(hits) >= 3:
+                                break
+                    elif match_type == "По словам":
+                        words = q.lower().split()
+                        tl    = text.lower()
+                        if all(w in tl for w in words):
+                            pos     = tl.find(words[0])
+                            start   = max(0, pos - 60)
+                            end     = min(len(text), pos + 120)
+                            snippet = ("..." if start > 0 else "") + text[start:end] + "..."
+                            pattern = "|".join(_re.escape(w) for w in words)
+                            hi = _re.sub(f"(?i)({pattern})", r"**\1**", snippet)
+                            hits.append((hi, src))
+                    elif match_type == "Нечёткое":
+                        words       = q.lower().split()
+                        tl          = text.lower()
+                        found_words = []
+                        for w in words:
+                            stem = w[:max(4, len(w) - 2)]
+                            if stem in tl:
+                                found_words.append(w)
+                        if len(found_words) >= max(1, len(words) // 2):
+                            pos     = tl.find(found_words[0][:4])
+                            start   = max(0, pos - 60)
+                            end     = min(len(text), pos + 150)
+                            snippet = ("..." if start > 0 else "") + text[start:end] + "..."
+                            pattern = "|".join(_re.escape(w[:4]) for w in found_words)
+                            hi = _re.sub(f"(?i)({pattern})", r"**\1**", snippet)
+                            hits.append((hi, src))
+                    return hits
+
+                all_hits = []
+
+                # Поиск по тексту страниц
+                if scope in ("Текст документов", "Везде"):
+                    full_text = doc.get("full_text", "") or "\n".join(
+                        p.get("text", "") for p in doc.get("pages", [])
+                    )
+                    all_hits += _search_in(full_text, "текст документа")
+
+                # Поиск по пересказу
+                if scope in ("Пересказы", "Везде"):
+                    orig_path    = doc.get("original_path", "")
+                    summary_text = load_summary_file(orig_path) if orig_path else ""
+                    if summary_text:
+                        all_hits += _search_in(summary_text, "пересказ")
+
+                return all_hits
+
+            # ── Выполнение поиска ─────────────────────────────────────────────
+            if _do_search or st.session_state.get("search_last_query"):
+                if _do_search:
+                    st.session_state.search_last_query    = _sq
+                    st.session_state.search_last_match    = _match_type
+                    st.session_state.search_last_scope    = _scope
+                    st.session_state.search_last_presence = _presence
+
+                query_to_use    = st.session_state.get("search_last_query", _sq)
+                match_to_use    = st.session_state.get("search_last_match", _match_type)
+                scope_to_use    = st.session_state.get("search_last_scope", _scope)
+                presence_to_use = st.session_state.get("search_last_presence", _presence)
+                want_match      = (presence_to_use == "Содержит")
+
+                if query_to_use.strip():
+                    _results = []
+                    for _d in db.get("documents", []):
+                        _hits    = _doc_matches(_d, query_to_use, match_to_use, scope_to_use)
+                        has_hits = len(_hits) > 0
+                        if has_hits == want_match:
+                            _results.append((_d, _hits))
+
+                    _icon = "+" if want_match else "−"
+                    st.caption(
+                        f"{_icon} Найдено документов: **{len(_results)}** "
+                        f"из {len(db.get('documents', []))} "
+                        f"· запрос: «{query_to_use}» "
+                        f"· {match_to_use} · {scope_to_use}"
+                    )
+
+                    if not _results:
+                        st.warning(
+                            "Ничего не найдено. Попробуйте изменить тип совпадения "
+                            "или расширить область поиска."
+                        )
+                    else:
+                        for _d, _hits in _results:
+                            _dfn  = _fname(_d)
+                            _pc   = _d.get("page_count", 0) or len(_d.get("pages", []))
+                            _wc   = _d.get("word_count", 0)
+                            _orig = _d.get("original_path", "")
+                            _has_sum = bool(load_summary_file(_orig))
+                            _exp_label = (
+                                f"{'📄' if _hits else '○'} {_dfn} · "
+                                f"{_pc} стр. · {_wc:,} сл. · "
+                                f"{len(_hits)} совп."
+                                + (" · есть пересказ" if _has_sum else "")
                             )
-                            st.divider()
-            elif do_search and search_query.strip():
-                st.warning("Совпадений не найдено. Попробуйте другой запрос.")
+                            with st.expander(_exp_label, expanded=(len(_results) == 1)):
+                                if _hits:
+                                    for ctx, src in _hits[:5]:
+                                        st.markdown(
+                                            f"<div style='background:#f4f6f9;"
+                                            f"border-left:3px solid #1B5C74;"
+                                            f"padding:6px 10px;margin:4px 0;"
+                                            f"border-radius:0 4px 4px 0;"
+                                            f"font-size:0.85rem;'>{ctx}</div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                        st.caption(f"Источник: {src}")
+                                elif not want_match:
+                                    st.caption("Запрос не найден в этом документе")
+
+                                # ── Кнопки действий ──────────────────────────
+                                _ca, _cb = st.columns(2)
+                                with _ca:
+                                    st.download_button(
+                                        "Скачать TXT",
+                                        data=export_txt(_d),
+                                        file_name=f"{os.path.splitext(_dfn)[0]}_распознан.txt",
+                                        mime="text/plain",
+                                        key=f"search_dl_txt_{_d['id']}",
+                                        use_container_width=True,
+                                    )
+                                with _cb:
+                                    _dsum_s = load_summary_file(_orig)
+                                    try:
+                                        _dbuf = export_docx(_d, summary=_dsum_s or None)
+                                        st.download_button(
+                                            "Скачать DOCX",
+                                            data=_dbuf,
+                                            file_name=f"{os.path.splitext(_dfn)[0]}_распознан.docx",
+                                            mime=(
+                                                "application/vnd.openxmlformats-"
+                                                "officedocument.wordprocessingml.document"
+                                            ),
+                                            key=f"search_dl_docx_{_d['id']}",
+                                            use_container_width=True,
+                                        )
+                                    except Exception:
+                                        pass
 
     # =========================================================================
     # Вкладка 3 — База документов

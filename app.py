@@ -190,39 +190,9 @@ h1, h2, h3, h4 { color: var(--text-primary); font-family: inherit; }
     font-size: 0.82em !important;
 }
 
-/* ── Radio — фирменный цвет, перебиваем красный baseweb ─────────────────── */
-/* Невыбранный кружок */
-[data-baseweb="radio"] [class*="RadioMarkOuter"],
-[data-baseweb="radio"] > div:first-child {
-    border-color: #aab4c0 !important;
-    background-color: transparent !important;
-}
-/* Выбранный кружок — внешний ring */
-[data-baseweb="radio"][aria-checked="true"] [class*="RadioMarkOuter"],
-[data-baseweb="radio"][aria-checked="true"] > div:first-child,
-[role="radio"][aria-checked="true"] [class*="RadioMarkOuter"],
-[role="radio"][aria-checked="true"] > div:first-child {
-    border-color: var(--brand-primary) !important;
-    background-color: transparent !important;
-}
-/* Выбранный кружок — внутренняя точка */
-[data-baseweb="radio"][aria-checked="true"] [class*="RadioMarkInner"],
-[data-baseweb="radio"][aria-checked="true"] > div:first-child > div,
-[role="radio"][aria-checked="true"] [class*="RadioMarkInner"],
-[role="radio"][aria-checked="true"] > div:first-child > div {
-    background-color: var(--brand-primary) !important;
-}
-/* Через SVG/fill если baseweb рисует через fill */
-[data-baseweb="radio"][aria-checked="true"] svg circle,
-[role="radio"][aria-checked="true"] svg circle {
-    fill: var(--brand-primary) !important;
-    stroke: var(--brand-primary) !important;
-}
-/* Hover */
+/* ── Radio — цвет задаётся через .streamlit/config.toml primaryColor ─────── */
 [data-testid="stRadio"] label:hover { color: var(--brand-primary) !important; }
-/* Подсветка выбранного лейбла */
-[data-testid="stRadio"] div[aria-checked="true"] ~ label,
-[data-testid="stRadio"] label[data-selected="true"] {
+[data-testid="stRadio"] div[aria-checked="true"] ~ label {
     color: var(--brand-primary) !important;
     font-weight: 600 !important;
 }
@@ -380,6 +350,10 @@ with st.sidebar:
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown("**Разделы**")
+    # Синхронизируем radio-ключи с main_choice: при переходе с лендинга
+    # session_state[key] имеет приоритет над index, поэтому обновляем явно.
+    if st.session_state.main_choice in _ACTIVE_PRODUCTS:
+        st.session_state["_sidebar_active"] = st.session_state.main_choice
     _active_idx = (
         _ACTIVE_PRODUCTS.index(st.session_state.main_choice)
         if st.session_state.main_choice in _ACTIVE_PRODUCTS else None
@@ -390,6 +364,8 @@ with st.sidebar:
     _dev_expanded = st.session_state.main_choice in _DEV_PRODUCTS
     with st.expander("Наши планы", expanded=_dev_expanded):
         st.caption("Продукты в активной разработке, доступны для ознакомления.")
+        if st.session_state.main_choice in _DEV_PRODUCTS:
+            st.session_state["_sidebar_dev"] = st.session_state.main_choice
         _dev_idx = (
             _DEV_PRODUCTS.index(st.session_state.main_choice)
             if st.session_state.main_choice in _DEV_PRODUCTS else None
@@ -499,9 +475,37 @@ else:
     st.session_state._dev_dialog_confirmed = None
 
 # =============================================================================
-# 🎯 Заголовок
+# 🏷️ Бренд-бар — отображается на каждом под-продукте
 # =============================================================================
-# (заголовок убран — каждый раздел имеет собственный st.header)
+st.markdown("""
+<div style="
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1.2rem;
+    margin-top: -1.5rem;
+    line-height: 1;
+    width: 100%;
+    gap: 0.55rem;
+">
+    <span style="
+        font-size: 2.6rem;
+        font-weight: 900;
+        color: #1B5C74;
+        letter-spacing: 0.02em;
+        line-height: 1;
+    ">РЕГУЛА.AI</span>
+    <span style="
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: #1B5C74;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        opacity: 0.7;
+    ">регулирование сегодня</span>
+</div>
+""", unsafe_allow_html=True)
 
 # (тестовые данные перенесены в streamlit_pages/claim_analyzer.py)
 

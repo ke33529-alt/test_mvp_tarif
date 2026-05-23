@@ -417,7 +417,7 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
 
     BATCH_SIZE=5: для каждого батча сначала RAG, потом LLM.
     Контекст на статью: 5 чанков × 400 симв = 2000 симв.
-    max_tokens=120: три строки ответа — достаточно для 9B модели.
+    max_tokens=300: развёрнутый ответ с цитатой НПА.
     """
     BATCH_SIZE = 3
     # Сокращаем контекст для маленькой модели
@@ -678,7 +678,7 @@ def show_claim_analyzer():
                               use_container_width=True, key="ca_run_full")
         run_risks = c3.button("⚡ Только риски",
                               use_container_width=True, key="ca_run_risks",
-                              disabled=not (ss.ca_summary or ss.ca_calc_context))
+                              disabled=False)
 
         # ── Полный анализ ─────────────────────────────────────────────────────
         if run_full:
@@ -774,8 +774,33 @@ def show_claim_analyzer():
             pbar   = st.progress(0.0)
             status = st.empty()
 
+            # Если calc_context пустой — сначала парсим расчётный файл
+            if not ss.ca_calc_context:
+                calc_name = ss.get("ca_calc_file", "")
+                # Кешируем байты если ещё не кешированы
+                if not ss.ca_uploaded_bytes:
+                    ss.ca_uploaded_bytes = {}
+                    ss.ca_uploaded_meta  = []
+                    for uf in uploaded:
+                        b = uf.read()
+                        ss.ca_uploaded_bytes[uf.name] = b
+                        ss.ca_uploaded_meta.append({"name": uf.name, "size": len(b)})
+                for uf_name, uf_bytes in ss.ca_uploaded_bytes.items():
+                    ext = os.path.splitext(uf_name.lower())[1]
+                    if ext in (".xlsx", ".xls") and (not calc_name or uf_name == calc_name):
+                        status.text(f"📊 Парсю расчётный файл: {uf_name}...")
+                        pbar.progress(0.1)
+                        try:
+                            from core.calc_parser import parse_workbook, to_llm_context
+                            df_calc, _ = parse_workbook(uf_bytes)
+                            if not df_calc.empty:
+                                ss.ca_calc_context = to_llm_context(df_calc)
+                        except Exception as e:
+                            st.warning(f"calc_parser: {e}")
+                        break
+
             def _pcb_r(pct, msg):
-                pbar.progress(pct)
+                pbar.progress(0.15 + pct * 0.85)
                 status.text(msg)
 
             ss.ca_risks      = analyze_risks(ss.ca_calc_context, ss.ca_summary, _pcb_r)
@@ -831,9 +856,9 @@ def show_claim_analyzer():
 
     # ── Вкладки ───────────────────────────────────────────────────────────────
     tab_risks, tab_summary, tab_registry = st.tabs([
-        "🔴 Риски и комплектность",
-        "📄 Резюме заявки",
-        "📂 Реестр заявок",
+        "Риски и комплектность",
+        "Резюме заявки",
+        "Реестр заявок",
     ])
 
     # =========================================================================
@@ -1039,7 +1064,7 @@ def _show_registry():
                 update_notes(pid, new_notes)
 
             # ── Резюме и риски ────────────────────────────────────────────
-            sub1, sub2 = st.tabs(["📄 Резюме", "🔴 Риски"])
+            sub1, sub2 = st.tabs(["Резюме", "Риски"])
 
             with sub1:
                 if summary:

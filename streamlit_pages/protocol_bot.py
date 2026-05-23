@@ -730,7 +730,7 @@ def show_protocol_bot():
         if key not in st.session_state:
             st.session_state[key] = default
 
-    tab_create, tab_search, tab_base = st.tabs(["✏️ Создание протокола", "🔍 Поиск по протоколам", "📚 База протоколов"])
+    tab_create, tab_search, tab_base = st.tabs(["Создание протокола", "Поиск по протоколам", "База протоколов"])
 
     # =========================================================================
     # ВКЛАДКА 1 — СОЗДАНИЕ ПРОТОКОЛА
