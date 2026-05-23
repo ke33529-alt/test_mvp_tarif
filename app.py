@@ -503,77 +503,17 @@ else:
 # =============================================================================
 # (заголовок убран — каждый раздел имеет собственный st.header)
 
-# =============================================================================
-# 📊 Тестовые данные
-# =============================================================================
-@st.cache_data
-def get_example_data():
-    completeness = pd.DataFrame([
-        {"Документ": "Устав организации",         "Требуется": "✅", "Приложено": "✅", "Статус": "🟢"},
-        {"Документ": "Договор теплоснабжения",    "Требуется": "✅", "Приложено": "✅", "Статус": "🟢"},
-        {"Документ": "Бухгалтерский баланс (Ф-1)","Требуется": "✅", "Приложено": "❌", "Статус": "🔴"},
-        {"Документ": "Акт сверки с контрагентами","Требуется": "✅", "Приложено": "✅", "Статус": "🟡"},
-        {"Документ": "Лицензия на деятельность",  "Требуется": "❌", "Приложено": "—", "Статус": "⚪"},
-    ])
-    articles = pd.DataFrame([
-        {"Статья": "Расходы на тепловую энергию", "Сумма (тыс. ₽)": 113705, "Документы": 3, "Риск": "🟢 5%",  "Рекомендация": "—"},
-        {"Статья": "Расходы на оплату труда АУП", "Сумма (тыс. ₽)": 9038,   "Документы": 1, "Риск": "🟡 35%", "Рекомендация": "Приложите приказ о зарплате"},
-        {"Статья": "Расходы на ремонт ОС",        "Сумма (тыс. ₽)": 25,     "Документы": 0, "Риск": "🔴 90%", "Рекомендация": "Приложите дефектную ведомость"},
-        {"Статья": "Программное обеспечение",      "Сумма (тыс. ₽)": 590,    "Документы": 1, "Риск": "🟡 40%", "Рекомендация": "Приложите лицензию"},
-        {"Статья": "Хозяйственные расходы",        "Сумма (тыс. ₽)": 150,    "Документы": 2, "Риск": "🟢 10%", "Рекомендация": "—"},
-    ])
-    return {"completeness": completeness, "articles": articles}
-
-example_data = get_example_data()
-df_comp = example_data["completeness"]
-df_art  = example_data["articles"]
+# (тестовые данные перенесены в streamlit_pages/claim_analyzer.py)
 
 # =============================================================================
 # Вкладка 1: Анализатор заявок
 # =============================================================================
 if main_choice == "Анализатор заявок":
-    st.header("Анализатор тарифных заявок")
-    st.info("Загрузите расчётную модель и документы для проверки комплектности и выявления рисков")
-    uploaded_files = st.file_uploader("Загрузите файлы", type=['xlsx','xls','pdf','docx'], accept_multiple_files=True)
-    if uploaded_files:
-        st.success(f"✅ Загружено: {len(uploaded_files)} файл(ов)")
-        st.subheader("📁 Приложенные файлы")
-        if "calc_file" not in st.session_state:
-            st.session_state.calc_file = None
-        for uploaded_file in uploaded_files:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                st.write(f"📄 {uploaded_file.name}")
-            with col2:
-                is_calc = st.checkbox("🧮 Расчёт", key=f"calc_{uploaded_file.name}",
-                                      value=(st.session_state.calc_file == uploaded_file.name))
-                if is_calc:
-                    st.session_state.calc_file = uploaded_file.name
-        if st.session_state.calc_file:
-            st.info(f"🧮 **Расчётный файл:** {st.session_state.calc_file}")
-        st.subheader("📋 Шаг 1: Проверка комплектности документов")
-        st.dataframe(df_comp, use_container_width=True, hide_index=True)
-        st.subheader("📊 Шаг 2: Статьи затрат и риски")
-        st.dataframe(df_art, use_container_width=True, hide_index=True)
-        st.subheader("💰 Валовая выручка")
-        total = int(df_art["Сумма (тыс. ₽)"].sum())
-        col1, col2, col3 = st.columns(3)
-        col1.metric("2024", f"{total:,.0f} тыс. ₽")
-        col2.metric("2025", f"{int(total*1.04):,.0f} тыс. ₽")
-        col3.metric("2026", f"{int(total*1.08):,.0f} тыс. ₽")
-        with st.expander("📝 Сообщить об ошибке", expanded=False):
-            with st.form("feedback_analyzer"):
-                issue = st.selectbox("Тип проблемы", ["Файл не распознан","Неверная классификация","Статья не извлечена","Неверный риск","Другое"])
-                file_list = ["— не относится —"] + [f.name for f in uploaded_files]
-                file = st.selectbox("Файл", file_list)
-                desc = st.text_area("Описание", placeholder="Что пошло не так?")
-                submitted = st.form_submit_button("📤 Отправить")
-                if submitted:
-                    if desc:
-                        submit_feedback("user", issue, desc, file_name=file if file != "— не относится —" else None)
-                        st.success("✅ Спасибо за отзыв!")
-                    else:
-                        st.warning("Опишите проблему")
+    try:
+        from streamlit_pages.claim_analyzer import show_claim_analyzer
+        show_claim_analyzer()
+    except ImportError as e:
+        st.error(f"Ошибка загрузки анализатора: {e}")
 
 # =============================================================================
 # Вкладка 2: Советчик — со стримингом ответа
@@ -1940,6 +1880,49 @@ elif main_choice == "Админка":
                     "Пример:\n| Параметр | Значение | Ед. изм. |\n|---|---|---|\n| Тариф | 100.50 | руб./Гкал |"
                 ),
                 "advisor_user": "Вопрос пользователя: {query}\n\nКонтекст из документов:\n{context}\n\nОтвет:",
+                # ── Анализатор заявок: суммаризатор ─────────────────────────
+                "claim_map_system": (
+                    "Ты эксперт по тарифному регулированию РФ. "
+                    "Извлекаешь структурированные данные из фрагментов тарифных заявок. "
+                    "Отвечаешь строго на русском языке, только по делу."
+                ),
+                "claim_map_user": (
+                    "Это часть {i} из {total} тарифной заявки.\n"
+                    "Извлеки ТОЛЬКО (если есть): статьи затрат (название, сумма тыс. руб., период), "
+                    "приложенные документы, ссылки на НПА, организацию и период.\n"
+                    "Формат: маркированный список. Без вступлений.\n\nФРАГМЕНТ:\n{chunk}"
+                ),
+                "claim_reduce_system": (
+                    "Ты эксперт по тарифному регулированию РФ. "
+                    "Составляешь структурированное резюме тарифной заявки. "
+                    "Все цифры точно из источника. Отвечаешь на русском."
+                ),
+                "claim_reduce_user": (
+                    "Собери единое резюме тарифной заявки (~{target_words} слов).\n\n"
+                    "Разделы: ## Организация и период ## Статьи затрат "
+                    "## Приложенные документы ## НПА ## Пробелы в обосновании\n\n"
+                    "Устрани дублирование. Все цифры точно.\n\nДАННЫЕ:\n{combined}"
+                ),
+                # ── Анализатор заявок: риски ─────────────────────────────────
+                "claim_risks_system": (
+                    "Ты эксперт-аудитор по тарифному регулированию РФ. "
+                    "Анализируешь тарифные заявки на риск отклонения регулятором. "
+                    "Отвечаешь структурированно на русском языке. "
+                    "Используй эмодзи 🔴 (высокий риск), 🟡 (средний), 🟢 (низкий)."
+                ),
+                "claim_risks_user": (
+                    "Проанализируй тарифную заявку и составь отчёт о рисках.\n\n"
+                    "## 1. Оценка комплектности документов\n"
+                    "Перечисли какие документы упоминаются. "
+                    "Укажи какие отсутствуют исходя из статей затрат.\n\n"
+                    "## 2. Риски по статьям затрат\n"
+                    "Для каждой значимой статьи: 🔴/🟡/🟢 Статья: сумма.\n"
+                    "Основание риска и рекомендация.\n\n"
+                    "## 3. Итоговая оценка\n"
+                    "Общий уровень и топ-3 рекомендации.\n\n"
+                    "ДАННЫЕ РАСЧЁТНОГО ФАЙЛА:\n{calc_context}\n\n"
+                    "РЕЗЮМЕ ЗАЯВКИ:\n{summary}"
+                ),
             }
             if os.path.exists(PROMPTS_FILE_ADMIN):
                 try:
@@ -2012,6 +1995,90 @@ elif main_choice == "Админка":
                 st.download_button("📥 Скачать", data=prompts_json.encode("utf-8"),
                                    file_name="prompts_backup.json", mime="application/json",
                                    use_container_width=True, key="download_prompts_btn")
+
+            # ── Анализатор заявок ─────────────────────────────────────────
+            st.divider()
+            st.subheader("🔍 Анализатор заявок")
+            st.caption("Промпты суммаризатора (Map-Reduce) и анализа рисков")
+
+            with st.expander("ℹ️ Переменные анализатора"):
+                st.markdown(
+                    "**MAP:** `{i}` — номер части, `{total}` — всего частей, `{chunk}` — текст фрагмента\n\n"
+                    "**REDUCE:** `{target_words}` — целевой объём, `{combined}` — результаты MAP\n\n"
+                    "**РИСКИ:** `{calc_context}` — данные расчётного файла, `{summary}` — резюме заявки"
+                )
+
+            st.markdown("**🗺️ Суммаризатор MAP — системный промпт**")
+            new_claim_map_sys = st.text_area(
+                "", value=current_prompts.get("claim_map_system", DEFAULT_PROMPTS_ADMIN["claim_map_system"]),
+                height=100, key="prompt_claim_map_sys", label_visibility="collapsed"
+            )
+            st.markdown("**🗺️ Суммаризатор MAP — пользовательский промпт**")
+            new_claim_map_usr = st.text_area(
+                "", value=current_prompts.get("claim_map_user", DEFAULT_PROMPTS_ADMIN["claim_map_user"]),
+                height=120, key="prompt_claim_map_usr", label_visibility="collapsed"
+            )
+            for v, name in [("{i}", "MAP user"), ("{total}", "MAP user"), ("{chunk}", "MAP user")]:
+                if v not in new_claim_map_usr:
+                    st.error(f"⚠️ {name} промпт должен содержать {v}")
+
+            st.markdown("**📦 Суммаризатор REDUCE — системный промпт**")
+            new_claim_red_sys = st.text_area(
+                "", value=current_prompts.get("claim_reduce_system", DEFAULT_PROMPTS_ADMIN["claim_reduce_system"]),
+                height=80, key="prompt_claim_red_sys", label_visibility="collapsed"
+            )
+            st.markdown("**📦 Суммаризатор REDUCE — пользовательский промпт**")
+            new_claim_red_usr = st.text_area(
+                "", value=current_prompts.get("claim_reduce_user", DEFAULT_PROMPTS_ADMIN["claim_reduce_user"]),
+                height=120, key="prompt_claim_red_usr", label_visibility="collapsed"
+            )
+
+            st.markdown("**⚠️ Анализ рисков — системный промпт**")
+            new_claim_risk_sys = st.text_area(
+                "", value=current_prompts.get("claim_risks_system", DEFAULT_PROMPTS_ADMIN["claim_risks_system"]),
+                height=100, key="prompt_claim_risk_sys", label_visibility="collapsed"
+            )
+            st.markdown("**⚠️ Анализ рисков — пользовательский промпт**")
+            new_claim_risk_usr = st.text_area(
+                "", value=current_prompts.get("claim_risks_user", DEFAULT_PROMPTS_ADMIN["claim_risks_user"]),
+                height=180, key="prompt_claim_risk_usr", label_visibility="collapsed"
+            )
+            for v, name in [("{calc_context}", "Риски user"), ("{summary}", "Риски user")]:
+                if v not in new_claim_risk_usr:
+                    st.error(f"⚠️ {name} промпт должен содержать {v}")
+
+            col1c, col2c = st.columns([2, 1])
+            with col1c:
+                if st.button("💾 Сохранить промпты анализатора", type="primary",
+                             use_container_width=True, key="save_claim_prompts_btn"):
+                    os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
+                    updated = {
+                        **current_prompts,
+                        "claim_map_system":    new_claim_map_sys,
+                        "claim_map_user":      new_claim_map_usr,
+                        "claim_reduce_system": new_claim_red_sys,
+                        "claim_reduce_user":   new_claim_red_usr,
+                        "claim_risks_system":  new_claim_risk_sys,
+                        "claim_risks_user":    new_claim_risk_usr,
+                        "updated_at":          datetime.now().isoformat(),
+                    }
+                    with open(PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as f:
+                        json.dump(updated, f, ensure_ascii=False, indent=2)
+                    st.success("✅ Промпты анализатора сохранены.")
+                    st.rerun()
+            with col2c:
+                claim_prompts_json = json.dumps({
+                    "claim_map_system":    new_claim_map_sys,
+                    "claim_map_user":      new_claim_map_usr,
+                    "claim_reduce_system": new_claim_red_sys,
+                    "claim_reduce_user":   new_claim_red_usr,
+                    "claim_risks_system":  new_claim_risk_sys,
+                    "claim_risks_user":    new_claim_risk_usr,
+                }, ensure_ascii=False, indent=2)
+                st.download_button("📥 Скачать", data=claim_prompts_json.encode("utf-8"),
+                                   file_name="claim_prompts_backup.json",
+                                   mime="application/json",
+                                   use_container_width=True, key="dl_claim_prompts_btn")
 
         elif admin_subtab == "📝 Отзывы":
             st.header("📝 Отзывы пользователей")
