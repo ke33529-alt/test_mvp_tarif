@@ -38,6 +38,31 @@ METADATA_FILE = os.path.join(VECTOR_DB_DIR, "indexing_metadata.json")
 CONFIG_FILE = os.path.join("config", "chunking_patterns.json")
 
 # =============================================================================
+# Сферы документов — читаем из doc_spheres.json при индексации
+# =============================================================================
+_SPHERES_CFG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "doc_spheres.json"
+)
+
+def _get_sphere_str(filename: str) -> str:
+    """
+    Читает назначенные сферы файла из config/doc_spheres.json.
+    Возвращает строки через запятую:
+      '🔥 Теплоснабжение,💧 Водоснабжение/водоотведение'
+    Пустая строка — сфера не назначена (старые документы тоже возвращаются в советчике).
+    """
+    try:
+        cfg = os.path.normpath(_SPHERES_CFG)
+        if os.path.exists(cfg):
+            with open(cfg, "r", encoding="utf-8") as f:
+                smap = json.load(f)
+            spheres = smap.get(os.path.basename(filename), [])
+            return ",".join(spheres) if spheres else ""
+    except Exception:
+        pass
+    return ""
+
+# =============================================================================
 # Импорты с обработкой ошибок
 # =============================================================================
 try:
@@ -465,6 +490,9 @@ def index_file(file_path, category="npa"):
                 "document_part": chunk['metadata'].get('document_part', ''),
                 "text_preview":  chunk['metadata'].get('text_preview', ''),
                 "chunk_index":   i,
+                "sphere":        _get_sphere_str(
+                    chunk['metadata'].get('filename', chunk['metadata'].get('filepath', ''))
+                ),
                 "indexed_at":    datetime.now().isoformat()
             })
 
@@ -661,10 +689,11 @@ def rebuild_index():
     chunks = []
     for doc in documents:
         base_metadata = {
-            'filename': os.path.basename(doc.metadata.get('source', '')),
-            'filepath': doc.metadata.get('source', ''),
-            'doc_type': detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
-            'indexed_at': datetime.now().isoformat()
+            'filename':   os.path.basename(doc.metadata.get('source', '')),
+            'filepath':   doc.metadata.get('source', ''),
+            'doc_type':   detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
+            'sphere':     _get_sphere_str(os.path.basename(doc.metadata.get('source', ''))),
+            'indexed_at': datetime.now().isoformat(),
         }
         
         file_metadata = extract_metadata_from_filename(doc.metadata.get('source', ''), CONFIG_FILE)
@@ -714,6 +743,9 @@ def rebuild_index():
                 "document_part": chunk['metadata'].get('document_part', ''),
                 "text_preview":  chunk['metadata'].get('text_preview', ''),
                 "chunk_index":   i,
+                "sphere":        _get_sphere_str(
+                    chunk['metadata'].get('filename', chunk['metadata'].get('filepath', ''))
+                ),
                 "indexed_at":    datetime.now().isoformat()
             })
 

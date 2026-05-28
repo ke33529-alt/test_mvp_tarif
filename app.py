@@ -743,6 +743,30 @@ elif main_choice == "Советчик":
             c2.metric("Среднее время", f"{avg_time:.1f} сек")
             c3.metric("Последний",    f"{st.session_state.query_times[-1]:.1f} сек")
 
+    # ── Фильтр по сфере деятельности ────────────────────────────────────────
+    _ADV_SPHERES = [
+        "🔥 Теплоснабжение",
+        "💧 Водоснабжение/водоотведение",
+        "🗑️ Обращение с ТКО",
+        "🔵 Газ",
+        "⚡ Электрика",
+        "📁 Иные сферы",
+    ]
+    adv_spheres = st.multiselect(
+        "🌐 Сфера деятельности",
+        options=_ADV_SPHERES,
+        default=[],
+        key="advisor_spheres_filter",
+        placeholder="Все сферы — фильтр не применяется",
+        help=(
+            "Уточните сферу(ы) для целевого поиска. "
+            "Документы без назначенной сферы всегда включаются в результаты."
+        ),
+    )
+    if adv_spheres:
+        _adv_sep = "  ·  "
+        st.caption(f"🔍 Активен фильтр: **{_adv_sep.join(adv_spheres)}**")
+
     # ── Поле ввода ───────────────────────────────────────────────────────────
     query = st.text_area(
         "Ваш вопрос",
@@ -779,7 +803,11 @@ elif main_choice == "Советчик":
                     # 2. Векторный поиск
                     with st.spinner("🔍 Ищем в базе знаний..."):
                         _effective_top_k = st.session_state.get("_adv_top_k", top_k)
-                        sources = search_vector_db(query, top_k=_effective_top_k)
+                        sources = search_vector_db(
+                            query,
+                            top_k=_effective_top_k,
+                            spheres=adv_spheres if adv_spheres else None,
+                        )
 
                     if sources and not st.session_state.sources_only_mode:
                         st.success(f"✅ Ответ сгенерирован ИИ · модель: {st.session_state.advisor_model}")
@@ -894,6 +922,10 @@ elif main_choice == "Советчик":
                     with st.expander(label):
                         snippet = src.get('snippet', '')
                         st.caption(snippet[:600] + ("..." if len(snippet) > 600 else ""))
+                        _src_sphere = src.get("sphere", "")
+                        if _src_sphere:
+                            _sphere_parts = [s.strip() for s in _src_sphere.split(",") if s.strip()]
+                            st.caption("🌐 " + "  ·  ".join(_sphere_parts))
 
             # Перенаправление
             if result.get("redirect"):
@@ -1177,6 +1209,12 @@ elif main_choice == "Админка":
                 dest_path   = os.path.join("data","raw",dest_folder)
                 os.makedirs(dest_path, exist_ok=True)
                 if st.button(f"💾 Сохранить и индексировать ({len(uploaded)} файл(ов))", type="primary", key="save_upload_btn"):
+                    if not upload_spheres:
+                        st.error(
+                            "⚠️ **Необходимо выбрать хотя бы одну сферу** перед индексацией! "
+                            "Выберите сферу в поле «Сферы» выше и повторите."
+                        )
+                        st.stop()
                     progress = st.progress(0)
                     for i, uf in enumerate(uploaded):
                         file_path = os.path.join(dest_path, uf.name)
@@ -1273,30 +1311,37 @@ elif main_choice == "Админка":
                                                key=f"dl_{fi['fname']}_{fi['folder']}", use_container_width=True)
                     with row[6]:
                         if st.button("🔄", key=f"idx_{fi['fname']}_{fi['folder']}", use_container_width=True, help="Переиндексировать"):
-                            with st.spinner(f"Индексация {fi['fname']}..."):
-                                try:
-                                    from core.indexer import remove_file_from_index, index_file
-                                    # Сначала удаляем старые чанки
-                                    old_chunks = fi["chunks_count"]
-                                    try: remove_file_from_index(fi["fname"])
-                                    except Exception: pass
-                                    res = index_file(fi["fpath"], fi["folder"])
-                                    if res["status"] == "success":
-                                        new_chunks = res.get("chunks", 0)
-                                        # Обновляем счётчик в session_state без rerun
-                                        st.session_state[f"chunks_{fi['fname']}"] = new_chunks
-                                        try:
-                                            from core.advisor import invalidate_hybrid_retriever
-                                            invalidate_hybrid_retriever()
+                            if not spheres_map.get(fi["fname"]):
+                                st.toast(
+                                    f"⚠️ «Файл {fi['fname']}» не имеет сферы — "
+                                    "выберите сферу в колонке «Сферы» и сохраните.",
+                                    icon="⚠️"
+                                )
+                            else:
+                                with st.spinner(f"Индексация {fi['fname']}..."):
+                                    try:
+                                        from core.indexer import remove_file_from_index, index_file
+                                        # Сначала удаляем старые чанки
+                                        old_chunks = fi["chunks_count"]
+                                        try: remove_file_from_index(fi["fname"])
                                         except Exception: pass
-                                        delta = new_chunks - old_chunks
-                                        delta_str = f"+{delta}" if delta >= 0 else str(delta)
-                                        st.toast(f"✅ {fi['fname']}: {new_chunks} чанков ({delta_str})", icon="📥")
-                                    else:
-                                        st.toast(f"❌ {res.get('message','Ошибка индексации')}", icon="🚨")
-                                except Exception as e:
-                                    st.toast(f"❌ {e}", icon="🚨")
-                            st.rerun()
+                                        res = index_file(fi["fpath"], fi["folder"])
+                                        if res["status"] == "success":
+                                            new_chunks = res.get("chunks", 0)
+                                            # Обновляем счётчик в session_state без rerun
+                                            st.session_state[f"chunks_{fi['fname']}"] = new_chunks
+                                            try:
+                                                from core.advisor import invalidate_hybrid_retriever
+                                                invalidate_hybrid_retriever()
+                                            except Exception: pass
+                                            delta = new_chunks - old_chunks
+                                            delta_str = f"+{delta}" if delta >= 0 else str(delta)
+                                            st.toast(f"✅ {fi['fname']}: {new_chunks} чанков ({delta_str})", icon="📥")
+                                        else:
+                                            st.toast(f"❌ {res.get('message','Ошибка индексации')}", icon="🚨")
+                                    except Exception as e:
+                                        st.toast(f"❌ {e}", icon="🚨")
+                                st.rerun()
                     with row[7]:
                         if st.button("📤", key=f"rmidx_{fi['fname']}_{fi['folder']}", use_container_width=True):
                             st.session_state[f"_confirm_rmidx_{fi['fname']}"] = True
@@ -1365,6 +1410,22 @@ elif main_choice == "Админка":
                 st.subheader("⚙️ Массовые операции")
                 reindex_cat = st.selectbox("Категория для переиндексации", list(CATEGORY_FOLDERS.keys()), key="reindex_cat_select")
                 if st.button("🚀 Переиндексировать категорию", type="primary", use_container_width=True, key="reindex_cat_btn"):
+                    # Проверяем файлы без сферы в выбранной категории
+                    _reindex_folder_path = os.path.join("data", "raw", CATEGORY_FOLDERS[reindex_cat])
+                    _no_sphere_files = []
+                    if os.path.exists(_reindex_folder_path):
+                        for _fn in sorted(os.listdir(_reindex_folder_path)):
+                            if _fn.startswith(".") or _fn.endswith(".indexed"): continue
+                            if not os.path.isfile(os.path.join(_reindex_folder_path, _fn)): continue
+                            if not spheres_map.get(_fn):
+                                _no_sphere_files.append(_fn)
+                    if _no_sphere_files:
+                        st.warning(
+                            f"⚠️ **{len(_no_sphere_files)} файл(ов) без назначенной сферы.** "
+                            "Назначьте сферы перед индексацией:\n\n" +
+                            "\n".join(f"• {fn}" for fn in _no_sphere_files)
+                        )
+                        st.stop()
                     with st.spinner("⏳ Индексация..."):
                         try:
                             from core.indexer import index_category

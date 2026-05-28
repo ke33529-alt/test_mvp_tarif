@@ -856,7 +856,19 @@ def _fetch_neighbors(top_candidates: list, collection, radius: int) -> dict:
 #
 # Интерфейс не изменён: query + top_k → list[dict] с теми же полями.
 # =============================================================================
-def search_vector_db(query: str, top_k: int = 5) -> list:
+
+def _sphere_match(chunk_sphere_str: str, selected_spheres: list) -> bool:
+    """
+    Проверяет, подходит ли чанк под фильтр сфер.
+    Чанки без поля sphere (старые документы / без назначенной сферы)
+    всегда проходят фильтр — обратная совместимость.
+    """
+    if not chunk_sphere_str:
+        return True
+    return any(s in chunk_sphere_str for s in selected_spheres)
+
+
+def search_vector_db(query: str, top_k: int = 5, spheres: list = None) -> list:
     t0 = time.perf_counter()
  
     retriever = get_hybrid_retriever()
@@ -892,6 +904,10 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
         # лучший (максимальный) RRF-score.
         _ss = _load_search_settings()
         _cands_per_var = int(_ss.get("candidates_per_var", 15))
+        # При активном фильтре по сфере запрашиваем вдвое больше кандидатов,
+        # чтобы компенсировать потери от постфильтрации.
+        if spheres:
+            _cands_per_var = _cands_per_var * 2
         _reranker_on   = bool(_ss.get("reranker_enabled", True))
  
         merged: dict = {}   # id → candidate dict
@@ -902,6 +918,16 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
                     merged[cid] = c
  
         candidates = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+ 
+        # ── Фильтрация по сфере (до реранкинга) ─────────────────────────────
+        if spheres:
+            pre_count  = len(candidates)
+            candidates = [
+                c for c in candidates
+                if _sphere_match(c.get("meta", {}).get("sphere", ""), spheres)
+            ]
+            print(f"[SPHERE FILTER] {pre_count} → {len(candidates)} кандидатов "
+                  f"по сферам: {spheres}")
  
         t1 = time.perf_counter()
         n_overlap = sum(1 for c in candidates if c['in_vector'] and c['in_bm25'])
@@ -955,6 +981,7 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
                 "article":      meta.get("article", ""),
                 "chunk_index":  meta.get("chunk_index", ""),
                 "distance":     pseudo_dist,
+                "sphere":       meta.get("sphere", ""),
             })
  
         print(f"[TIMING] search_vector_db итого: {time.perf_counter()-t0:.3f} сек")
@@ -962,7 +989,13 @@ def search_vector_db(query: str, top_k: int = 5) -> list:
  
     # ── Fallback: чистый векторный поиск ────────────────────────────────────
     print("[TIMING] Fallback — чистый векторный поиск (rank_bm25 не установлен)")
-    return _pure_vector_search(query, top_k, t0)
+    _fallback_sources = _pure_vector_search(query, top_k, t0)
+    if spheres:
+        _fallback_sources = [
+            s for s in _fallback_sources
+            if _sphere_match(s.get("sphere", ""), spheres)
+        ]
+    return _fallback_sources
  
  
 def debug_search_candidates(query: str, top_k: int = 5) -> dict:
@@ -1075,6 +1108,7 @@ def _build_context(sources: list, max_chars: int = None) -> str:
  
  
  
+def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
     """Оригинальный векторный поиск. Используется как fallback."""
     if t0 is None:
         t0 = time.perf_counter()
@@ -1124,6 +1158,7 @@ def _build_context(sources: list, max_chars: int = None) -> str:
             "article":     meta.get("article", ""),
             "chunk_index": meta.get("chunk_index", ""),
             "distance":    round(dist, 3),
+            "sphere":      meta.get("sphere", ""),
         })
     return sources
  
