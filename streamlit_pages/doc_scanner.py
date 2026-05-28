@@ -423,6 +423,17 @@ def _safe_print(msg: str):
         print(msg.encode("ascii", errors="replace").decode("ascii"))
 
 
+def _strip_thinking(text: str) -> str:
+    """
+    Убирает <think>...</think> блоки Qwen3/DeepSeek.
+    Модель генерирует их перед ответом — они не нужны пользователю.
+    """
+    import re
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
 def _load_lm_config() -> tuple:
     """Возвращает (lm_url, model) из advisor_config.json."""
     config_path = os.path.join("config", "advisor_config.json")
@@ -493,7 +504,8 @@ def _lm_call(client, model: str, system: str, user: str, max_tokens: int) -> str
             max_tokens=max_tokens,
             temperature=0.3,
         )
-        return (resp.choices[0].message.content or "").strip()
+        raw = (resp.choices[0].message.content or "").strip()
+        return _strip_thinking(raw)
     except Exception as e:
         return f"[Ошибка LM: {e}]"
 
@@ -922,73 +934,63 @@ def show_doc_scanner():
                 )
 
             if _do_summary:
-                st.session_state[f"gen_trigger_{doc['id']}"] = summary_length
-
-            # ── Генерация пересказа — ПОСЛЕ рендера текста документа ─────
-            # Запускается в том же рендере: документ уже виден, кнопка одна.
-            _gk = f"gen_trigger_{doc['id']}"
-            if _gk in st.session_state:
-                _gl   = st.session_state.pop(_gk)
                 _gft  = doc.get("full_text", "")
                 _gnc  = max(1, len(_gft) // _CHUNK_SIZE + 1)
                 _gisl = len(_gft) > _LARGE_DOC_THRESHOLD
 
-                st.info(
-                    "Генерация идёт — не переключайтесь на другой документ "
-                    "и не покидайте страницу: прогресс пропадёт."
-                )
                 if _gisl:
-                    st.caption(
-                        f"Map-Reduce: ~{_gnc} частей · ~1-3 мин. · {len(_gft):,} символов"
-                    )
+                    st.caption(f"📄 Map-Reduce: ~{_gnc} частей · {len(_gft):,} символов")
+
                 _gprog = st.progress(0.0)
                 _gcap  = st.empty()
-                _gcap.caption("Подготовка...")
+                _gcap.caption("⏳ Подготовка...")
 
                 def _gcb(pct, msg, _p=_gprog, _c=_gcap):
                     _pct = min(float(pct), 1.0)
                     _p.progress(_pct)
                     _c.caption(f"⏳ {msg}  ·  {int(_pct * 100)}%")
 
-                _gresult = summarize_document(_gft, _gl, _progress_cb=_gcb)
-                _gprog.progress(1.0)
-                _gcap.caption("Готово")
+                with st.spinner("🤖 Генерирую пересказ..."):
+                    _gresult = summarize_document(_gft, summary_length, _progress_cb=_gcb)
+
                 _gprog.empty()
                 _gcap.empty()
+                if not _gresult or not _gresult.strip():
+                    _gresult = "⚠️ Модель вернула пустой ответ. Попробуйте ещё раз."
                 st.session_state[summary_key] = _gresult
-                # Сохраняем пересказ как txt рядом с оригиналом
+
                 _orig_p = doc.get("original_path", "")
                 if _orig_p:
                     save_summary_file(_orig_p, _gresult)
-                st.rerun()
+                # Нет st.rerun() — результат показывается сразу ниже
 
             # ── Результат пересказа ───────────────────────────────────────
             _summary_text = st.session_state.get(summary_key)
             if _summary_text:
                 import streamlit.components.v1 as _stc
                 _wc = len(_summary_text.split())
+
+                # Заголовок с кол-вом слов
                 st.markdown(
                     "<div style='display:flex;align-items:center;"
-                    "justify-content:space-between;margin-bottom:4px;'>"
-                    "<span style='font-weight:600;'>Пересказ</span>"
-                    f"<span style='color:#888;font-size:0.85em;'>{_wc} слов</span>"
+                    "justify-content:space-between;margin-bottom:8px;margin-top:4px;'>"
+                    "<span style='font-weight:600;font-size:0.95em;'>🤖 Пересказ</span>"
+                    f"<span style='color:#888;font-size:0.82em;'>{_wc} слов</span>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                _sum_h = max(200, min(600, _wc * 6))
-                _body  = _summary_text.replace("<", "&lt;").replace(">", "&gt;")
-                st.markdown(
-                    f"<div style='font-size:0.87em;line-height:1.65;"
-                    f"background:#f0f4f8;border:1px solid #d0d8e4;"
-                    f"border-radius:6px;padding:14px 16px;"
-                    f"max-height:{_sum_h}px;overflow-y:auto;"
-                    f"white-space:pre-wrap;word-break:break-word;'>"
-                    f"{_body}</div>",
-                    unsafe_allow_html=True,
+
+                # Рендерим как markdown — LLM возвращает структуру с заголовками и списками
+                st.markdown(_summary_text)
+
+                # Кнопка копирования через iframe (текст в скрытом span)
+                _safe = (
+                    _summary_text
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                    .replace('"', "&quot;")
                 )
-                _safe = (_summary_text
-                    .replace("&","&amp;").replace("<","&lt;")
-                    .replace(">","&gt;").replace('"',"&quot;"))
                 _stc.html(
                     "<div style='font-family:sans-serif'>"
                     f"<span id='t' style='display:none'>{_safe}</span>"
@@ -998,9 +1000,9 @@ def show_doc_scanner():
                     "setTimeout(()=>this.textContent='📋 Скопировать пересказ',2000)})\" "
                     "style='font-size:13px;padding:5px 16px;cursor:pointer;"
                     "border:1px solid #d0d8e4;border-radius:5px;"
-                    "background:#fff;color:#333;margin-top:6px'>"
+                    "background:#fff;color:#333;margin-top:2px'>"
                     "📋 Скопировать пересказ</button></div>",
-                    height=48,
+                    height=44,
                 )
 
             st.divider()
