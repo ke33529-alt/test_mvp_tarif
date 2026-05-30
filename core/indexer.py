@@ -417,8 +417,16 @@ def _apply_overlap_texts(texts: list, overlap: int) -> list:
         result.append(text)
     return result
 
-def index_file(file_path, category="npa"):
-    """Индексирует один файл с учётом настроек чанкования"""
+def index_file(file_path, category="npa", extra_metadata: dict = None):
+    """
+    Индексирует один файл с учётом настроек чанкования.
+
+    extra_metadata — дополнительные поля метаданных, которые будут добавлены
+    к каждому чанку. Используется при индексации протоколов регуляторов:
+      extra_metadata = {"sphere": "Теплоснабжение", "region": "Тамбовская область",
+                        "organization": "ООО ТеплоСеть", "date": "2024-11-15",
+                        "file": "Протокол_2024-11-15.pdf"}
+    """
     try:
         if not LANGCHAIN_AVAILABLE:
             return {"status": "error", "message": "LangChain не установлен"}
@@ -470,12 +478,21 @@ def index_file(file_path, category="npa"):
 
         client, collection = initialize_db()
 
+        # Нормализуем extra_metadata: все значения должны быть строками
+        _extra = {}
+        if extra_metadata:
+            for k, v in extra_metadata.items():
+                _extra[str(k)] = str(v) if v is not None else ""
+
+        # Поле "file" в метаданных протокола = имя файла для отображения источника
+        _file_label = _extra.get("file") or os.path.basename(file_path)
+
         ids, documents, metadatas = [], [], []
         for i, chunk in enumerate(chunks):
             doc_id = f"{os.path.basename(file_path)}_{i}"
             ids.append(doc_id)
             documents.append(chunk['text'])
-            metadatas.append({
+            chunk_meta = {
                 "filename":      chunk['metadata'].get('filename', ''),
                 "filepath":      chunk['metadata'].get('filepath', ''),
                 "category":      chunk['metadata'].get('category', ''),
@@ -493,8 +510,14 @@ def index_file(file_path, category="npa"):
                 "sphere":        _get_sphere_str(
                     chunk['metadata'].get('filename', chunk['metadata'].get('filepath', ''))
                 ),
-                "indexed_at":    datetime.now().isoformat()
-            })
+                "indexed_at":    datetime.now().isoformat(),
+                # Поле "file" — читаемое имя источника для советчика и прогнозиста
+                "file":          _file_label,
+            }
+            # Накладываем extra_metadata поверх стандартных полей
+            if _extra:
+                chunk_meta.update(_extra)
+            metadatas.append(chunk_meta)
 
         BATCH = 100
         for start in range(0, len(ids), BATCH):
@@ -508,6 +531,152 @@ def index_file(file_path, category="npa"):
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+def index_file_to_collection(
+    file_path: str,
+    collection_name: str = "tariff_docs",
+    extra_metadata: dict = None,
+):
+    """
+    Индексирует файл в указанную коллекцию ChromaDB.
+
+    Для коллекции «protocols» (прогнозист решений) передаются метаданные:
+      extra_metadata = {
+          "file":         "Протокол_Тамбов_2024-11-15.pdf",  # читаемое имя
+          "sphere":       "Теплоснабжение",
+          "region":       "Тамбовская область",
+          "organization": "ООО «ТеплоСеть»",
+          "date":         "2024-11-15",
+      }
+
+    Для коллекции «tariff_docs» (советчик) вызов эквивалентен index_file().
+    """
+    if collection_name == "tariff_docs":
+        return index_file(file_path, category="npa", extra_metadata=extra_metadata)
+
+    try:
+        if not LANGCHAIN_AVAILABLE:
+            return {"status": "error", "message": "LangChain не установлен"}
+
+        loader = get_loader(file_path)
+        if loader is None:
+            return {"status": "error", "message": "Неподдерживаемый формат"}
+
+        docs = loader.load()
+        settings = load_chunking_settings()
+
+        chunker = None
+        if CHUNKER_AVAILABLE:
+            try:
+                chunker = LegalDocumentChunker(
+                    max_chunk_chars=settings.get("max_chunk_length", 900),
+                    neighbor_radius=settings.get("neighbor_radius", 2),
+                )
+            except Exception as e:
+                print(f"[WARN] Чанкер для протоколов: {e}")
+
+        chunks = []
+        for doc in docs:
+            base_metadata = {
+                'filename':   os.path.basename(doc.metadata.get('source', '')),
+                'filepath':   doc.metadata.get('source', ''),
+                'category':   collection_name,
+                'doc_type':   detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
+                'indexed_at': datetime.now().isoformat(),
+            }
+            file_metadata = extract_metadata_from_filename(doc.metadata.get('source', ''), CONFIG_FILE)
+            base_metadata.update(file_metadata)
+            doc_chunks = apply_chunking(doc.page_content, base_metadata, settings, chunker)
+            chunks.extend(doc_chunks)
+
+        if not chunks:
+            return {"status": "error", "message": "Пустой файл или нет чанков после разбивки"}
+
+        # Получаем или создаём коллекцию
+        client = _get_chroma_client()
+        ef = get_embedding_function()
+        try:
+            collection = client.get_collection(name=collection_name, embedding_function=ef)
+        except Exception:
+            collection = client.create_collection(name=collection_name, embedding_function=ef)
+
+        # Нормализуем extra_metadata
+        _extra = {}
+        if extra_metadata:
+            for k, v in extra_metadata.items():
+                _extra[str(k)] = str(v) if v is not None else ""
+
+        _file_label = _extra.get("file") or os.path.basename(file_path)
+
+        ids, documents, metadatas = [], [], []
+        for i, chunk in enumerate(chunks):
+            doc_id = f"{collection_name}__{os.path.basename(file_path)}__{i}"
+            ids.append(doc_id)
+            documents.append(chunk['text'])
+            chunk_meta = {
+                "filename":    chunk['metadata'].get('filename', ''),
+                "filepath":    chunk['metadata'].get('filepath', ''),
+                "category":    collection_name,
+                "chunk_index": i,
+                "indexed_at":  datetime.now().isoformat(),
+                # Поле "file" — читаемое имя источника для прогнозиста
+                "file":        _file_label,
+                # Поля протокола (пустые строки если не переданы)
+                "sphere":       _extra.get("sphere", ""),
+                "region":       _extra.get("region", ""),
+                "organization": _extra.get("organization", ""),
+                "date":         _extra.get("date", ""),
+            }
+            metadatas.append(chunk_meta)
+
+        BATCH = 100
+        for start in range(0, len(ids), BATCH):
+            collection.upsert(
+                ids=ids[start:start+BATCH],
+                documents=documents[start:start+BATCH],
+                metadatas=metadatas[start:start+BATCH],
+            )
+
+        print(f"[INDEX] {os.path.basename(file_path)} → «{collection_name}»: {len(chunks)} чанков")
+        return {"status": "success", "chunks": len(chunks)}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def remove_file_from_protocols(filename: str):
+    """
+    Удаляет все чанки файла из коллекции protocols.
+    Используется при удалении протокола из Админки.
+    """
+    try:
+        client = _get_chroma_client()
+        ef = get_embedding_function()
+        try:
+            collection = client.get_collection(name="protocols", embedding_function=ef)
+        except Exception:
+            return {"status": "ok", "message": "Коллекция protocols не существует"}
+
+        results = collection.get(
+            where={"file": os.path.basename(filename)},
+            include=[],
+        )
+        ids_to_delete = results.get("ids", [])
+        if not ids_to_delete:
+            # Fallback: ищем по полю filename
+            results2 = collection.get(
+                where={"filename": os.path.basename(filename)},
+                include=[],
+            )
+            ids_to_delete = results2.get("ids", [])
+
+        if ids_to_delete:
+            collection.delete(ids=ids_to_delete)
+            return {"status": "success", "deleted": len(ids_to_delete)}
+        return {"status": "success", "deleted": 0}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 def index_category(category="npa"):
     """Индексирует всю категорию документов (для совместимости с app.py)"""

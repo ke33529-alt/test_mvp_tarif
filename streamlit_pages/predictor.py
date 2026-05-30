@@ -1,728 +1,993 @@
 # streamlit_pages/predictor.py
-import streamlit as st
-import pandas as pd
+"""
+Прогноз решения регулятора
+──────────────────────────────────────────────────────────────────────────────
+Логика:
+  1. Пользователь вводит статью затрат + описание/документы-обоснования
+  2. Запрос расширяется через QueryExpander (синонимы статей затрат)
+  3. Если приложен файл — сжимается через Map-Reduce (как в doc_scanner)
+  4. Векторный поиск по коллекции протоколов в ChromaDB (top-K чанков)
+  5. LLM классифицирует каждый чанк: положительное / отрицательное / нейтральное
+  6. Агрегация по файлам (1 файл = 1 голос, по большинству чанков)
+  7. Результат: счётчик за/против/нейтр + цитаты со свёрнутыми источниками
+  8. Сохранение в реестр прогнозов (data/predictor/registry_NNNN.jsonl)
+──────────────────────────────────────────────────────────────────────────────
+"""
+import io
 import json
 import os
-from datetime import datetime, timedelta
-import io
-from docx import Document as DocxDocument
-from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+import re
+import time
+import threading
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import streamlit as st
 
 # =============================================================================
-# Функции
+# Константы
 # =============================================================================
+_BASE_DIR        = os.path.join("data", "predictor")
+_REGISTRY_DIR    = _BASE_DIR
+_MAX_PER_FILE    = 1000
+_CHROMA_DIR      = os.path.join("data", "vector_db")
+_PROTOCOLS_COLLECTION = "protocols"
 
-def get_mock_regulator_decisions():
-    """Демо-данные решений регулятора по Тамбовской области"""
-    
-    return {
-        "region": "Тамбовская область",
-        "regulator": "Управление Федеральной службы по тарифам по Тамбовской области",
-        "decisions": [
-            {
-                "id": "dec_001",
-                "date": "2024-11-15",
-                "organization": "ООО «ТамбовТеплоСеть»",
-                "sphere": "heat_supply",
-                "article": "Амортизация",
-                "decision": "partial_approval",
-                "reduction_percent": 15,
-                "reason": "Отсутствует обоснование продления срока службы оборудования сверх нормативного",
-                "source": "Решение №ТБ-2024-089 от 15.11.2024",
-                "documents_required": ["Акт технической экспертизы", "Дефектная ведомость"]
-            },
-            {
-                "id": "dec_002",
-                "date": "2024-10-20",
-                "organization": "ООО «ТамбовВодоканал»",
-                "sphere": "water_supply",
-                "article": "Расходы на ремонт ОС",
-                "decision": "full_approval",
-                "reduction_percent": 0,
-                "reason": "Предоставлен полный пакет документов по каждому объекту ремонта",
-                "source": "Решение №ТБ-2024-076 от 20.10.2024",
-                "documents_required": []
-            },
-            {
-                "id": "dec_003",
-                "date": "2024-09-05",
-                "organization": "ООО «ТамбовЭнерго»",
-                "sphere": "heat_supply",
-                "article": "Численность персонала",
-                "decision": "partial_approval",
-                "reduction_percent": 25,
-                "reason": "Численность АУП превышает норматив по методике ФАС №1746-э",
-                "source": "Решение №ТБ-2024-063 от 05.09.2024",
-                "documents_required": ["Штатное расписание с обоснованием", "Должностные инструкции"]
-            },
-            {
-                "id": "dec_004",
-                "date": "2024-08-12",
-                "organization": "ООО «ТамбовТеплоСеть»",
-                "sphere": "heat_supply",
-                "article": "Электроэнергия на собственные нужды",
-                "decision": "full_approval",
-                "reduction_percent": 0,
-                "reason": "Расчёт соответствует методике, предоставлены показания приборов учёта",
-                "source": "Решение №ТБ-2024-051 от 12.08.2024",
-                "documents_required": []
-            },
-            {
-                "id": "dec_005",
-                "date": "2024-07-18",
-                "organization": "ООО «ТамбовКомСервис»",
-                "sphere": "waste_management",
-                "article": "Транспортирование ТКО",
-                "decision": "rejection",
-                "reduction_percent": 40,
-                "reason": "Заявленные затраты превышают средние по региону в 2.5 раза без обоснования",
-                "source": "Решение №ТБ-2024-042 от 18.07.2024",
-                "documents_required": ["Договоры с перевозчиками", "Путевые листы за 12 месяцев"]
-            },
-            {
-                "id": "dec_006",
-                "date": "2024-06-25",
-                "organization": "ООО «ТамбовВодоканал»",
-                "sphere": "water_supply",
-                "article": "Потери в сетях",
-                "decision": "partial_approval",
-                "reduction_percent": 20,
-                "reason": "Фактические потери превышают нормативные, не предоставлен план мероприятий по снижению",
-                "source": "Решение №ТБ-2024-035 от 25.06.2024",
-                "documents_required": ["Расчёт норматива потерь", "Инвестиционная программа по снижению потерь"]
-            },
-            {
-                "id": "dec_007",
-                "date": "2024-05-10",
-                "organization": "ООО «ТамбовТеплоСеть»",
-                "sphere": "heat_supply",
-                "article": "Заработная плата",
-                "decision": "full_approval",
-                "reduction_percent": 0,
-                "reason": "Фонд оплаты труда в пределах норматива, предоставлены штатное расписание и расчёт",
-                "source": "Решение №ТБ-2024-028 от 10.05.2024",
-                "documents_required": []
-            },
-            {
-                "id": "dec_008",
-                "date": "2024-04-15",
-                "organization": "ООО «ТамбовЭнерго»",
-                "sphere": "heat_supply",
-                "article": "Амортизация",
-                "decision": "partial_approval",
-                "reduction_percent": 30,
-                "reason": "Неверно применена классификация ОС, срок службы завышен",
-                "source": "Решение №ТБ-2024-019 от 15.04.2024",
-                "documents_required": ["Реестр ОС с группами", "Выписка из Классификатора ОС"]
-            }
+_LARGE_DOC_THRESHOLD = 12_000
+_CHUNK_SIZE          = 6_000
+_CHUNK_OVERLAP       = 300
+
+_DEFAULT_TOP_K = 30
+
+_REGISTRY_LOCK = threading.Lock()
+
+
+# =============================================================================
+# Загрузка настроек прогнозиста из Админки
+# =============================================================================
+_PRED_CFG_FILE = os.path.join("config", "predictor_config.json")
+_PRED_CFG_DEFAULTS = {
+    "chunk_chars_to_llm":  800,
+    "justification_chars": 200,
+    "classify_max_tokens": 100,
+    "default_top_k":       30,
+    "disable_thinking":    True,
+}
+
+
+def load_predictor_config() -> dict:
+    """Читает config/predictor_config.json, возвращает merged с defaults."""
+    if os.path.exists(_PRED_CFG_FILE):
+        try:
+            with open(_PRED_CFG_FILE, "r", encoding="utf-8") as f:
+                return {**_PRED_CFG_DEFAULTS, **json.load(f)}
+        except Exception:
+            pass
+    return dict(_PRED_CFG_DEFAULTS)
+
+
+# =============================================================================
+# Утилиты реестра (jsonl, ротация по 1000 записей)
+# =============================================================================
+def _ensure_dirs():
+    os.makedirs(_REGISTRY_DIR, exist_ok=True)
+
+
+def _current_registry_path() -> str:
+    """Возвращает путь к активному файлу реестра, создаёт новый при переполнении."""
+    _ensure_dirs()
+    idx = 1
+    while True:
+        path = os.path.join(_REGISTRY_DIR, f"registry_{idx:04d}.jsonl")
+        if not os.path.exists(path):
+            return path
+        # Считаем строки
+        with open(path, "r", encoding="utf-8") as f:
+            count = sum(1 for line in f if line.strip())
+        if count < _MAX_PER_FILE:
+            return path
+        idx += 1
+
+
+def save_to_registry(record: Dict):
+    """Дозаписывает запись в активный файл реестра."""
+    _ensure_dirs()
+    path = _current_registry_path()
+    with _REGISTRY_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_registry(max_records: int = 200) -> List[Dict]:
+    """Загружает последние max_records записей из всех файлов реестра."""
+    _ensure_dirs()
+    all_records = []
+    files = sorted(
+        [f for f in os.listdir(_REGISTRY_DIR) if f.startswith("registry_") and f.endswith(".jsonl")],
+        reverse=True,
+    )
+    for fname in files:
+        path = os.path.join(_REGISTRY_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            for line in reversed(lines):
+                try:
+                    all_records.append(json.loads(line))
+                except Exception:
+                    pass
+            if len(all_records) >= max_records:
+                break
+        except Exception:
+            pass
+    return all_records[:max_records]
+
+
+# =============================================================================
+# LM Studio — переиспользуем логику doc_scanner
+# =============================================================================
+def _load_lm_config() -> Tuple[str, str]:
+    config_path = os.path.join("config", "advisor_config.json")
+    config = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            pass
+    lm_url = config.get("lm_studio_url", "http://127.0.0.1:1234/v1")
+    model  = config.get("default_model", "qwen/qwen3.5-9b")
+    return lm_url, model
+
+
+def _strip_thinking(text: str) -> str:
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+
+def _lm_call(client, model: str, system: str, user: str, max_tokens: int = 600) -> str:
+    cfg = load_predictor_config()
+    _disable_thinking = bool(cfg.get("disable_thinking", True))
+    _kwargs = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
         ],
-        "statistics": {
-            "heat_supply": {
-                "Амортизация": {"full": 0, "partial": 2, "rejection": 0, "avg_reduction": 22.5},
-                "Расходы на ремонт ОС": {"full": 1, "partial": 0, "rejection": 0, "avg_reduction": 0},
-                "Численность персонала": {"full": 0, "partial": 1, "rejection": 0, "avg_reduction": 25},
-                "Электроэнергия на собственные нужды": {"full": 1, "partial": 0, "rejection": 0, "avg_reduction": 0},
-                "Заработная плата": {"full": 1, "partial": 0, "rejection": 0, "avg_reduction": 0},
-                "Потери в сетях": {"full": 0, "partial": 1, "rejection": 0, "avg_reduction": 20}
-            },
-            "water_supply": {
-                "Расходы на ремонт ОС": {"full": 1, "partial": 0, "rejection": 0, "avg_reduction": 0},
-                "Потери в сетях": {"full": 0, "partial": 1, "rejection": 0, "avg_reduction": 20}
-            },
-            "waste_management": {
-                "Транспортирование ТКО": {"full": 0, "partial": 0, "rejection": 1, "avg_reduction": 40}
-            }
+        max_tokens=max_tokens,
+        temperature=0.1,
+    )
+    if _disable_thinking:
+        _kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    try:
+        resp = client.chat.completions.create(**_kwargs)
+        raw = (resp.choices[0].message.content or "").strip()
+        return _strip_thinking(raw)
+    except Exception:
+        # Fallback без extra_body если модель не поддерживает параметр
+        _kwargs.pop("extra_body", None)
+        try:
+            resp = client.chat.completions.create(**_kwargs)
+            raw = (resp.choices[0].message.content or "").strip()
+            return _strip_thinking(raw)
+        except Exception as e2:
+            return f"[Ошибка LM: {e2}]"
+
+
+def _split_text_chunks(text: str) -> List[str]:
+    """Разбивает текст на чанки по границам абзацев (из doc_scanner)."""
+    if len(text) <= _CHUNK_SIZE:
+        return [text]
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + _CHUNK_SIZE
+        if end >= len(text):
+            tail = text[start:].strip()
+            if tail:
+                chunks.append(tail)
+            break
+        min_pos = start + _CHUNK_SIZE * 3 // 4
+        split_end = end
+        for sep in ('\n\n', '. ', ' '):
+            pos = text.rfind(sep, min_pos, end)
+            if pos != -1:
+                split_end = pos + len(sep)
+                break
+        chunk = text[start:split_end].strip()
+        if chunk:
+            chunks.append(chunk)
+        next_start = split_end - _CHUNK_OVERLAP
+        start = max(start + _CHUNK_SIZE // 2, next_start)
+    return chunks
+
+
+def compress_document(text: str, article_name: str, _progress_cb=None) -> str:
+    """
+    Сжимает текст документа-обоснования до краткого резюме через Map-Reduce.
+    Акцентирует на связи с конкретной статьёй затрат.
+    """
+    if not text.strip():
+        return ""
+    try:
+        from openai import OpenAI
+        lm_url, model = _load_lm_config()
+        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=180.0)
+        system_msg = (
+            "Ты эксперт по тарифному регулированию. "
+            "Кратко извлекай только факты, суммы и показатели, "
+            "относящиеся к статье затрат."
+        )
+
+        if len(text) <= _LARGE_DOC_THRESHOLD:
+            prompt = (
+                f"Извлеки ключевые факты из документа, относящиеся к статье затрат "
+                f'«{article_name}»: суммы, обоснования, нормативы, методику расчёта. '
+                f"Ответь кратко, 3-7 пунктов. Без вступлений.\n\nДОКУМЕНТ:\n{text}"
+            )
+            return _lm_call(client, model, system_msg, prompt, max_tokens=500)
+
+        # Map-Reduce для большого документа
+        chunks = _split_text_chunks(text)
+        total  = len(chunks)
+        mini_summaries = []
+        for i, chunk in enumerate(chunks, 1):
+            if _progress_cb:
+                _progress_cb((i - 1) / (total + 1), f"Сжатие документа: часть {i}/{total}…")
+            map_prompt = (
+                f"Часть {i} из {total} документа-обоснования.\n"
+                f'Извлеки только факты, относящиеся к статье затрат «{article_name}»: '
+                f"суммы, нормативы, методику. Если нет — напиши «нет данных».\n\n"
+                f"ЧАСТЬ:\n{chunk}"
+            )
+            mini = _lm_call(client, model, system_msg, map_prompt, max_tokens=300)
+            mini_summaries.append(f"=== Часть {i}/{total} ===\n{mini}")
+
+        if _progress_cb:
+            _progress_cb(total / (total + 1), "Финальный синтез…")
+
+        combined = "\n\n".join(mini_summaries)
+        reduce_prompt = (
+            f"Ниже — резюме частей документа. Создай единое краткое резюме (5-10 пунктов) "
+            f'по статье затрат «{article_name}». Сохрани все суммы и нормативы.\n\n'
+            f"РЕЗЮМЕ ЧАСТЕЙ:\n{combined}"
+        )
+        return _lm_call(client, model, system_msg, reduce_prompt, max_tokens=600)
+
+    except Exception as e:
+        return f"[Ошибка сжатия: {e}]"
+
+
+# =============================================================================
+# Извлечение текста из загруженного файла (переиспользуем doc_scanner)
+# =============================================================================
+def extract_file_text(file_bytes: bytes, filename: str) -> str:
+    """Извлекает текст из файла через логику doc_scanner."""
+    try:
+        from streamlit_pages.doc_scanner import extract_text
+        pages = extract_text(file_bytes, filename)
+        return "\n".join(p.get("text", "") for p in pages if p.get("text"))
+    except Exception as e:
+        return f"[Ошибка извлечения текста: {e}]"
+
+
+# =============================================================================
+# ChromaDB — поиск по коллекции протоколов
+# =============================================================================
+def _get_chroma_collection():
+    """
+    Возвращает коллекцию протоколов из ChromaDB.
+    Использует ту же E5EmbeddingFunction что и indexer.py —
+    без этого query-векторы несовместимы с индексированными passage-векторами.
+    """
+    try:
+        from core.indexer import get_embedding_function, _get_chroma_client
+        client = _get_chroma_client()
+        ef = get_embedding_function()
+        try:
+            return client.get_collection(
+                name=_PROTOCOLS_COLLECTION,
+                embedding_function=ef,
+            )
+        except Exception:
+            return None
+    except Exception as e:
+        print(f"[PREDICTOR] Ошибка подключения к ChromaDB: {e}")
+        return None
+
+
+def search_protocols(query: str, top_k: int = _DEFAULT_TOP_K,
+                     filters: Optional[Dict] = None) -> List[Dict]:
+    """
+    Векторный поиск по коллекции протоколов.
+    Возвращает список чанков с текстом и метаданными.
+    """
+    collection = _get_chroma_collection()
+    if collection is None:
+        return []
+
+    try:
+        where = {}
+        if filters:
+            clauses = []
+            if filters.get("sphere"):
+                clauses.append({"sphere": {"$eq": filters["sphere"]}})
+            if filters.get("region"):
+                clauses.append({"region": {"$eq": filters["region"]}})
+            if len(clauses) == 1:
+                where = clauses[0]
+            elif len(clauses) > 1:
+                where = {"$and": clauses}
+
+        kwargs = dict(query_texts=[query], n_results=top_k, include=["documents", "metadatas", "distances"])
+        if where:
+            kwargs["where"] = where
+
+        results = collection.query(**kwargs)
+
+        chunks = []
+        docs      = results.get("documents", [[]])[0]
+        metas     = results.get("metadatas",  [[]])[0]
+        distances = results.get("distances",  [[]])[0]
+
+        for doc, meta, dist in zip(docs, metas, distances):
+            chunks.append({
+                "text":         doc,
+                "file":         meta.get("file", ""),
+                "date":         meta.get("date", ""),
+                "sphere":       meta.get("sphere", ""),
+                "region":       meta.get("region", ""),
+                "organization": meta.get("organization", ""),
+                "distance":     dist,
+            })
+        return chunks
+
+    except Exception as e:
+        print(f"[PREDICTOR] Ошибка поиска: {e}")
+        return []
+
+
+# =============================================================================
+# Классификация чанка через LLM
+# =============================================================================
+# Короткий системный промпт — экономим токены контекста
+_CLASSIFY_SYSTEM = "Тарифный эксперт РФ. JSON только."
+
+
+def classify_chunk(chunk_text: str, article_name: str, justification_summary: str,
+                   client, model: str) -> Dict:
+    """
+    Классифицирует один чанк протокола.
+    Возвращает: {"decision": "positive"|"negative"|"neutral", "quote": str, "reason": str}
+    Параметры читаются из config/predictor_config.json (настраиваются в Админке).
+    """
+    cfg = load_predictor_config()
+    _chunk_chars   = int(cfg["chunk_chars_to_llm"])
+    _justify_chars = int(cfg["justification_chars"])
+    _max_tokens    = int(cfg["classify_max_tokens"])
+
+    _chunk   = chunk_text[:_chunk_chars]
+    _justify = justification_summary[:_justify_chars] if justification_summary and _justify_chars > 0 else ""
+
+    prompt = (
+        f"Статья: {article_name}\n"
+        + (f"Обоснование: {_justify}\n" if _justify else "")
+        + f"\nФрагмент:\n{_chunk}\n\n"
+        f"Решение регулятора по статье: positive/negative/neutral?\n"
+        f"positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
+        f'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
+    )
+    raw = _lm_call(client, model, _CLASSIFY_SYSTEM, prompt, max_tokens=_max_tokens)
+    # Парсим JSON
+    try:
+        # Убираем возможные обёртки ```json
+        clean = re.sub(r'```json|```', '', raw).strip()
+        data = json.loads(clean)
+        decision = data.get("decision", "neutral")
+        if decision not in ("positive", "negative", "neutral"):
+            decision = "neutral"
+        return {
+            "decision": decision,
+            "quote":    data.get("quote", chunk_text[:150]),
+            "reason":   data.get("reason", ""),
         }
-    }
-
-def get_risk_level(avg_reduction: float) -> str:
-    """Определяет уровень риска по среднему снижению"""
-    if avg_reduction == 0:
-        return "low"
-    elif avg_reduction < 15:
-        return "medium"
-    else:
-        return "high"
-
-def get_risk_label(level: str) -> str:
-    """Возвращает метку риска"""
-    labels = {
-        "high": "🔴 Высокий",
-        "medium": "🟡 Средний",
-        "low": "🟢 Низкий"
-    }
-    return labels.get(level, "⚪ Не определён")
-
-def get_overall_risk(article_risks: list) -> str:
-    """Определяет общий риск по всем статьям"""
-    if not article_risks:
-        return "medium"
-    
-    high_count = sum(1 for r in article_risks if r == "high")
-    medium_count = sum(1 for r in article_risks if r == "medium")
-    
-    if high_count >= 2:
-        return "high"
-    elif high_count >= 1 or medium_count >= 2:
-        return "medium"
-    else:
-        return "low"
-
-def get_accuracy_score(decisions_count: int) -> str:
-    """Оценивает точность прогноза по количеству кейсов"""
-    if decisions_count >= 5:
-        return "85-90%"
-    elif decisions_count >= 3:
-        return "75-85%"
-    elif decisions_count >= 1:
-        return "60-75%"
-    else:
-        return "Недостаточно данных"
-
-def generate_prediction_report(prediction_data, region):
-    """Генерирует отчёт в DOCX"""
-    
-    doc = DocxDocument()
-    
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Times New Roman'
-    font.size = Pt(14)
-    
-    # Заголовок
-    p = doc.add_paragraph("ПРОГНОЗ РЕШЕНИЯ РЕГУЛЯТОРА")
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.runs[0]
-    run.bold = True
-    run.font.size = Pt(16)
-    
-    doc.add_paragraph(f"Регион: {region}")
-    doc.add_paragraph(f"Дата прогноза: {datetime.now().strftime('%d.%m.%Y')}")
-    
-    doc.add_paragraph()
-    
-    # Общий риск
-    p = doc.add_paragraph(f"Общий риск снижения тарифа: {prediction_data['overall_risk_label']}")
-    run = p.runs[0]
-    run.bold = True
-    
-    doc.add_paragraph(f"Точность прогноза: {prediction_data['accuracy']}")
-    doc.add_paragraph(f"Проанализировано решений: {prediction_data['decisions_count']}")
-    
-    doc.add_paragraph()
-    doc.add_paragraph("-" * 80)
-    doc.add_paragraph()
-    
-    # Таблица по статьям
-    p = doc.add_paragraph("Анализ по статьям затрат:")
-    run = p.runs[0]
-    run.bold = True
-    
-    for article_data in prediction_data['articles']:
-        doc.add_paragraph()
-        p = doc.add_paragraph(f"Статья: {article_data['name']}")
-        run = p.runs[0]
-        run.bold = True
-        
-        doc.add_paragraph(f"Риск: {article_data['risk_label']}")
-        doc.add_paragraph(f"Вероятное снижение: {article_data['reduction']}")
-        doc.add_paragraph(f"Причина: {article_data['reason']}")
-        doc.add_paragraph(f"Источник: {article_data['source']}")
-        
-        if article_data['similar_cases'] > 0:
-            doc.add_paragraph(f"Похожих кейсов: {article_data['similar_cases']}")
-        
-        doc.add_paragraph()
-    
-    doc.add_paragraph("-" * 80)
-    doc.add_paragraph()
-    
-    # Исторические кейсы
-    p = doc.add_paragraph("Исторические кейсы:")
-    run = p.runs[0]
-    run.bold = True
-    
-    for case in prediction_data['cases'][:5]:
-        doc.add_paragraph()
-        doc.add_paragraph(f"Организация: {case['organization']}")
-        doc.add_paragraph(f"Дата: {case['date']}")
-        doc.add_paragraph(f"Статья: {case['article']}")
-        doc.add_paragraph(f"Решение: {case['decision_label']}")
-        doc.add_paragraph(f"Снижение: {case['reduction']}%")
-        doc.add_paragraph(f"Причина: {case['reason']}")
-        doc.add_paragraph(f"Источник: {case['source']}")
-    
-    output = io.BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output
-
-def load_analyzer_history():
-    """Загружает историю из Анализатора заявок"""
-    
-    history_file = os.path.join("data", "analyzer", "history.json")
-    if os.path.exists(history_file):
-        with open(history_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    # Демо-данные для примера
-    return {
-        "applications": [
-            {
-                "id": "app_001",
-                "date": "2025-01-15",
-                "organization": "ООО «ТамбовТеплоСеть»",
-                "sphere": "heat_supply",
-                "articles": [
-                    {"name": "Амортизация", "amount": 20000000, "documents": ["Реестр ОС"]},
-                    {"name": "Расходы на ремонт ОС", "amount": 5000000, "documents": ["Дефектная ведомость", "Смета"]},
-                    {"name": "Заработная плата", "amount": 15000000, "documents": ["Штатное расписание", "Расчёт ФОТ"]},
-                    {"name": "Электроэнергия на собственные нужды", "amount": 3000000, "documents": ["Показания приборов учёта"]}
-                ],
-                "total_amount": 43000000,
-                "status": "analyzed"
-            },
-            {
-                "id": "app_002",
-                "date": "2025-01-10",
-                "organization": "ООО «ТамбовВодоканал»",
-                "sphere": "water_supply",
-                "articles": [
-                    {"name": "Потери в сетях", "amount": 8000000, "documents": ["Расчёт норматива"]},
-                    {"name": "Расходы на ремонт ОС", "amount": 6000000, "documents": ["Акт выполненных работ", "Накладные"]},
-                    {"name": "Заработная плата", "amount": 12000000, "documents": ["Штатное расписание"]}
-                ],
-                "total_amount": 26000000,
-                "status": "analyzed"
-            }
-        ]
-    }
-
-# =============================================================================
-# Интерфейс Streamlit
-# =============================================================================
-
-def show_predictor():
-    """Страница прогноза решения регулятора"""
-    
-    st.header("Прогноз решения регулятора")
-    st.info("Выберите заявку и укажите статьи затрат — система оценит вероятность одобрения на основе истории решений регулятора")
-    
-    # Инициализация session_state
-    if "regulator_data" not in st.session_state:
-        st.session_state.regulator_data = get_mock_regulator_decisions()
-    if "analyzer_history" not in st.session_state:
-        st.session_state.analyzer_history = load_analyzer_history()
-    if "current_prediction" not in st.session_state:
-        st.session_state.current_prediction = None
-    if "selected_application" not in st.session_state:
-        st.session_state.selected_application = None
-    
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 1: Выбор заявки из Анализатора
-    # ─────────────────────────────────────────────────────────────────────
-    st.subheader("1. Выбор заявки")
-    
-    applications = st.session_state.analyzer_history.get("applications", [])
-    
-    if applications:
-        app_options = {}
-        for app in applications:
-            label = f"{app['date']} — {app['organization']} ({app['sphere']}) — {app['total_amount']:,.0f} ₽"
-            app_options[label] = app
-        
-        selected_label = st.selectbox(
-            "Выберите заявку из Анализатора",
-            list(app_options.keys()),
-            key="app_select"
-        )
-        
-        if selected_label:
-            st.session_state.selected_application = app_options[selected_label]
-    else:
-        st.warning("⚠️ Нет заявок в истории Анализатора. Сначала используйте раздел «Анализатор заявок».")
-        st.session_state.selected_application = None
-    
-    st.divider()
-    
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 2: Просмотр структуры заявки
-    # ─────────────────────────────────────────────────────────────────────
-    if st.session_state.selected_application:
-        st.subheader("2. Структура заявки")
-        
-        app = st.session_state.selected_application
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Организация", app['organization'][:20])
-        col2.metric("Сфера", {
-            "heat_supply": "🔥 Теплоснабжение",
-            "water_supply": "💧 Водоснабжение",
-            "waste_management": "🗑️ ТКО"
-        }.get(app['sphere'], app['sphere']))
-        col3.metric("Сумма", f"{app['total_amount']:,.0f} ₽")
-        
-        st.write("**📋 Статьи затрат:**")
-        
-        articles_df = pd.DataFrame([
-            {
-                "Статья": art['name'],
-                "Сумма (₽)": f"{art['amount']:,.0f}",
-                "Документы": ", ".join(art.get('documents', []))
-            }
-            for art in app['articles']
-        ])
-        
-        st.dataframe(articles_df, use_container_width=True, hide_index=True)
-        
-        # Кнопка анализа
-        st.divider()
-        st.subheader("3. Анализ")
-        
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            st.caption("💡 На основе истории решений регулятора по Тамбовской области")
-        
-        with col2:
-            analyze_btn = st.button("🔮 Рассчитать прогноз", use_container_width=True, type="primary", key="analyze_btn")
-        
-        if analyze_btn:
-            with st.spinner("🔄 Анализируем историю решений регулятора..."):
-                # Генерация прогноза
-                prediction = generate_prediction(app, st.session_state.regulator_data)
-                st.session_state.current_prediction = prediction
-                st.success("✅ Прогноз готов!")
-                st.rerun()
-    
-    # ─────────────────────────────────────────────────────────────────────
-    # Шаг 3: Результаты прогноза
-    # ─────────────────────────────────────────────────────────────────────
-    if st.session_state.current_prediction:
-        pred = st.session_state.current_prediction
-        
-        st.divider()
-        st.subheader("4. Результаты прогноза")
-        
-        # Общий риск
-        risk_color = {
-            "high": "🔴",
-            "medium": "🟡",
-            "low": "🟢"
-        }.get(pred['overall_risk'], "⚪")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric(
-                "Общий риск",
-                f"{risk_color} {pred['overall_risk_label']}",
-                delta=f"Точность: {pred['accuracy']}"
-            )
-        
-        with col2:
-            st.metric(
-                "Проанализировано решений",
-                pred['decisions_count'],
-                delta="по Тамбовской области"
-            )
-        
-        with col3:
-            st.metric(
-                "Период анализа",
-                "2024-2025",
-                delta="история решений"
-            )
-        
-        # Объяснение общего риска
-        st.info(f"**Почему {pred['overall_risk_label'].lower()}?** {pred['overall_reason']}")
-        
-        st.divider()
-        
-        # Таблица по статьям
-        st.subheader("📊 Анализ по статьям затрат")
-        
-        articles_df = pd.DataFrame([
-            {
-                "Статья": art['name'],
-                "Риск": art['risk_label'],
-                "Снижение": art['reduction'],
-                "Кейсов": art['similar_cases'],
-                "Причина": art['reason'][:80] + "..." if len(art['reason']) > 80 else art['reason']
-            }
-            for art in pred['articles']
-        ])
-        
-        # Сортировка по риску (высокий → низкий)
-        risk_order = {"🔴 Высокий": 0, "🟡 Средний": 1, "🟢 Низкий": 2}
-        articles_df["sort_key"] = articles_df["Риск"].map(risk_order)
-        articles_df = articles_df.sort_values("sort_key").drop("sort_key", axis=1)
-        
-        st.dataframe(articles_df, use_container_width=True, hide_index=True)
-        
-        # График рисков
-        st.divider()
-        st.subheader("📈 Визуализация рисков")
-        
-        # График 1: Распределение по уровням риска
-        risk_counts = {}
-        for art in pred['articles']:
-            risk = art['risk']
-            risk_counts[risk] = risk_counts.get(risk, 0) + 1
-        
-        if risk_counts:
-            chart_df = pd.DataFrame({
-                "Уровень риска": [get_risk_label(r) for r in risk_counts.keys()],
-                "Количество статей": list(risk_counts.values())
-            })
-            st.bar_chart(chart_df.set_index("Уровень риска"))
-        
-        # График 2: Статьи по убыванию риска
-        st.caption("📊 Статьи затрат по уровню риска (от высокого к низкому)")
-        
-        risk_chart_df = pd.DataFrame([
-            {
-                "Статья": art['name'][:20],
-                "Риск (0=высокий, 2=низкий)": {"high": 0, "medium": 1, "low": 2}.get(art['risk'], 1),
-                "Снижение %": art['reduction_percent']
-            }
-            for art in sorted(pred['articles'], key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x['risk'], 1))
-        ])
-        
-        st.bar_chart(risk_chart_df.set_index("Статья"))
-        
-        st.divider()
-        
-        # Исторические кейсы
-        st.subheader("📚 Исторические кейсы с похожими решениями")
-        
-        for i, case in enumerate(pred['cases'][:5], 1):
-            with st.expander(f"📄 Кейс {i}: {case['organization']} ({case['date'][:10]})", expanded=(i<=2)):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write(f"**Статья:** {case['article']}")
-                    st.write(f"**Решение:** {case['decision_label']}")
-                    st.write(f"**Снижение:** {case['reduction']}%")
-                
-                with col2:
-                    st.write(f"**Дата:** {case['date']}")
-                    st.write(f"**Сфера:** {case['sphere']}")
-                    st.write(f"**Точность:** {case['accuracy']}")
-                
-                st.write(f"**Причина:** {case['reason']}")
-                st.write(f"**Источник:** {case['source']}")
-                
-                if case.get('documents_required'):
-                    st.write(f"**Требовались документы:** {', '.join(case['documents_required'])}")
-        
-        st.divider()
-        
-        # Экспорт
-        st.subheader("5. Экспорт")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            docx_output = generate_prediction_report(pred, "Тамбовская область")
-            filename = f"Predictor_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-            
-            st.download_button(
-                label="📥 Скачать DOCX",
-                data=docx_output,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True
-            )
-        
-        with col2:
-            if st.button("📄 Экспорт в PDF", use_container_width=True):
-                st.info("🚧 Функция в разработке (требуется дополнительная библиотека)")
-        
-        # Пересчёт
-        st.divider()
-        st.subheader("6. Пересчёт")
-        
-        st.caption("🔄 Загрузите новые документы для пересчёта прогноза")
-        
-        uploaded_files = st.file_uploader(
-            "Загрузить дополнительные документы",
-            type=['pdf', 'docx', 'xlsx', 'txt'],
-            accept_multiple_files=True,
-            key="predictor_upload"
-        )
-        
-        if uploaded_files:
-            if st.button("🔄 Пересчитать прогноз", use_container_width=True):
-                st.session_state.current_prediction = None
-                st.success("✅ Документы загружены. Нажмите «Рассчитать прогноз» для пересчёта.")
-                st.rerun()
-    
-    else:
-        st.info("👈 Выберите заявку и нажмите «Рассчитать прогноз»")
-    
-    # ─────────────────────────────────────────────────────────────────────
-    # Справка
-    # ─────────────────────────────────────────────────────────────────────
-    with st.expander("💡 Как использовать", expanded=False):
-        st.write("""
-**Назначение:**
-
-Предсказание решения регулятора анализирует вашу заявку на основе истории решений регулятора по Тамбовской области и показывает:
-- Общий риск снижения тарифа (высокий/средний/низкий)
-- Риск по каждой статье затрат
-- Исторические кейсы с похожими решениями
-- Точность прогноза на основе количества проанализированных решений
-
-**Как работает:**
-
-1. Выберите заявку из Анализатора заявок
-2. Нажмите «Рассчитать прогноз»
-3. Система сравнит ваши статьи затрат с историей решений регулятора
-4. Получите прогноз с объяснением причин и ссылками на источники
-
-**Источники данных:**
-
-- Решения Управления Федеральной службы по тарифам по Тамбовской области (2024-2025)
-- Практика ФАС России по аналогичным вопросам
-- Открытые данные о тарифных кампаниях в регионе
-
-**Точность прогноза:**
-
-- 85-90%: при 5+ похожих кейсах в истории
-- 75-85%: при 3-5 кейсах
-- 60-75%: при 1-3 кейсах
-- Недостаточно данных: менее 1 кейса
-
-**Важно:**
-
-- Прогноз носит информационный характер и не является гарантией решения регулятора
-- Точность повышается с накоплением истории решений
-- Регион анализа: Тамбовская область (в MVP)
-        """)
-
-def generate_prediction(application, regulator_data):
-    """Генерирует прогноз на основе заявки и данных регулятора"""
-    
-    sphere = application.get('sphere', 'heat_supply')
-    articles = application.get('articles', [])
-    
-    stats = regulator_data.get('statistics', {}).get(sphere, {})
-    decisions = regulator_data.get('decisions', [])
-    
-    article_predictions = []
-    article_risks = []
-    
-    for article in articles:
-        article_name = article['name']
-        
-        # Поиск статистики по статье
-        article_stats = stats.get(article_name, {})
-        
-        if article_stats:
-            full = article_stats.get('full', 0)
-            partial = article_stats.get('partial', 0)
-            rejection = article_stats.get('rejection', 0)
-            avg_reduction = article_stats.get('avg_reduction', 0)
-            total = full + partial + rejection
-            
-            # Определение риска
-            risk = get_risk_level(avg_reduction)
-            risk_label = get_risk_label(risk)
-            
-            # Поиск похожих решений
-            similar_cases = [
-                d for d in decisions 
-                if d.get('sphere') == sphere and d.get('article') == article_name
-            ]
-            
-            # Причина
-            if similar_cases:
-                reason = similar_cases[0].get('reason', 'Нет данных')
-                source = similar_cases[0].get('source', 'Нет данных')
-            else:
-                reason = 'Нет похожих решений в истории'
-                source = '—'
-            
-            article_predictions.append({
-                'name': article_name,
-                'amount': article.get('amount', 0),
-                'risk': risk,
-                'risk_label': risk_label,
-                'reduction': f"{avg_reduction}%" if avg_reduction > 0 else "Не ожидается",
-                'reduction_percent': avg_reduction,
-                'similar_cases': len(similar_cases),
-                'reason': reason,
-                'source': source
-            })
-            
-            article_risks.append(risk)
+    except Exception:
+        # Fallback: пробуем угадать по ключевым словам
+        text_lower = raw.lower()
+        if "positive" in text_lower:
+            decision = "positive"
+        elif "negative" in text_lower:
+            decision = "negative"
         else:
-            # Нет статистики по статье
-            article_predictions.append({
-                'name': article_name,
-                'amount': article.get('amount', 0),
-                'risk': 'medium',
-                'risk_label': '🟡 Средний',
-                'reduction': 'Нет данных',
-                'reduction_percent': 0,
-                'similar_cases': 0,
-                'reason': 'Нет истории решений по этой статье в регионе',
-                'source': '—'
-            })
-            article_risks.append('medium')
-    
-    # Общий риск
-    overall_risk = get_overall_risk(article_risks)
-    overall_risk_label = get_risk_label(overall_risk)
-    
-    # Объяснение общего риска
-    if overall_risk == 'high':
-        overall_reason = f"Выявлено {sum(1 for r in article_risks if r == 'high')} статей с высоким риском снижения на основе истории решений регулятора."
-    elif overall_risk == 'medium':
-        overall_reason = f"Выявлено {sum(1 for r in article_risks if r == 'medium')} статей со средним риском. Требуется дополнительная проработка документов."
-    else:
-        overall_reason = "Все статьи затрат имеют низкий риск на основе положительной истории решений регулятора."
-    
-    # Исторические кейсы
-    cases = []
-    for decision in decisions[:5]:
-        decision_label = {
-            'full_approval': '✅ Полное одобрение',
-            'partial_approval': '⚠️ Частичное одобрение',
-            'rejection': '❌ Отклонение'
-        }.get(decision.get('decision'), decision.get('decision'))
-        
-        cases.append({
-            'organization': decision.get('organization', ''),
-            'date': decision.get('date', ''),
-            'sphere': decision.get('sphere', ''),
-            'article': decision.get('article', ''),
-            'decision_label': decision_label,
-            'reduction': decision.get('reduction_percent', 0),
-            'reason': decision.get('reason', ''),
-            'source': decision.get('source', ''),
-            'documents_required': decision.get('documents_required', []),
-            'accuracy': get_accuracy_score(1)
-        })
-    
-    # Подсчёт общего количества решений
-    decisions_count = len([d for d in decisions if d.get('sphere') == sphere])
-    
+            decision = "neutral"
+        return {"decision": decision, "quote": chunk_text[:150], "reason": raw[:100]}
+
+
+# =============================================================================
+# Агрегация: 1 файл = 1 голос (по большинству чанков внутри файла)
+# =============================================================================
+def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
+    """
+    Группирует чанки по файлу и определяет решение каждого файла
+    по большинству голосов среди его чанков.
+    Возвращает:
+      {
+        "positive": [{"file": ..., "quote": ..., "reason": ..., "date": ..., ...}, ...],
+        "negative": [...],
+        "neutral":  [...],
+        "total_files": int,
+      }
+    """
+    from collections import defaultdict, Counter
+
+    # Группировка по файлу
+    by_file: Dict[str, List[Dict]] = defaultdict(list)
+    for chunk in classified_chunks:
+        fname = chunk.get("file") or "неизвестный файл"
+        by_file[fname].append(chunk)
+
+    result = {"positive": [], "negative": [], "neutral": [], "total_files": 0}
+
+    for fname, chunks in by_file.items():
+        # Считаем голоса
+        counter = Counter(c["decision"] for c in chunks)
+        # Определяем победившее решение
+        decision = counter.most_common(1)[0][0]
+
+        # Берём лучшую цитату — от чанка с победившим решением
+        best_chunk = next(
+            (c for c in chunks if c["decision"] == decision), chunks[0]
+        )
+
+        file_record = {
+            "file":         fname,
+            "date":         best_chunk.get("date", ""),
+            "sphere":       best_chunk.get("sphere", ""),
+            "region":       best_chunk.get("region", ""),
+            "organization": best_chunk.get("organization", ""),
+            "quote":        best_chunk.get("quote", ""),
+            "reason":       best_chunk.get("reason", ""),
+            "chunks_total": len(chunks),
+            "chunks_decision": dict(counter),
+        }
+        result[decision].append(file_record)
+        result["total_files"] += 1
+
+    return result
+
+
+# =============================================================================
+# Основная функция прогноза
+# =============================================================================
+def run_prediction(
+    article_name: str,
+    justification_text: str,
+    top_k: int = None,
+    filters: Optional[Dict] = None,
+    _progress_cb=None,
+) -> Optional[Dict]:
+    """
+    Запускает полный цикл прогноза. Возвращает dict с результатами или None при ошибке.
+    """
+    if not article_name.strip():
+        return None
+
+    # Читаем top_k из конфига если не передан явно
+    if top_k is None:
+        top_k = int(load_predictor_config().get("default_top_k", _DEFAULT_TOP_K))
+
+    # 1. Расширяем запрос
+    if _progress_cb:
+        _progress_cb(0.05, "Расширение поискового запроса…")
+    try:
+        from core.query_expander import expand_query
+        query_variants = expand_query(article_name)
+        # Добавляем обоснование в запрос если оно короткое
+        if justification_text and len(justification_text) <= 500:
+            search_query = f"{article_name} {justification_text}"
+        else:
+            search_query = " ".join(query_variants[:3])
+    except Exception:
+        search_query = article_name
+
+    # 2. Сжимаем обоснование если длинное
+    justification_summary = justification_text
+    if justification_text and len(justification_text) > _LARGE_DOC_THRESHOLD:
+        if _progress_cb:
+            _progress_cb(0.1, "Сжатие документа-обоснования…")
+        justification_summary = compress_document(
+            justification_text, article_name,
+            _progress_cb=lambda p, m: _progress_cb(0.1 + p * 0.2, m) if _progress_cb else None,
+        )
+
+    # 3. Поиск по ChromaDB
+    if _progress_cb:
+        _progress_cb(0.32, f"Поиск по протоколам (top-{top_k})…")
+    chunks = search_protocols(search_query, top_k=top_k, filters=filters)
+
+    if not chunks:
+        return {
+            "article":    article_name,
+            "query":      search_query,
+            "chunks":     [],
+            "aggregated": {"positive": [], "negative": [], "neutral": [], "total_files": 0},
+            "error":      "Протоколы не найдены. Проверьте, загружена ли коллекция в Админке.",
+        }
+
+    # 4. Классификация чанков через LLM
+    if _progress_cb:
+        _progress_cb(0.40, f"Классификация {len(chunks)} фрагментов…")
+    try:
+        from openai import OpenAI
+        lm_url, model = _load_lm_config()
+        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=180.0)
+    except Exception as e:
+        return {"error": f"LM Studio недоступен: {e}", "article": article_name}
+
+    classified = []
+    total = len(chunks)
+    for i, chunk in enumerate(chunks):
+        if _progress_cb:
+            pct = 0.40 + (i / total) * 0.50
+            _progress_cb(pct, f"Классифицирую фрагмент {i + 1} / {total}…")
+        classification = classify_chunk(
+            chunk["text"], article_name, justification_summary, client, model
+        )
+        classified.append({**chunk, **classification})
+
+    # 5. Агрегация по файлам
+    if _progress_cb:
+        _progress_cb(0.92, "Агрегация результатов…")
+    aggregated = aggregate_by_file(classified)
+
     return {
-        'overall_risk': overall_risk,
-        'overall_risk_label': overall_risk_label,
-        'overall_reason': overall_reason,
-        'accuracy': get_accuracy_score(decisions_count),
-        'decisions_count': decisions_count,
-        'articles': article_predictions,
-        'cases': cases
+        "article":              article_name,
+        "query":                search_query,
+        "justification_summary": justification_summary,
+        "chunks_raw":           len(chunks),
+        "aggregated":           aggregated,
+        "timestamp":            datetime.now().isoformat(),
+        "top_k":                top_k,
+        "filters":              filters or {},
     }
 
-# =============================================================================
-# Запуск
-# =============================================================================
 
+# =============================================================================
+# UI — счётчик-бейдж (цветной)
+# =============================================================================
+def _badge(label: str, count: int, color: str) -> str:
+    return (
+        f"<span style='display:inline-block;padding:3px 12px;border-radius:12px;"
+        f"background:{color};color:#fff;font-weight:600;font-size:0.9rem;margin-right:6px'>"
+        f"{label}: {count}</span>"
+    )
+
+
+def _source_card(record: Dict, idx: int, decision: str) -> None:
+    """Отображает одну карточку-источник в свёрнутом виде (как в советчике)."""
+    color_map = {"positive": "#2e7a50", "negative": "#b33a3a", "neutral": "#888"}
+    border_color = color_map.get(decision, "#888")
+
+    header = record.get("file", "неизвестный файл")
+    if record.get("date"):
+        header += f"  ·  {record['date']}"
+    if record.get("organization"):
+        header += f"  ·  {record['organization']}"
+
+    with st.expander(header, expanded=False):
+        # Цитата
+        quote = record.get("quote", "")
+        if quote:
+            st.markdown(
+                f"<div style='border-left:3px solid {border_color};"
+                f"padding:8px 12px;background:#f8f9fa;"
+                f"border-radius:0 6px 6px 0;font-style:italic;"
+                f"font-size:0.88rem;margin-bottom:8px;'>"
+                f"{quote}</div>",
+                unsafe_allow_html=True,
+            )
+        # Причина
+        if record.get("reason"):
+            st.caption(f"Обоснование: {record['reason']}")
+        # Метаданные
+        meta_parts = []
+        if record.get("sphere"):
+            meta_parts.append(f"Сфера: {record['sphere']}")
+        if record.get("region"):
+            meta_parts.append(f"Регион: {record['region']}")
+        chunks_info = record.get("chunks_decision", {})
+        if chunks_info:
+            parts_str = " / ".join(
+                f"{k}: {v}" for k, v in chunks_info.items()
+            )
+            meta_parts.append(f"Фрагментов ({parts_str})")
+        if meta_parts:
+            st.caption("  ·  ".join(meta_parts))
+
+
+# =============================================================================
+# Страница реестра
+# =============================================================================
+def _show_registry():
+    st.subheader("Реестр прогнозов")
+
+    records = load_registry(max_records=500)
+    if not records:
+        st.info("Реестр пуст — запустите первый прогноз.")
+        return
+
+    # Фильтры
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        filter_article = st.text_input("Фильтр по статье", key="reg_filter_article")
+    with col2:
+        filter_org = st.text_input("Фильтр по организации", key="reg_filter_org")
+    with col3:
+        filter_date = st.text_input("Фильтр по дате (ГГГГ-ММ)", key="reg_filter_date")
+
+    # Применяем фильтры
+    filtered = records
+    if filter_article.strip():
+        filtered = [r for r in filtered if filter_article.lower() in r.get("article", "").lower()]
+    if filter_org.strip():
+        filtered = [
+            r for r in filtered
+            if filter_org.lower() in json.dumps(r.get("aggregated", {}), ensure_ascii=False).lower()
+        ]
+    if filter_date.strip():
+        filtered = [r for r in filtered if r.get("timestamp", "").startswith(filter_date)]
+
+    st.caption(f"Показано: {len(filtered)} из {len(records)}")
+    st.divider()
+
+    # Пагинация (по 20 записей)
+    page_size = 20
+    total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+    page_num = st.number_input("Страница", min_value=1, max_value=total_pages,
+                                value=1, key="reg_page")
+    start = (page_num - 1) * page_size
+    page_records = filtered[start: start + page_size]
+
+    for rec in page_records:
+        agg = rec.get("aggregated", {})
+        pos = len(agg.get("positive", []))
+        neg = len(agg.get("negative", []))
+        neu = len(agg.get("neutral",  []))
+
+        ts  = rec.get("timestamp", "")[:16].replace("T", " ")
+        lbl = f"{ts}  ·  {rec.get('article', '—')}"
+
+        with st.expander(lbl, expanded=False):
+            st.markdown(
+                _badge("За", pos, "#2e7a50")
+                + _badge("Против", neg, "#b33a3a")
+                + _badge("Нейтр.", neu, "#888"),
+                unsafe_allow_html=True,
+            )
+            st.caption(f"Запрос: {rec.get('query', '—')[:120]}")
+            if rec.get("filters"):
+                st.caption(f"Фильтры: {rec['filters']}")
+
+
+# =============================================================================
+# Главная страница прогнозиста
+# =============================================================================
+def show_predictor():
+    st.header("Прогноз решения регулятора")
+    st.info(
+        "Введите статью затрат и обоснование — система найдёт аналогичные случаи "
+        "в протоколах и экспертных заключениях регуляторов и оценит вероятность одобрения."
+    )
+
+    # ── session_state ────────────────────────────────────────────────────────
+    for key, val in [
+        ("pred_result",       None),
+        ("pred_running",      False),
+        ("pred_doc_text",     ""),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+    # ── Вкладки ──────────────────────────────────────────────────────────────
+    tab_predict, tab_registry = st.tabs(["Прогноз", "Реестр прогнозов"])
+
+    with tab_predict:
+        _show_predict_tab()
+
+    with tab_registry:
+        _show_registry()
+
+
+# =============================================================================
+# Вкладка «Прогноз»
+# =============================================================================
+def _show_predict_tab():
+    # ── Шаг 1: Статья затрат ─────────────────────────────────────────────────
+    st.subheader("1. Статья затрат")
+    article_name = st.text_input(
+        "Наименование статьи",
+        placeholder="Например: Заработная плата, Амортизация, Расходы на ремонт ОС",
+        key="pred_article",
+    )
+
+    # ── Шаг 2: Документы-обоснования ─────────────────────────────────────────
+    st.subheader("2. Документы-обоснования")
+    st.caption(
+        "Опишите обоснование текстом и/или приложите файл. "
+        "Большие документы будут автоматически сжаты."
+    )
+
+    input_method = st.radio(
+        "Способ ввода",
+        ["Текстом", "Загрузить файл", "Из Сканера документов"],
+        horizontal=True,
+        key="pred_input_method",
+    )
+
+    justification_text = ""
+
+    if input_method == "Текстом":
+        justification_text = st.text_area(
+            "Описание обоснования",
+            height=160,
+            placeholder=(
+                "Опишите документы и суть обоснования: "
+                "какие нормативы применялись, какие расчёты выполнены, "
+                "какие документы прилагаются..."
+            ),
+            key="pred_justification_text",
+        )
+
+    elif input_method == "Загрузить файл":
+        uploaded = st.file_uploader(
+            "Загрузите документ-обоснование",
+            type=["pdf", "docx", "doc", "txt", "xlsx"],
+            key="pred_upload",
+        )
+        if uploaded:
+            with st.spinner("Извлекаю текст из файла…"):
+                raw_text = extract_file_text(uploaded.read(), uploaded.name)
+            st.session_state.pred_doc_text = raw_text
+            st.success(f"Файл прочитан: {len(raw_text):,} символов")
+            preview = raw_text[:500]
+            with st.expander("Предпросмотр текста"):
+                st.text(preview + ("…" if len(raw_text) > 500 else ""))
+        justification_text = st.session_state.get("pred_doc_text", "")
+
+        # Дополнительный текст
+        extra = st.text_area(
+            "Дополнительное описание (опционально)",
+            height=80,
+            key="pred_extra_text",
+        )
+        if extra.strip():
+            justification_text = (justification_text + "\n\n" + extra).strip()
+
+    elif input_method == "Из Сканера документов":
+        try:
+            from streamlit_pages.doc_scanner import load_db as load_scan_db, _fname
+            scan_db = load_scan_db()
+            docs = scan_db.get("documents", [])
+        except Exception:
+            docs = []
+
+        if not docs:
+            st.warning("База Сканера пуста. Загрузите документы в разделе «Сканер документов».")
+        else:
+            doc_options = {_fname(d): d for d in docs}
+            selected_name = st.selectbox(
+                "Выберите документ",
+                list(doc_options.keys()),
+                key="pred_scanner_select",
+            )
+            if selected_name:
+                selected_doc = doc_options[selected_name]
+                scan_text = selected_doc.get("full_text", "")
+                if not scan_text:
+                    scan_text = "\n".join(
+                        p.get("text", "") for p in selected_doc.get("pages", [])
+                    )
+                st.session_state.pred_doc_text = scan_text
+                st.caption(f"Объём: {len(scan_text):,} символов · {selected_doc.get('word_count', 0):,} слов")
+                justification_text = scan_text
+
+    # ── Шаг 3: Фильтры ───────────────────────────────────────────────────────
+    st.subheader("3. Фильтры (опционально)")
+    col1, col2 = st.columns(2)
+    with col1:
+        filter_sphere = st.text_input(
+            "Сфера регулирования",
+            placeholder="теплоснабжение, водоснабжение, электроэнергетика…",
+            key="pred_filter_sphere",
+        )
+    with col2:
+        filter_region = st.text_input(
+            "Регион",
+            placeholder="Тамбовская область, Московская область…",
+            key="pred_filter_region",
+        )
+
+    # ── Шаг 4: Настройки поиска ───────────────────────────────────────────────
+    with st.expander("Настройки поиска", expanded=False):
+        top_k = st.slider(
+            "Количество источников (top-K)",
+            min_value=5,
+            max_value=100,
+            value=_DEFAULT_TOP_K,
+            step=5,
+            key="pred_top_k",
+            help="Сколько фрагментов протоколов извлекается перед классификацией",
+        )
+
+    # ── Кнопка запуска ────────────────────────────────────────────────────────
+    st.divider()
+    run_disabled = not article_name.strip()
+    if st.button(
+        "Рассчитать прогноз",
+        type="primary",
+        disabled=run_disabled,
+        use_container_width=True,
+        key="pred_run_btn",
+    ):
+        if not article_name.strip():
+            st.warning("Введите наименование статьи затрат.")
+        else:
+            # Сохраняем параметры для запуска
+            st.session_state.pred_result  = None
+            st.session_state.pred_running = True
+            st.session_state._pred_params = {
+                "article":       article_name,
+                "justification": justification_text,
+                "top_k":         top_k,
+                "filters": {
+                    k: v for k, v in {
+                        "sphere": filter_sphere.strip(),
+                        "region": filter_region.strip(),
+                    }.items() if v
+                },
+            }
+            st.rerun()
+
+    # ── Запуск прогноза ───────────────────────────────────────────────────────
+    if st.session_state.get("pred_running") and st.session_state.get("_pred_params"):
+        params = st.session_state._pred_params
+        progress_bar  = st.progress(0.0, text="Запуск…")
+        status_text   = st.empty()
+
+        def _progress(pct: float, msg: str):
+            progress_bar.progress(min(pct, 0.99), text=msg)
+            status_text.caption(msg)
+
+        with st.spinner("Анализирую протоколы регулятора…"):
+            result = run_prediction(
+                article_name      = params["article"],
+                justification_text= params["justification"],
+                top_k             = params["top_k"],
+                filters           = params["filters"],
+                _progress_cb      = _progress,
+            )
+
+        progress_bar.progress(1.0, text="Готово")
+        st.session_state.pred_result  = result
+        st.session_state.pred_running = False
+
+        # Сохраняем в реестр
+        if result and not result.get("error"):
+            registry_record = {
+                "timestamp": result.get("timestamp", datetime.now().isoformat()),
+                "article":   result.get("article", ""),
+                "query":     result.get("query", ""),
+                "filters":   result.get("filters", {}),
+                "aggregated_summary": {
+                    "positive": len(result["aggregated"]["positive"]),
+                    "negative": len(result["aggregated"]["negative"]),
+                    "neutral":  len(result["aggregated"]["neutral"]),
+                    "total_files": result["aggregated"]["total_files"],
+                },
+                "sources": [
+                    {"file": r["file"], "decision": d}
+                    for d in ("positive", "negative", "neutral")
+                    for r in result["aggregated"].get(d, [])
+                ],
+            }
+            save_to_registry(registry_record)
+
+        st.rerun()
+
+    # ── Отображение результатов ───────────────────────────────────────────────
+    result = st.session_state.get("pred_result")
+    if result is None:
+        st.info("Введите данные и нажмите «Рассчитать прогноз».")
+        return
+
+    if result.get("error"):
+        st.error(result["error"])
+        return
+
+    agg  = result["aggregated"]
+    pos  = agg.get("positive", [])
+    neg  = agg.get("negative", [])
+    neu  = agg.get("neutral",  [])
+    total = agg.get("total_files", 0)
+
+    st.divider()
+    st.subheader("Результаты")
+
+    # ── Счётчик ───────────────────────────────────────────────────────────────
+    st.markdown(
+        _badge("За", len(pos), "#2e7a50")
+        + _badge("Против", len(neg), "#b33a3a")
+        + _badge("Нейтрально", len(neu), "#888")
+        + f"<span style='color:#666;font-size:0.85rem;margin-left:8px'>"
+        f"Уникальных источников: {total} · Фрагментов в поиске: {result.get('chunks_raw', 0)}</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    # Процентный вывод
+    if total > 0:
+        pct_pos = round(len(pos) / total * 100)
+        pct_neg = round(len(neg) / total * 100)
+        pct_neu = round(len(neu) / total * 100)
+        st.progress(len(pos) / total)
+        st.caption(
+            f"По аналогичным случаям в протоколах: "
+            f"одобрено — {pct_pos}%, отклонено — {pct_neg}%, нейтрально — {pct_neu}%"
+        )
+
+    st.divider()
+
+    # ── Источники — положительные ─────────────────────────────────────────────
+    if pos:
+        st.markdown(
+            "<div style='color:#2e7a50;font-weight:600;font-size:1rem;margin-bottom:6px'>"
+            "Одобрено / включено</div>",
+            unsafe_allow_html=True,
+        )
+        for i, rec in enumerate(pos):
+            _source_card(rec, i, "positive")
+        st.markdown("")
+
+    # ── Источники — отрицательные ─────────────────────────────────────────────
+    if neg:
+        st.markdown(
+            "<div style='color:#b33a3a;font-weight:600;font-size:1rem;margin-bottom:6px'>"
+            "Отклонено / снижено</div>",
+            unsafe_allow_html=True,
+        )
+        for i, rec in enumerate(neg):
+            _source_card(rec, i, "negative")
+        st.markdown("")
+
+    # ── Источники — нейтральные ───────────────────────────────────────────────
+    if neu:
+        st.markdown(
+            "<div style='color:#888;font-weight:600;font-size:1rem;margin-bottom:6px'>"
+            "Нейтральные упоминания</div>",
+            unsafe_allow_html=True,
+        )
+        for i, rec in enumerate(neu):
+            _source_card(rec, i, "neutral")
+
+    if not pos and not neg and not neu:
+        st.warning("По данной статье затрат не найдено релевантных фрагментов в протоколах.")
+
+    # ── Запрос и сжатое обоснование ───────────────────────────────────────────
+    with st.expander("Детали поиска", expanded=False):
+        st.caption(f"Поисковый запрос: {result.get('query', '—')}")
+        if result.get("justification_summary") and result["justification_summary"] != result.get("justification_text"):
+            st.markdown("**Сжатое обоснование:**")
+            st.text(result["justification_summary"][:800])
+
+    # ── Сброс ─────────────────────────────────────────────────────────────────
+    st.divider()
+    if st.button("Новый прогноз", key="pred_reset_btn"):
+        for k in ["pred_result", "pred_running", "_pred_params", "pred_doc_text"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
+
+# =============================================================================
+# Точка входа
+# =============================================================================
 if __name__ == "__main__":
     show_predictor()
