@@ -66,6 +66,33 @@ def load_predictor_config() -> dict:
     return dict(_PRED_CFG_DEFAULTS)
 
 
+_PROMPTS_FILE = os.path.join("config", "prompts.json")
+_PRED_PROMPT_DEFAULTS = {
+    "predictor_classify_system": "Тарифный эксперт РФ. JSON только.",
+    "predictor_classify_user": (
+        "Статья: {article_name}\n"
+        "{justification_line}"
+        "\nФрагмент:\n{chunk}\n\n"
+        "Решение регулятора по статье: positive/negative/neutral?\n"
+        "positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
+        'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
+    ),
+}
+
+
+def load_predictor_prompts() -> dict:
+    """Читает промпты прогнозиста из config/prompts.json."""
+    if os.path.exists(_PROMPTS_FILE):
+        try:
+            with open(_PROMPTS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            return {**_PRED_PROMPT_DEFAULTS,
+                    **{k: saved[k] for k in _PRED_PROMPT_DEFAULTS if k in saved}}
+        except Exception:
+            pass
+    return dict(_PRED_PROMPT_DEFAULTS)
+
+
 # =============================================================================
 # Утилиты реестра (jsonl, ротация по 1000 записей)
 # =============================================================================
@@ -157,8 +184,13 @@ def _lm_call(client, model: str, system: str, user: str, max_tokens: int = 600) 
         max_tokens=max_tokens,
         temperature=0.1,
     )
+    # cache_prompt: false — запрещаем llama.cpp кэшировать KV между запросами.
+    # Без этого после 5-10 последовательных вызовов слот переполняется,
+    # llama.cpp перестраивает кэш и часть вычислений падает на CPU.
+    extra = {"cache_prompt": False}
     if _disable_thinking:
-        _kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        extra["thinking"] = {"type": "disabled"}
+    _kwargs["extra_body"] = extra
     try:
         resp = client.chat.completions.create(**_kwargs)
         raw = (resp.choices[0].message.content or "").strip()
@@ -349,34 +381,35 @@ def search_protocols(query: str, top_k: int = _DEFAULT_TOP_K,
 # =============================================================================
 # Классификация чанка через LLM
 # =============================================================================
-# Короткий системный промпт — экономим токены контекста
-_CLASSIFY_SYSTEM = "Тарифный эксперт РФ. JSON только."
-
 
 def classify_chunk(chunk_text: str, article_name: str, justification_summary: str,
                    client, model: str) -> Dict:
     """
     Классифицирует один чанк протокола.
     Возвращает: {"decision": "positive"|"negative"|"neutral", "quote": str, "reason": str}
-    Параметры читаются из config/predictor_config.json (настраиваются в Админке).
+    Параметры читаются из config/predictor_config.json,
+    промпты — из config/prompts.json (настраиваются в Админке).
     """
-    cfg = load_predictor_config()
+    cfg     = load_predictor_config()
+    prompts = load_predictor_prompts()
+
     _chunk_chars   = int(cfg["chunk_chars_to_llm"])
     _justify_chars = int(cfg["justification_chars"])
     _max_tokens    = int(cfg["classify_max_tokens"])
 
     _chunk   = chunk_text[:_chunk_chars]
     _justify = justification_summary[:_justify_chars] if justification_summary and _justify_chars > 0 else ""
+    _justify_line = f"Обоснование: {_justify}\n" if _justify else ""
 
-    prompt = (
-        f"Статья: {article_name}\n"
-        + (f"Обоснование: {_justify}\n" if _justify else "")
-        + f"\nФрагмент:\n{_chunk}\n\n"
-        f"Решение регулятора по статье: positive/negative/neutral?\n"
-        f"positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
-        f'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
+    system_prompt = prompts["predictor_classify_system"]
+    user_template = prompts["predictor_classify_user"]
+
+    prompt = user_template.format(
+        article_name     = article_name,
+        justification_line = _justify_line,
+        chunk            = _chunk,
     )
-    raw = _lm_call(client, model, _CLASSIFY_SYSTEM, prompt, max_tokens=_max_tokens)
+    raw = _lm_call(client, model, system_prompt, prompt, max_tokens=_max_tokens)
     # Парсим JSON
     try:
         # Убираем возможные обёртки ```json
@@ -631,7 +664,7 @@ def _show_registry():
     if filter_org.strip():
         filtered = [
             r for r in filtered
-            if filter_org.lower() in json.dumps(r.get("aggregated", {}), ensure_ascii=False).lower()
+            if filter_org.lower() in json.dumps(r.get("sources", r.get("aggregated", {})), ensure_ascii=False).lower()
         ]
     if filter_date.strip():
         filtered = [r for r in filtered if r.get("timestamp", "").startswith(filter_date)]
@@ -648,10 +681,11 @@ def _show_registry():
     page_records = filtered[start: start + page_size]
 
     for rec in page_records:
-        agg = rec.get("aggregated", {})
-        pos = len(agg.get("positive", []))
-        neg = len(agg.get("negative", []))
-        neu = len(agg.get("neutral",  []))
+        agg = rec.get("aggregated_summary", rec.get("aggregated", {}))
+        # aggregated_summary хранит целые числа; aggregated — legacy списки
+        pos = agg.get("positive", 0) if isinstance(agg.get("positive", 0), int) else len(agg.get("positive", []))
+        neg = agg.get("negative", 0) if isinstance(agg.get("negative", 0), int) else len(agg.get("negative", []))
+        neu = agg.get("neutral",  0) if isinstance(agg.get("neutral",  0), int) else len(agg.get("neutral",  []))
 
         ts  = rec.get("timestamp", "")[:16].replace("T", " ")
         lbl = f"{ts}  ·  {rec.get('article', '—')}"

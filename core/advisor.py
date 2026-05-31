@@ -154,6 +154,59 @@ client = OpenAI(
     base_url=CONFIG.get("lm_studio_url", "http://127.0.0.1:1234/v1"),
     api_key="lm-studio",
 )
+
+
+# =============================================================================
+# Сброс KV-кэша LM Studio после каждого запроса
+#
+# LM Studio (llama.cpp бэкенд) накапливает KV-кэш в VRAM между независимыми
+# запросами. При переполнении модель начинает свопиться на CPU и работает
+# в 5-10 раз медленнее. Перезагрузка модели через REST API очищает VRAM.
+# Вызов происходит в daemon-потоке — не блокирует UI и не замедляет ответ.
+# =============================================================================
+def _reload_lm_studio_context():
+    """
+    Сбрасывает KV-кэш LM Studio перезагрузкой модели через REST API.
+    Совместимо с LM Studio 0.3.x (api/v0) и более ранними версиями (фоллбэк).
+    """
+    if not CONFIG.get("reset_context_after_request", True):
+        return
+
+    import requests
+    base_url = CONFIG.get("lm_studio_url", "http://127.0.0.1:1234/v1").rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+
+    try:
+        models_resp = requests.get(f"{base_url}/v1/models", timeout=5)
+        models_resp.raise_for_status()
+        model_id = models_resp.json()["data"][0]["id"]
+    except Exception as e:
+        print(f"[KV-RESET] Не удалось получить список моделей: {e}")
+        return
+
+    try:
+        # LM Studio 0.3.x — новый API
+        r = requests.post(
+            f"{base_url}/api/v0/models/reload",
+            json={"identifier": model_id},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            print(f"[KV-RESET] Контекст сброшен (reload) ✅  модель: {model_id}")
+            return
+
+        # Фоллбэк: выгрузить → пауза → загрузить заново
+        print(f"[KV-RESET] reload вернул {r.status_code}, пробуем unload/load...")
+        requests.post(f"{base_url}/api/v0/models/unload",
+                      json={"identifier": model_id}, timeout=15)
+        time.sleep(1.5)
+        requests.post(f"{base_url}/api/v0/models/load",
+                      json={"identifier": model_id}, timeout=30)
+        print(f"[KV-RESET] Контекст сброшен (unload/load) ✅  модель: {model_id}")
+
+    except Exception as e:
+        print(f"[KV-RESET] Ошибка при сбросе: {e}")
  
  
 # =============================================================================
@@ -1306,7 +1359,10 @@ def stream_ai_answer(
                         break
  
         print(f"[LLM stream] готово за {time.perf_counter()-t0:.2f} сек")
- 
+
+        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI
+        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
+
         answer = strip_thinking_blocks(full_text)
  
         # Не кэшируем сломанные ответы (петли, пустые, слишком короткие)
@@ -1407,7 +1463,10 @@ def generate_ai_answer(
  
         print(f"[LLM] ответ за {time.perf_counter()-t0:.2f} сек | "
               f"finish={finish_reason} | len={len(raw_content or '')}")
- 
+
+        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI
+        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
+
         if finish_reason == "length":
             return ("⚠️ Превышен лимит токенов. "
                     "Увеличьте 'max_tokens' в конфиге или сократите запрос.")

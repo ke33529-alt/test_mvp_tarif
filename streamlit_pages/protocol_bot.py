@@ -546,6 +546,70 @@ def _load_lm_config() -> Dict:
     return dict(_LM_STUDIO_DEFAULTS)
 
 
+# =============================================================================
+# Промпты протокольщика — конфиг (редактируются в админке)
+# =============================================================================
+_PROTO_PROMPTS_FILE = os.path.join("config", "protocol_prompts.json")
+
+# Заводские значения — сюда можно вернуться кнопкой «Сбросить»
+DEFAULT_SYSTEM_PROMPT = "Ты профессиональный секретарь. Составляй официальные протоколы встреч. Отвечай только на русском языке. Строго следуй указанной структуре — не добавляй разделов, не пропускай указанные."
+
+DEFAULT_USER_PROMPT_TEMPLATE = """\
+Составь официальный протокол встречи на русском языке.
+
+РЕКВИЗИТЫ:
+Название:     {meeting_name}
+Организация:  {organization}
+Дата:         {meeting_date}
+Время:        {meeting_time}
+{attendees_block}
+
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ПРОТОКОЛА:
+Ниже перечислены все разделы. Ты ОБЯЗАН включить каждый из них в строго указанном порядке.
+Не добавляй разделов сверх списка. Не объединяй разделы. Не меняй порядок.
+
+{structure}
+
+УРОВЕНЬ ДЕТАЛИЗАЦИИ: {detail_level} — {detail_caption}
+
+ТЕКСТ / РАСШИФРОВКА ВСТРЕЧИ:
+{source_text}
+
+ТРЕБОВАНИЯ К ОФОРМЛЕНИЮ:
+- Оформи каждый раздел как заголовок, выделенный на отдельной строке
+- Выдели ключевые решения и поручения отдельно
+- Укажи ответственных и сроки исполнения
+- Официально-деловой стиль, без лишних слов
+- Если информации по разделу нет — пиши «Не указано»
+- Не добавляй советов, рекомендаций и комментариев от себя
+
+ПРОТОКОЛ:"""
+
+
+def _load_proto_prompts() -> Dict:
+    """Загружает промпты из файла конфига, при отсутствии возвращает заводские."""
+    defaults = {
+        "system_prompt":        DEFAULT_SYSTEM_PROMPT,
+        "user_prompt_template": DEFAULT_USER_PROMPT_TEMPLATE,
+        "default_structure":    DEFAULT_STRUCTURE,
+    }
+    if os.path.exists(_PROTO_PROMPTS_FILE):
+        try:
+            with open(_PROTO_PROMPTS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            return {**defaults, **saved}
+        except Exception:
+            pass
+    return defaults
+
+
+def _save_proto_prompts(data: Dict):
+    """Сохраняет промпты в файл конфига."""
+    os.makedirs(os.path.dirname(_PROTO_PROMPTS_FILE), exist_ok=True)
+    with open(_PROTO_PROMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def generate_protocol(
     text: str,
     structure: str,
@@ -556,6 +620,7 @@ def generate_protocol(
     attendees: List[Dict],
     detail_level: str = "средний",
     model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> Dict:
     result: Dict = {"status": "error", "protocol": None, "error": None}
 
@@ -571,36 +636,26 @@ def generate_protocol(
         if lines:
             attendees_block = "Присутствовали:\n" + "\n".join(lines)
 
+    # ── Загружаем промпты из конфига ─────────────────────────────────────────
+    prompts = _load_proto_prompts()
+    system_prompt    = prompts["system_prompt"]
+    prompt_template  = prompts["user_prompt_template"]
+
     if not structure.strip():
-        structure = DEFAULT_STRUCTURE
+        structure = prompts["default_structure"]
 
-    prompt = f"""Ты — профессиональный секретарь. Составь официальный протокол встречи на русском языке.
-
-РЕКВИЗИТЫ:
-Название:     {meeting_name}
-Организация:  {organization}
-Дата:         {meeting_date}
-Время:        {meeting_time}
-{attendees_block}
-
-СТРУКТУРА ПРОТОКОЛА (следуй строго, раздел за разделом):
-{structure}
-
-УРОВЕНЬ ДЕТАЛИЗАЦИИ: {detail_level}
-{DETAIL_CAPTIONS.get(detail_level, "")}
-
-ТЕКСТ / РАСШИФРОВКА ВСТРЕЧИ:
-{text[:14000]}
-
-ТРЕБОВАНИЯ:
-- Строго следуй указанной структуре
-- Выдели ключевые решения и поручения отдельно
-- Укажи ответственных и сроки
-- Официально-деловой стиль, без лишних слов
-- Если информации нет — пиши «Не указано»
-- Не добавляй советов и рекомендаций
-
-ПРОТОКОЛ:"""
+    # ── Подставляем переменные в шаблон ──────────────────────────────────────
+    prompt = prompt_template.format(
+        meeting_name   = meeting_name,
+        organization   = organization,
+        meeting_date   = meeting_date,
+        meeting_time   = meeting_time,
+        attendees_block= attendees_block,
+        structure      = structure,
+        detail_level   = detail_level,
+        detail_caption = DETAIL_CAPTIONS.get(detail_level, ""),
+        source_text    = text[:14000],
+    )
 
     try:
         from openai import OpenAI
@@ -614,20 +669,22 @@ def generate_protocol(
         if is_qwen3:
             prompt = "/no_think\n\n" + prompt
 
+        _max_tok = max_tokens or DETAIL_MAX_TOKENS.get(detail_level, 2500)
+
         kwargs: Dict = dict(
             model=_model,
             messages=[
-                {"role": "system", "content": "Ты профессиональный секретарь. Отвечай только на русском языке."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": prompt},
             ],
             temperature=0.15,
-            max_tokens=DETAIL_MAX_TOKENS.get(detail_level, 2500),
+            max_tokens=_max_tok,
             timeout=cfg["timeout_seconds"],
         )
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        print(f"[PROTOCOL] LM Studio: {_model}", flush=True)
+        print(f"[PROTOCOL] LM Studio: {_model} | max_tokens={_max_tok}", flush=True)
         response = _client.chat.completions.create(**kwargs)
         raw = response.choices[0].message.content or ""
 
@@ -722,15 +779,18 @@ def show_protocol_bot():
 
     # ── Инициализация session_state ──────────────────────────────────────────
     for key, default in [
-        ("proto_result",    None),   # Dict текущего созданного протокола
-        ("proto_saved_id",  None),   # ID сохранённого протокола
-        ("proto_transcript", None),  # Текст расшифровки аудио
-        ("pb_open_card",    None),   # ID раскрытой карточки в базе
+        ("proto_result",         None),   # Dict текущего созданного протокола
+        ("proto_saved_id",       None),   # ID сохранённого протокола
+        ("proto_transcript",     None),   # Текст расшифровки аудио
+        ("proto_audio_file_id",  None),   # Идентификатор последнего аудиофайла
+        ("pb_open_card",         None),   # ID раскрытой карточки в базе
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
 
-    tab_create, tab_search, tab_base = st.tabs(["Создание протокола", "Поиск по протоколам", "База протоколов"])
+    tab_create, tab_search, tab_base = st.tabs([
+        "Создание протокола", "Поиск по протоколам", "База протоколов"
+    ])
 
     # =========================================================================
     # ВКЛАДКА 1 — СОЗДАНИЕ ПРОТОКОЛА
@@ -846,6 +906,17 @@ def show_protocol_bot():
 
             if uploaded_audio:
                 source_filename = uploaded_audio.name
+
+                # Определяем уникальный идентификатор файла по имени + размеру
+                _cur_file_id = f"{uploaded_audio.name}_{uploaded_audio.size}"
+                if st.session_state.proto_audio_file_id != _cur_file_id:
+                    # Файл сменился — сбрасываем старую расшифровку и результат
+                    st.session_state.proto_audio_file_id = _cur_file_id
+                    st.session_state.proto_transcript    = None
+                    st.session_state.proto_result        = None
+                    st.session_state.proto_saved_id      = None
+                    st.rerun()
+
                 st.audio(uploaded_audio)
 
                 # Выбор модели
@@ -915,12 +986,23 @@ def show_protocol_bot():
 
             # Показываем / редактируем расшифровку
             if st.session_state.proto_transcript:
-                source_text = st.text_area(
-                    "Расшифровка (можно отредактировать)",
-                    value=st.session_state.proto_transcript,
-                    height=240,
-                    key="proto_transcript_edit",
-                )
+                _tc1, _tc2 = st.columns([5, 1])
+                with _tc1:
+                    source_text = st.text_area(
+                        "Расшифровка (можно отредактировать)",
+                        value=st.session_state.proto_transcript,
+                        height=240,
+                        key="proto_transcript_edit",
+                    )
+                with _tc2:
+                    st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+                    if st.button("🗑 Очистить", key="proto_transcript_clear", use_container_width=True,
+                                 help="Сбросить расшифровку и результат"):
+                        st.session_state.proto_transcript   = None
+                        st.session_state.proto_audio_file_id = None
+                        st.session_state.proto_result       = None
+                        st.session_state.proto_saved_id     = None
+                        st.rerun()
 
         st.divider()
 
@@ -992,6 +1074,7 @@ def show_protocol_bot():
                         meeting_time=str(meeting_time)[:5],
                         attendees=attendees,
                         detail_level=detail_level,
+                        max_tokens=max_tokens,
                     )
 
                 if res["status"] == "success":
@@ -1373,6 +1456,10 @@ def show_protocol_bot():
                 st.session_state.pb_date_from = _min_date
                 st.session_state.pb_date_to   = _max_date
                 st.rerun()
+
+        # Защита от None: st.date_input может вернуть None при перерисовке после сброса
+        _date_from = _date_from if _date_from is not None else _min_date
+        _date_to   = _date_to   if _date_to   is not None else _max_date
 
         # ── Применяем фильтры ────────────────────────────────────────────────
         filtered = list(all_protos)

@@ -1,7 +1,7 @@
 # streamlit_pages/doc_scanner.py
 """
 AI-Сканер документов
-Поддерживаемые форматы: PDF (текстовый и скан), DOCX, DOC, XLSX, JPG, PNG
+Поддерживаемые форматы: PDF (текстовый и скан), DOCX, DOC, XLSX, JPG, PNG, TXT
 OCR: EasyOCR (основной) → Tesseract (fallback)
 Пересказ: LM Studio
 Поиск: текстовый с синонимами через QueryExpander
@@ -260,6 +260,24 @@ def _extract_image(file_bytes: bytes) -> List[Dict]:
                  "method": "error", "word_count": 0}]
 
 
+def _extract_txt(file_bytes: bytes) -> List[Dict]:
+    """TXT → список страниц (по 80 строк каждая)."""
+    try:
+        # Пробуем UTF-8, затем cp1251 (Windows-кириллица)
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                text = file_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = file_bytes.decode("utf-8", errors="replace")
+        return _split_into_pages(text, method="direct")
+    except Exception as e:
+        return [{"page": 1, "text": f"[Ошибка TXT: {e}]",
+                 "method": "error", "word_count": 0}]
+
+
 def _split_into_pages(text: str, method: str = "direct", lines_per_page: int = 80) -> List[Dict]:
     """Разбивает длинный текст на условные страницы."""
     lines = text.splitlines()
@@ -289,6 +307,8 @@ def extract_text(file_bytes: bytes, filename: str) -> List[Dict]:
         return _extract_xlsx(file_bytes)
     elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"):
         return _extract_image(file_bytes)
+    elif ext == ".txt":
+        return _extract_txt(file_bytes)
     else:
         return [{"page": 1, "text": f"[Формат {ext} не поддерживается]",
                  "method": "error", "word_count": 0}]
@@ -735,12 +755,12 @@ def show_doc_scanner():
     with tab_scan:
         st.subheader("Загрузка файлов")
 
-        SUPPORTED = ["pdf", "docx", "doc", "xlsx", "xls", "jpg", "jpeg", "png", "bmp", "tiff"]
+        SUPPORTED = ["pdf", "docx", "doc", "xlsx", "xls", "jpg", "jpeg", "png", "bmp", "tiff", "txt"]
         uploaded = st.file_uploader(
             "Перетащите файлы или выберите из папки",
             type=SUPPORTED,
             accept_multiple_files=True,
-            help="Поддерживаются: PDF (текстовые и сканы), DOCX, DOC, XLSX, JPG, PNG",
+            help="Поддерживаются: PDF (текстовые и сканы), DOCX, DOC, XLSX, JPG, PNG, TXT",
         )
 
         if uploaded:
@@ -895,12 +915,16 @@ def show_doc_scanner():
 
             st.divider()
 
-            # ── Пересказ ──────────────────────────────────────────────────
+            # ── Пересказ одного документа ─────────────────────────────────
             summary_key  = f"summary_{doc['id']}"
             sum_mode_key = f"sum_mode_{doc['id']}"
             sum_words_key= f"sum_words_{doc['id']}"
 
-            st.markdown("**Пересказ**")
+            _doc_short_name = _fname(doc)
+            if len(_doc_short_name) > 50:
+                _doc_short_name = _doc_short_name[:50] + "…"
+
+            st.markdown(f"**Пересказ: {_doc_short_name}**")
             sum_mode = st.selectbox(
                 "Объём пересказа",
                 ["1 страница", "2 страницы", "5 страниц", "10 страниц",
@@ -923,7 +947,7 @@ def show_doc_scanner():
             _bL, _bC, _bR = st.columns([2, 3, 2])
             with _bC:
                 _do_summary = st.button(
-                    "▶ Сгенерировать пересказ",
+                    f"▶ Пересказать «{_doc_short_name}»",
                     key=f"sum_btn_{doc['id']}", type="primary",
                     use_container_width=True,
                 )
@@ -1032,6 +1056,101 @@ def show_doc_scanner():
                     )
                 except Exception as e:
                     st.warning(f"DOCX недоступен: {e}")
+
+            # ── Пересказ всех загруженных файлов ─────────────────────────
+            if len(last_docs) > 1:
+                st.divider()
+                st.markdown("**Пересказать все загруженные файлы**")
+
+                _batch_mode_key  = "batch_sum_mode"
+                _batch_words_key = "batch_sum_words"
+                _ba, _bb = st.columns([3, 2])
+                with _ba:
+                    _batch_mode = st.selectbox(
+                        "Объём пересказа для каждого файла",
+                        ["1 страница", "2 страницы", "5 страниц", "10 страниц",
+                         "Точное кол-во слов"],
+                        index=1,
+                        key=_batch_mode_key,
+                    )
+                with _bb:
+                    if _batch_mode == "Точное кол-во слов":
+                        _batch_words = st.number_input(
+                            "Количество слов",
+                            min_value=50, max_value=5000, value=300, step=50,
+                            key=_batch_words_key,
+                        )
+                        _batch_length = str(int(_batch_words))
+                    else:
+                        _batch_length = _batch_mode
+                        _batch_words  = None
+
+                # Счётчик уже готовых
+                _batch_done = sum(
+                    1 for _bd in last_docs
+                    if st.session_state.get(f"summary_{_bd['id']}")
+                )
+                if _batch_done:
+                    st.caption(f"Уже готово: {_batch_done} из {len(last_docs)}")
+
+                _bpL, _bpC, _bpR = st.columns([2, 3, 2])
+                with _bpC:
+                    _do_batch = st.button(
+                        f"▶ Пересказать все {len(last_docs)} файла(-ов)",
+                        key="batch_sum_btn",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if _do_batch:
+                    _batch_progress = st.progress(0.0)
+                    _batch_status   = st.empty()
+                    _batch_errors   = []
+
+                    for _bi, _bd in enumerate(last_docs):
+                        _bsk = f"summary_{_bd['id']}"
+                        _bname = _fname(_bd)
+                        _batch_status.caption(
+                            f"⏳ Файл {_bi + 1}/{len(last_docs)}: {_bname}"
+                        )
+                        _batch_progress.progress(_bi / len(last_docs))
+
+                        _bft = _bd.get("full_text", "")
+
+                        # Вложенный прогресс для Map-Reduce
+                        _inner_cap = st.empty()
+                        def _bcb(pct, msg, _c=_inner_cap, _i=_bi, _t=len(last_docs)):
+                            _c.caption(
+                                f"  [{_i + 1}/{_t}] {msg}  ·  {int(min(pct, 1.0) * 100)}%"
+                            )
+
+                        _bres = summarize_document(
+                            _bft, _batch_length, _progress_cb=_bcb
+                        )
+                        _inner_cap.empty()
+
+                        if not _bres or not _bres.strip():
+                            _bres = "⚠️ Модель вернула пустой ответ."
+                            _batch_errors.append(_bname)
+
+                        st.session_state[_bsk] = _bres
+
+                        _borig = _bd.get("original_path", "")
+                        if _borig:
+                            save_summary_file(_borig, _bres)
+
+                    _batch_progress.progress(1.0)
+                    _batch_status.empty()
+
+                    if _batch_errors:
+                        st.warning(
+                            "Не удалось получить пересказ для: "
+                            + ", ".join(_batch_errors)
+                        )
+                    else:
+                        st.success(
+                            f"✅ Пересказы готовы для всех {len(last_docs)} файлов!"
+                        )
 
     # =========================================================================
     # Вкладка 2 — Поиск

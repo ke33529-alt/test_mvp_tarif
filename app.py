@@ -1365,7 +1365,7 @@ elif main_choice == "Админка":
                 st.error("❌ Неверный пароль")
     else:
         tab_analytics, tab_docs, tab_chunking, tab_search, tab_prompts, tab_predictor = st.tabs(
-            ["📈 Аналитика ИИ", "Документы", "Настройки чанкования", "Поиск и реранкинг", "📝 Промпты", "🔮 Прогнозист"]
+            ["📈 Аналитика ИИ", "Документы", "Настройки чанкования", "Поиск и реранкинг", "📝 Промпты", "Прогнозист"]
         )
 
         with tab_analytics:
@@ -2659,6 +2659,16 @@ elif main_choice == "Админка":
                     "ДАННЫЕ РАСЧЁТНОГО ФАЙЛА:\n{calc_context}\n\n"
                     "РЕЗЮМЕ ЗАЯВКИ:\n{summary}"
                 ),
+                # ── Прогнозист решений: классификация ────────────────────────
+                "predictor_classify_system": "Тарифный эксперт РФ. JSON только.",
+                "predictor_classify_user": (
+                    "Статья: {article_name}\n"
+                    "{justification_line}"
+                    "\nФрагмент:\n{chunk}\n\n"
+                    "Решение регулятора по статье: positive/negative/neutral?\n"
+                    "positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
+                    'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
+                ),
             }
             if os.path.exists(PROMPTS_FILE_ADMIN):
                 try:
@@ -2672,7 +2682,7 @@ elif main_choice == "Админка":
             # ── Выбор раздела промптов ────────────────────────────────────
             prompt_section = st.radio(
                 "Раздел",
-                ["Советчик", "Анализатор заявок"],
+                ["Советчик", "Анализатор заявок", "Прогнозист решений", "Протокольщик"],
                 horizontal=True,
                 key="prompt_section_radio",
             )
@@ -2826,6 +2836,275 @@ elif main_choice == "Админка":
                                        mime="application/json",
                                        use_container_width=True, key="dl_claim_prompts_btn")
 
+            elif prompt_section == "Прогнозист решений":
+                st.caption("Промпты классификации чанков протоколов регулятора")
+                with st.expander("ℹ️ Переменные прогнозиста"):
+                    st.markdown(
+                        "**Системный:** без переменных — короткий системный контекст для модели\n\n"
+                        "**Пользовательский:** `{article_name}` — статья затрат, "
+                        "`{justification_line}` — строка обоснования (пустая если не указано), "
+                        "`{chunk}` — фрагмент протокола"
+                    )
+
+                st.markdown("**Системный промпт классификации**")
+                new_pred_cls_sys = st.text_area(
+                    "", value=current_prompts.get("predictor_classify_system",
+                        DEFAULT_PROMPTS_ADMIN["predictor_classify_system"]),
+                    height=80, key="prompt_pred_cls_sys", label_visibility="collapsed",
+                )
+
+                st.markdown("**Пользовательский промпт классификации**")
+                new_pred_cls_usr = st.text_area(
+                    "", value=current_prompts.get("predictor_classify_user",
+                        DEFAULT_PROMPTS_ADMIN["predictor_classify_user"]),
+                    height=200, key="prompt_pred_cls_usr", label_visibility="collapsed",
+                )
+                for v, name in [("{article_name}", "User"), ("{chunk}", "User")]:
+                    if v not in new_pred_cls_usr:
+                        st.error(f"⚠️ {name} промпт должен содержать {v}")
+
+                st.divider()
+                _pp1, _pp2 = st.columns([2, 1])
+                with _pp1:
+                    if st.button("💾 Сохранить промпты прогнозиста", type="primary",
+                                 use_container_width=True, key="save_pred_prompts_btn"):
+                        if "{article_name}" in new_pred_cls_usr and "{chunk}" in new_pred_cls_usr:
+                            os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
+                            updated = {
+                                **current_prompts,
+                                "predictor_classify_system": new_pred_cls_sys,
+                                "predictor_classify_user":   new_pred_cls_usr,
+                                "updated_at": datetime.now().isoformat(),
+                            }
+                            with open(PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as f:
+                                json.dump(updated, f, ensure_ascii=False, indent=2)
+                            st.success("✅ Промпты прогнозиста сохранены.")
+                            st.rerun()
+                        else:
+                            st.error("❌ Исправьте ошибки в промпте")
+                with _pp2:
+                    pred_prompts_json = json.dumps({
+                        "predictor_classify_system": new_pred_cls_sys,
+                        "predictor_classify_user":   new_pred_cls_usr,
+                    }, ensure_ascii=False, indent=2)
+                    st.download_button("📥 Скачать", data=pred_prompts_json.encode("utf-8"),
+                                       file_name="predictor_prompts_backup.json",
+                                       mime="application/json",
+                                       use_container_width=True, key="dl_pred_prompts_btn")
+
+            elif prompt_section == "Протокольщик":
+                # ── Конфиг промптов протокольщика ────────────────────────────
+                _PROTO_PROMPTS_FILE_ADMIN = os.path.join("config", "protocol_prompts.json")
+
+                _PROTO_DEFAULT_STRUCTURE = (
+                    "1. Дата и время встречи\n"
+                    "2. Присутствовали\n"
+                    "3. Повестка дня\n"
+                    "4. Обсуждаемые вопросы\n"
+                    "5. Принятые решения\n"
+                    "6. Поручения (кто, что, срок)\n"
+                    "7. Следующая встреча"
+                )
+                _PROTO_DEFAULT_SYSTEM = (
+                    "Ты профессиональный секретарь. Составляй официальные протоколы встреч. "
+                    "Отвечай только на русском языке. "
+                    "Строго следуй указанной структуре — не добавляй разделов, не пропускай указанные."
+                )
+                _PROTO_DEFAULT_USER_TMPL = (
+                    "Составь официальный протокол встречи на русском языке.\n\n"
+                    "РЕКВИЗИТЫ:\n"
+                    "Название:     {meeting_name}\n"
+                    "Организация:  {organization}\n"
+                    "Дата:         {meeting_date}\n"
+                    "Время:        {meeting_time}\n"
+                    "{attendees_block}\n\n"
+                    "ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ПРОТОКОЛА:\n"
+                    "Ниже перечислены все разделы. Ты ОБЯЗАН включить каждый из них в строго указанном порядке.\n"
+                    "Не добавляй разделов сверх списка. Не объединяй разделы. Не меняй порядок.\n\n"
+                    "{structure}\n\n"
+                    "УРОВЕНЬ ДЕТАЛИЗАЦИИ: {detail_level} — {detail_caption}\n\n"
+                    "ТЕКСТ / РАСШИФРОВКА ВСТРЕЧИ:\n"
+                    "{source_text}\n\n"
+                    "ТРЕБОВАНИЯ К ОФОРМЛЕНИЮ:\n"
+                    "- Оформи каждый раздел как заголовок, выделенный на отдельной строке\n"
+                    "- Выдели ключевые решения и поручения отдельно\n"
+                    "- Укажи ответственных и сроки исполнения\n"
+                    "- Официально-деловой стиль, без лишних слов\n"
+                    "- Если информации по разделу нет — пиши «Не указано»\n"
+                    "- Не добавляй советов, рекомендаций и комментариев от себя\n\n"
+                    "ПРОТОКОЛ:"
+                )
+                _proto_prompt_defaults = {
+                    "system_prompt":        _PROTO_DEFAULT_SYSTEM,
+                    "user_prompt_template": _PROTO_DEFAULT_USER_TMPL,
+                    "default_structure":    _PROTO_DEFAULT_STRUCTURE,
+                }
+
+                # Загружаем текущие значения
+                if os.path.exists(_PROTO_PROMPTS_FILE_ADMIN):
+                    try:
+                        with open(_PROTO_PROMPTS_FILE_ADMIN, "r", encoding="utf-8") as _f:
+                            _proto_cur = {**_proto_prompt_defaults, **json.load(_f)}
+                    except Exception:
+                        _proto_cur = dict(_proto_prompt_defaults)
+                else:
+                    _proto_cur = dict(_proto_prompt_defaults)
+
+                _proto_is_mod = _proto_cur != _proto_prompt_defaults
+                st.caption(
+                    "Загружен из: " + (
+                        "📁 protocol_prompts.json" if os.path.exists(_PROTO_PROMPTS_FILE_ADMIN)
+                        else "⚙️ заводские значения"
+                    )
+                )
+                if _proto_is_mod:
+                    st.warning("✏️ Промпты изменены относительно заводских")
+                else:
+                    st.success("✅ Заводские промпты")
+
+                st.divider()
+
+                # ── Справка по переменным ─────────────────────────────────────
+                with st.expander("ℹ️ Переменные User Prompt шаблона", expanded=False):
+                    st.markdown(
+                        "| Переменная | Описание |\n|---|---|\n"
+                        "| `{meeting_name}` | Название встречи |\n"
+                        "| `{organization}` | Организация |\n"
+                        "| `{meeting_date}` | Дата встречи |\n"
+                        "| `{meeting_time}` | Время встречи |\n"
+                        "| `{attendees_block}` | Список участников (готовая строка) |\n"
+                        "| `{structure}` | **Структура протокола** — подставляется из шага 3 |\n"
+                        "| `{detail_level}` | Уровень детализации (краткий/средний/подробный) |\n"
+                        "| `{detail_caption}` | Описание уровня детализации |\n"
+                        "| `{source_text}` | **Расшифровка / текст встречи** |"
+                    )
+
+                # ── System Prompt ─────────────────────────────────────────────
+                st.markdown("**Системный промпт**")
+                st.caption("Задаёт роль и базовое поведение модели.")
+                _proto_new_sys = st.text_area(
+                    "", value=_proto_cur["system_prompt"],
+                    height=120, key="prompt_proto_system", label_visibility="collapsed",
+                )
+
+                st.divider()
+
+                # ── User Prompt ───────────────────────────────────────────────
+                st.markdown("**User Prompt (шаблон)**")
+                st.caption(
+                    "Основной промпт. `{structure}` — обязательная переменная: "
+                    "именно через неё структура из шага 3 попадает в запрос к модели."
+                )
+                _proto_new_usr = st.text_area(
+                    "", value=_proto_cur["user_prompt_template"],
+                    height=480, key="prompt_proto_user", label_visibility="collapsed",
+                )
+                _proto_required = ["{structure}", "{source_text}", "{meeting_name}"]
+                _proto_missing = [v for v in _proto_required if v not in _proto_new_usr]
+                if _proto_missing:
+                    st.error(f"❌ Отсутствуют обязательные переменные: {', '.join(_proto_missing)}")
+                else:
+                    st.caption("✅ Все обязательные переменные присутствуют")
+
+                st.divider()
+
+                # ── Структура по умолчанию ────────────────────────────────────
+                st.markdown("**Структура протокола по умолчанию**")
+                st.caption(
+                    "Заполняет поле «Структура» на шаге 3 при каждом открытии протокольщика. "
+                    "Пользователь может изменить её под конкретное совещание."
+                )
+                _proto_new_struct = st.text_area(
+                    "", value=_proto_cur["default_structure"],
+                    height=200, key="prompt_proto_structure", label_visibility="collapsed",
+                )
+
+                st.divider()
+
+                # ── Превью финального промпта ─────────────────────────────────
+                if st.button("👁 Предпросмотр финального промпта", key="proto_prompt_preview_btn"):
+                    st.session_state["_proto_prompt_preview"] = True
+                if st.session_state.get("_proto_prompt_preview"):
+                    try:
+                        _proto_preview = _proto_new_usr.format(
+                            meeting_name    = "Совещание по тарифам",
+                            organization    = "АО Ромашка",
+                            meeting_date    = "2026-05-31",
+                            meeting_time    = "10:00",
+                            attendees_block = "Присутствовали:\n  • Иванов И.И. — Директор — АО Ромашка",
+                            structure       = _proto_new_struct,
+                            detail_level    = "средний",
+                            detail_caption  = "Факты + важные детали, оптимальный объём",
+                            source_text     = "[← здесь будет расшифровка встречи до 14 000 символов]",
+                        )
+                        st.code(_proto_preview, language=None)
+                    except KeyError as _pke:
+                        st.error(f"Неизвестная переменная: {{{_pke}}}. Проверьте имена переменных.")
+                    if st.button("Скрыть превью", key="proto_prompt_preview_hide"):
+                        st.session_state["_proto_prompt_preview"] = False
+                        st.rerun()
+
+                st.divider()
+
+                # ── Кнопки сохранения / сброса / скачивания ──────────────────
+                _pb1, _pb2, _pb3 = st.columns([2, 2, 1])
+                with _pb1:
+                    if st.button("💾 Сохранить промпты", type="primary",
+                                 use_container_width=True, key="save_proto_prompts_btn"):
+                        if _proto_missing:
+                            st.error(f"❌ Исправьте ошибки перед сохранением")
+                        else:
+                            _proto_to_save = {
+                                "system_prompt":        _proto_new_sys,
+                                "user_prompt_template": _proto_new_usr,
+                                "default_structure":    _proto_new_struct,
+                                "updated_at":           datetime.now().isoformat(),
+                            }
+                            os.makedirs("config", exist_ok=True)
+                            with open(_PROTO_PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as _f:
+                                json.dump(_proto_to_save, _f, ensure_ascii=False, indent=2)
+                            st.success("✅ Промпты протокольщика сохранены. Применятся при следующей генерации.")
+                            st.rerun()
+
+                with _pb2:
+                    if st.button("🔄 Сбросить к заводским", use_container_width=True,
+                                 key="reset_proto_prompts_btn"):
+                        st.session_state["_confirm_reset_proto_prompts"] = True
+                    if st.session_state.get("_confirm_reset_proto_prompts"):
+                        @st.dialog("⚠️ Сброс промптов протокольщика")
+                        def _confirm_reset_proto_prompts_dialog():
+                            st.warning("Промпты вернутся к заводским значениям. Файл protocol_prompts.json будет удалён.")
+                            _rpa, _rpb = st.columns(2)
+                            with _rpa:
+                                if st.button("🗑️ Да, сбросить", type="primary", use_container_width=True,
+                                             key="dialog_confirm_reset_proto"):
+                                    if os.path.exists(_PROTO_PROMPTS_FILE_ADMIN):
+                                        os.remove(_PROTO_PROMPTS_FILE_ADMIN)
+                                    for _k in ("prompt_proto_system", "prompt_proto_user", "prompt_proto_structure"):
+                                        st.session_state.pop(_k, None)
+                                    st.session_state["_confirm_reset_proto_prompts"] = False
+                                    st.rerun()
+                            with _rpb:
+                                if st.button("← Отмена", use_container_width=True,
+                                             key="dialog_cancel_reset_proto"):
+                                    st.session_state["_confirm_reset_proto_prompts"] = False
+                                    st.rerun()
+                        _confirm_reset_proto_prompts_dialog()
+
+                with _pb3:
+                    _proto_dl_json = json.dumps({
+                        "system_prompt":        _proto_new_sys,
+                        "user_prompt_template": _proto_new_usr,
+                        "default_structure":    _proto_new_struct,
+                    }, ensure_ascii=False, indent=2)
+                    st.download_button(
+                        "📥 Скачать",
+                        data=_proto_dl_json.encode("utf-8"),
+                        file_name="protocol_prompts_backup.json",
+                        mime="application/json",
+                        use_container_width=True,
+                        key="dl_proto_prompts_btn",
+                    )
 
 
         with tab_predictor:
