@@ -448,6 +448,18 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
     article_results: List[str] = []
     rag_available = True
 
+    # ── Диапазоны прогресс-бара (монотонно возрастают) ───────────────────────
+    # [0.00..0.05] — инициализация реранкера
+    # [0.05..0.50] — RAG-фаза (все статьи)
+    # [0.50..0.88] — LLM-фаза (все статьи)
+    # [0.88..1.00] — агрегация итогового отчёта
+    P_INIT_START = 0.00
+    P_INIT_END   = 0.05
+    P_RAG_START  = 0.05
+    P_RAG_END    = 0.50
+    P_LLM_START  = 0.50
+    P_LLM_END    = 0.88
+
     # Принудительно включаем русский реранкер DiTy для анализатора
     try:
         import json as _json
@@ -470,10 +482,16 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
     except Exception:
         pass
 
-    # Прогрев RAG
+    # Прогрев RAG / инициализация реранкера
     if progress_cb:
-        progress_cb(0.02, "Инициализация RAG (русский реранкер DiTy)...")
+        progress_cb(P_INIT_START, "Инициализация RAG (русский реранкер DiTy)...")
     _rag_search("тарифное регулирование НВВ", top_k=1)
+    if progress_cb:
+        progress_cb(P_INIT_END, f"Реранкер готов. Статей к анализу: {total}")
+
+    # Счётчики для независимого расчёта прогресса каждой фазы
+    rag_done = 0  # сколько статей прошло RAG
+    llm_done = 0  # сколько статей прошло LLM
 
     # ── Батчевая обработка ────────────────────────────────────────────────────
     for batch_start in range(0, total, BATCH_SIZE):
@@ -482,14 +500,16 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
         # Шаг 1: RAG для всего батча подряд
         batch_chunks: List[List[Dict]] = []
         for j, art in enumerate(batch):
-            idx = batch_start + j + 1
+            # Прогресс: позиция внутри RAG-диапазона по числу уже обработанных
+            rag_frac = rag_done / total  # 0..1 внутри фазы
             if progress_cb:
                 progress_cb(
-                    0.03 + (idx - 1) / total * 0.40,
-                    f"RAG {idx}/{total}: {art['name'][:40]}..."
+                    P_RAG_START + rag_frac * (P_RAG_END - P_RAG_START),
+                    f"RAG {rag_done + 1}/{total}: {art['name'][:40]}..."
                 )
             chunks = _rag_search(_make_rag_query(art["name"]), top_k=10)
             batch_chunks.append(chunks)
+            rag_done += 1
             if not chunks:
                 rag_available = False
 
@@ -512,13 +532,14 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
 
         # Шаг 2: LLM для всего батча
         for j, (art, chunks) in enumerate(zip(batch, batch_chunks)):
-            idx     = batch_start + j + 1
             name    = art["name"]
             amounts = art["amounts"]
+            # Прогресс: позиция внутри LLM-диапазона по числу уже обработанных
+            llm_frac = llm_done / total  # 0..1 внутри фазы
             if progress_cb:
                 progress_cb(
-                    0.43 + (idx - 1) / total * 0.44,
-                    f"LLM {idx}/{total}: {name[:40]}..."
+                    P_LLM_START + llm_frac * (P_LLM_END - P_LLM_START),
+                    f"LLM {llm_done + 1}/{total}: {name[:40]}..."
                 )
 
             npa_context = _format_chunks_for_prompt(
@@ -546,6 +567,7 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None) -> str:
                 max_tokens=MAX_TOKENS_PER_ARTICLE,
             )
             article_results.append(f"### {name}\n{amounts}\n\n{art_result}")
+            llm_done += 1
 
     if progress_cb:
         progress_cb(0.88, f"Агрегирую {total} статей...")
@@ -748,16 +770,25 @@ def show_claim_analyzer():
 
             st.info(f"📊 Подготовлено: **{len(combined.split()):,} слов**")
 
+            ss["_pbar_max"] = 0.25
+
             def _pcb_sum(pct, msg):
-                pbar.progress(0.25 + pct * 0.40)
+                val = min(0.25 + pct * 0.40, 0.65)
+                if val > ss.get("_pbar_max", 0):
+                    ss["_pbar_max"] = val
+                    pbar.progress(val)
                 status.text(msg)
 
             summary = summarize_claim(combined, ss.ca_summary_words, _pcb_sum)
             ss.ca_summary = summary
+            ss["_pbar_max"] = 0.65
             pbar.progress(0.65)
 
             def _pcb_risk(pct, msg):
-                pbar.progress(0.65 + pct * 0.30)
+                val = min(0.65 + pct * 0.34, 0.99)
+                if val > ss.get("_pbar_max", 0):
+                    ss["_pbar_max"] = val
+                    pbar.progress(val)
                 status.text(msg)
 
             risks = analyze_risks(calc_context, summary, _pcb_risk)
@@ -799,8 +830,13 @@ def show_claim_analyzer():
                             st.warning(f"calc_parser: {e}")
                         break
 
+            ss["_pbar_max"] = 0.15
+
             def _pcb_r(pct, msg):
-                pbar.progress(0.15 + pct * 0.85)
+                val = min(0.15 + pct * 0.84, 0.99)
+                if val > ss.get("_pbar_max", 0):
+                    ss["_pbar_max"] = val
+                    pbar.progress(val)
                 status.text(msg)
 
             ss.ca_risks      = analyze_risks(ss.ca_calc_context, ss.ca_summary, _pcb_r)
