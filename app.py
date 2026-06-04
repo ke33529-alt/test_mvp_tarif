@@ -1016,72 +1016,48 @@ elif main_choice == "Советчик":
                             try:
                                 from core.advisor import (
                                     search_vector_db as _svdb,
-                                    stream_ai_answer as _stream,
+                                    stream_clarification_answer as _stream_clar,
                                     strip_thinking_blocks as _strip,
                                     set_sources_only_mode as _set_som,
                                 )
                                 _set_som(False)
 
-                                # Предыдущий контекст: последнее уточнение или исходный ответ
+                                # Предыдущий ответ для контекста:
+                                # каждый раунд берёт ОДИН последний ответ (исходный или предыдущее уточнение)
                                 _clars = st.session_state.clarifications
-                                if _clars:
-                                    _prev_q = _clars[-1]["query"]
-                                    _prev_a = _clars[-1]["answer"]
-                                else:
-                                    _prev_q = st.session_state.last_query
-                                    _prev_a = result.get("answer", "")
+                                _prev_a = _clars[-1]["answer"] if _clars else result.get("answer", "")
 
-                                # Составной RAG-запрос: уточнение + предыдущий вопрос + предыдущий ответ
-                                _rag_query = (
-                                    f"{clarify_q}\n\n"
-                                    f"Предыдущий вопрос: {_prev_q}\n\n"
-                                    f"Предыдущий ответ:\n{_prev_a[:1500]}"
-                                )
-
+                                # RAG-запрос — только текст уточнения (чистый эмбеддинг)
                                 with st.spinner("Ищем в базе знаний..."):
                                     _new_sources = _svdb(
-                                        _rag_query,
+                                        clarify_q,
                                         top_k=st.session_state.get("_adv_top_k", 20),
                                         spheres=adv_spheres if adv_spheres else None,
                                     )
 
-                                # Добавляем предыдущий ответ как первый псевдо-источник для LLM
-                                _ctx_source = {
-                                    "snippet":  f"Предыдущий вопрос: {_prev_q}\n\nПредыдущий ответ:\n{_prev_a}",
-                                    "file":     "Контекст предыдущего ответа",
-                                    "page":     "",
-                                    "category": "context",
-                                    "sphere":   "",
-                                }
-                                _sources_for_llm = [_ctx_source] + _new_sources
-
-                                if _sources_for_llm:
-                                    st.success(f"Уточнение сгенерировано · модель: {st.session_state.advisor_model}")
-                                    import itertools as _it
-                                    _gen = _stream(
-                                        clarify_q,
-                                        _sources_for_llm,
-                                        st.session_state.advisor_model,
-                                        st.session_state.get("_adv_temperature", 0.3),
-                                    )
-                                    with st.spinner("Модель формирует ответ..."):
-                                        _first = next(_gen, None)
-                                    if _first is not None:
-                                        _raw = st.write_stream(_it.chain([_first], _gen))
-                                    else:
-                                        _raw = ""
-                                    _clar_answer = _strip(_raw)
+                                st.success(f"Уточнение · модель: {st.session_state.advisor_model}")
+                                import itertools as _it
+                                _gen = _stream_clar(
+                                    clarify_q,
+                                    _prev_a,
+                                    _new_sources,
+                                    st.session_state.advisor_model,
+                                    st.session_state.get("_adv_temperature", 0.3),
+                                )
+                                with st.spinner("Модель формирует ответ..."):
+                                    _first = next(_gen, None)
+                                if _first is not None:
+                                    _raw = st.write_stream(_it.chain([_first], _gen))
                                 else:
-                                    _clar_answer = "❌ Не найдено релевантных документов."
-                                    st.warning(_clar_answer)
+                                    _raw = ""
+                                _clar_answer = _strip(_raw) if _raw else "❌ Не найдено релевантных документов."
 
                                 # Сохраняем уточнение в цепочку
-                                _clar_entry = {
+                                st.session_state.clarifications.append({
                                     "query":   clarify_q,
                                     "answer":  _clar_answer,
                                     "sources": _new_sources,
-                                }
-                                st.session_state.clarifications.append(_clar_entry)
+                                })
 
                                 # Обновляем последнюю запись в истории
                                 if st.session_state.advisor_history:

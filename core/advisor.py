@@ -1393,6 +1393,158 @@ def stream_ai_answer(
  
  
 # =============================================================================
+# Стриминг ответа для уточняющих вопросов (без кэша, с контекстом предыдущего ответа)
+#
+# Стратегия преемственности:
+#   RAG-запрос  = clarify_q  (чистый — эмбеддинг не засоряется историей)
+#   LLM-промпт  = предыдущий ответ (явный блок) + новые RAG-чанки + вопрос уточнения
+#
+# Каждый раунд уточнения берёт ОДИН предыдущий ответ как контекст и заново
+# ищет лучших кандидатов в RAG по чистому тексту уточнения.
+# Уточнения не кэшируются — они всегда зависят от предыдущего ответа.
+# =============================================================================
+def stream_clarification_answer(
+    clarify_q: str,
+    prev_answer: str,
+    new_sources: list,
+    model: str = None,
+    temperature: float = None,
+):
+    """
+    Генератор токенов для уточняющих вопросов.
+
+    Args:
+        clarify_q:    текст уточняющего вопроса
+        prev_answer:  предыдущий ответ LLM (исходный или последнее уточнение)
+        new_sources:  чанки из RAG, найденные по clarify_q
+        model:        модель LM Studio
+        temperature:  температура генерации
+    """
+    config      = load_config()
+    model       = model or config.get("default_model", "qwen/qwen3.5-9b")
+    temperature = temperature if temperature is not None else config.get("temperature", 0.3)
+    max_tokens  = config.get("max_tokens", 2048)
+    timeout     = config.get("timeout_seconds", 300)
+
+    if _SOURCES_ONLY_MODE:
+        yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
+        return
+
+    try:
+        prompts       = load_prompts()
+        system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
+
+        # Контекст новых RAG-чанков (без псевдо-источника предыдущего ответа)
+        rag_context = _build_context(new_sources) if new_sources else "(новых документов не найдено)"
+
+        # Промпт уточнения: предыдущий ответ — явный отдельный блок
+        PREV_ANSWER_LIMIT = 2000   # символов — достаточно для контекста, не раздувает промпт
+        user_content = (
+            "Ты продолжаешь консультацию. Ниже приведён предыдущий ответ и новые фрагменты документов.\n\n"
+            "## Предыдущий ответ\n"
+            f"{prev_answer[:PREV_ANSWER_LIMIT]}"
+            + (" _(сокращено)_" if len(prev_answer) > PREV_ANSWER_LIMIT else "")
+            + "\n\n"
+            "## Новые фрагменты нормативных документов\n"
+            f"{rag_context}\n\n"
+            "## Вопрос уточнения\n"
+            f"{clarify_q}\n\n"
+            "Дай ответ на вопрос уточнения, опираясь на предыдущий ответ и новые документы. "
+            "Не повторяй то, что уже было сказано, если это не нужно для ответа."
+        )
+
+        is_qwen3   = "qwen3" in model.lower() or "qwen/qwen3" in model.lower()
+        extra_body = {}
+        if is_qwen3:
+            user_content = "/no_think\n\n" + user_content
+            extra_body = {
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+        kwargs = dict(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_content},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            frequency_penalty=0.1,
+            stream=True,
+        )
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        print(f"[CLARIFY stream] {model} | промпт ~{len(system_prompt)+len(user_content)} симв. | "
+              f"prev_answer={len(prev_answer)} симв. | rag_chunks={len(new_sources)}")
+        t0 = time.perf_counter()
+
+        full_text  = ""
+        buf        = ""
+        in_think   = False
+        last_token = ""
+        repeat_cnt = 0
+
+        response = client.chat.completions.create(**kwargs)
+
+        for chunk in response:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+
+            stripped = delta.strip()
+            if stripped and stripped == last_token:
+                repeat_cnt += 1
+                if repeat_cnt >= 20:
+                    msg = "\n\n⚠️ [Генерация прервана: модель зациклилась.]"
+                    full_text += msg
+                    yield msg
+                    break
+            else:
+                last_token = stripped
+                repeat_cnt = 0
+
+            full_text += delta
+            buf       += delta
+
+            # фильтр thinking-блоков в потоке
+            while buf:
+                if in_think:
+                    end = buf.find("</think>")
+                    if end >= 0:
+                        in_think = False
+                        buf = buf[end + len("</think>"):]
+                    else:
+                        buf = ""
+                        break
+                else:
+                    start = buf.find("<think>")
+                    if start >= 0:
+                        if start > 0:
+                            yield buf[:start]
+                        in_think = True
+                        buf = buf[start + len("<think>"):]
+                    else:
+                        yield buf
+                        buf = ""
+                        break
+
+        print(f"[CLARIFY stream] готово за {time.perf_counter()-t0:.2f} сек")
+        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset-clar").start()
+
+    except Exception as e:
+        err = str(e)
+        if "Connection" in err or "refused" in err:
+            yield "\n🔌 Ошибка подключения к LM Studio."
+        elif "timeout" in err.lower():
+            yield f"\n⏱️ Таймаут ({timeout} сек)."
+        else:
+            yield f"\n❌ Ошибка LLM: {err}"
+
+
+# =============================================================================
 # Генерация ответа (не-стриминг, используется как fallback)
 # =============================================================================
 def generate_ai_answer(
