@@ -393,6 +393,17 @@ div.element-container div[data-baseweb="notification"][kind="info"] {
 .landing-metric-value { font-size: 1.5rem; font-weight: 700; color: var(--brand-primary); }
 .landing-metric-label { font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem; }
 .main-title { display: none; }
+
+/* ── Отзывчивость кнопок навигации ─────────────────────────────────────── */
+[data-testid="stSidebar"] .stButton > button:active {
+    opacity: 0.6 !important;
+    transform: scale(0.97) !important;
+    transition: all 0.05s ease !important;
+}
+[data-testid="stSidebar"] .stButton > button {
+    cursor: pointer !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
