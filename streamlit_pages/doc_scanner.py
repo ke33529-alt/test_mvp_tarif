@@ -768,6 +768,7 @@ def show_doc_scanner():
 
             # Кнопка запуска
             if st.button("▶ Запустить распознавание", type="primary", key="scan_btn"):
+                st.warning("⚠️ Идёт распознавание — не переключайте раздел и не закрывайте вкладку")
                 progress = st.progress(0)
                 status   = st.empty()
                 new_ids  = []
@@ -974,6 +975,7 @@ def show_doc_scanner():
                     _p.progress(_pct)
                     _c.caption(f"⏳ {msg}  ·  {int(_pct * 100)}%")
 
+                st.warning("⚠️ Идёт генерация пересказа — не переключайте раздел и не закрывайте вкладку")
                 with st.spinner("🤖 Генерирую пересказ..."):
                     _gresult = summarize_document(_gft, summary_length, _progress_cb=_gcb)
 
@@ -1103,6 +1105,7 @@ def show_doc_scanner():
                     )
 
                 if _do_batch:
+                    st.warning("⚠️ Идёт пакетный пересказ — не переключайте раздел и не закрывайте вкладку")
                     _batch_progress = st.progress(0.0)
                     _batch_status   = st.empty()
                     _batch_errors   = []

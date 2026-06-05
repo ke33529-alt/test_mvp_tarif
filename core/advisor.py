@@ -1051,11 +1051,13 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None) -> list:
     return _fallback_sources
  
  
-def debug_search_candidates(query: str, top_k: int = 5) -> dict:
+def debug_search_candidates(query: str, top_k: int = 5,
+                            spheres: Optional[List[str]] = None) -> dict:
     """
     Отладочная функция для UI «Поиск и реранкинг».
     Возвращает кандидатов ДО и ПОСЛЕ реранкинга, а также варианты запроса.
     Не подтягивает соседей — нужен только чистый текст чанка для просмотра.
+    spheres: список сфер для фильтрации (None = все сферы).
     """
     result = {
         "query_variants": [query],
@@ -1090,6 +1092,8 @@ def debug_search_candidates(query: str, top_k: int = 5) -> dict:
         _ss = _load_search_settings()
         _cands_per_var = int(_ss.get("candidates_per_var", 15))
         _reranker_on   = bool(_ss.get("reranker_enabled", True))
+        if spheres:
+            _cands_per_var = _cands_per_var * 2  # компенсируем потери от постфильтрации
 
         merged: dict = {}
         for variant in unique_variants:
@@ -1099,6 +1103,16 @@ def debug_search_candidates(query: str, top_k: int = 5) -> dict:
                     merged[cid] = c
 
         pre_rerank = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+        # Фильтрация по сфере до реранкинга
+        if spheres:
+            pre_count  = len(pre_rerank)
+            pre_rerank = [
+                c for c in pre_rerank
+                if _sphere_match(c.get("meta", {}).get("sphere", ""), spheres)
+            ]
+            print(f"[SPHERE FILTER/debug] {pre_count} → {len(pre_rerank)} по сферам: {spheres}")
+
         result["pre_rerank"] = pre_rerank
 
         reranker = get_reranker() if _reranker_on else None

@@ -977,6 +977,7 @@ def _show_predict_tab():
     # ── Запуск прогноза ───────────────────────────────────────────────────────
     if st.session_state.get("pred_running") and st.session_state.get("_pred_params"):
         params = st.session_state._pred_params
+        st.warning("⚠️ Идёт анализ протоколов — не переключайте раздел и не закрывайте вкладку")
         progress_bar  = st.progress(0.0, text="Запуск…")
         status_text   = st.empty()
 

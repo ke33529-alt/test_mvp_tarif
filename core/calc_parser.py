@@ -1,498 +1,518 @@
 # core/calc_parser.py
 """
-Парсер расчётных Excel-файлов тарифных заявок
-──────────────────────────────────────────────
-Алгоритм:
-  1. classify_sheet(ws)    — тип листа по сигнальным фразам из НПА
-  2. find_table_rect(ws)   — прямоугольник таблицы по плотности данных
-  3. extract_flat(ws,rect) — unpivot: каждая ячейка → одна запись
-  4. parse_workbook(...)   — всё вместе, возвращает DataFrame + контекст
-  5. to_llm_context(df)    — форматирует DataFrame для подачи в LLM
+Универсальный парсер расчётных файлов тарифных заявок.
 
-Не зависит от имён листов. Работает с любым расположением таблицы.
-Пометки на полях отфильтровываются автоматически.
+Поддерживает два формата:
+  1. ЕИАС (признак: строка PJ_YEAR в первых 15 строках любого листа)
+     — любая сфера (ТЭ, ГВС, ТКО, водоснабжение и др.)
+     — любая версия формы
+  2. Произвольные Excel (сметы, УРТ-формы, расчёты организаций)
+     — эвристика: строка = имя статьи + числа
+
+Публичный API:
+    parse_workbook(bytes_or_path) -> (df, meta)
+    to_llm_context(df)            -> str  (только ненулевые статьи)
+    to_llm_context_compact(df)    -> str  (компактный формат для промпта)
 """
 
 from __future__ import annotations
-import io
-import re
+import io, re
 from typing import Dict, List, Optional, Tuple
-
+import openpyxl
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Константы классификации листов
-# ---------------------------------------------------------------------------
-_SHEET_SIGNALS: Dict[str, List[str]] = {
-    "смета_главная": [
-        "смета затрат",
-        "приложение 5.1",
-        "базовый уровень операцио",
-    ],
-    "нвв": [
-        "необходимая валовая выручка",
-        "расчет необходимой валов",
-        "итого необходимая валовая",
-    ],
-    "операционные": [
-        "операционных (подконтрольных)",
-        "определение операционных",
-        "базовый уровень операционных",
-    ],
-    "неподконтрольные": [
-        "реестр неподконтрольных",
-        "неподконтрольные расходы",
-    ],
-    "энергоресурсы": [
-        "реестр расходов на приобретение энергетических",
-        "расходы на приобретение энергетических ресурсов",
-    ],
-    "тарифы": [
-        "расчет тарифов",
-        "тариф ето",
-        "расчет  тарифов",
-    ],
-    "иные_расходы": [
-        "иные расходы",
-        "фактические затраты",
-    ],
-    "баланс": [
-        "баланс тепловой энергии",
-        "выработка на источнике",
-    ],
-    "нормативы_численности": [
-        "нормативы численности",
-        "расчет численности",
-    ],
+# ─────────────────────────────────────────────────────────────────────────────
+# Константы
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EIAS_SKIP_SHEETS = {
+    "Инструкция", "Информация JSON", "Список листов", "Общие сведения",
+    "Заявление", "Список территорий", "Список объектов", "Сценарии",
+    "Сценарии (МСА)", "Расчет УЕ", "Баланс Пр", "Баланс Тр", "Баланс",
+    "Баланс ГВС (Тр)", "Баланс ГВС", "Транспорт", "Комментарии",
+    "ТМ", "ДПР", "ДПР-КС", "Экономия_корр", "Корр Факт", "Корр ИП",
+    "Корр Факт РО", "ИП источники", "Удельные расходы (МСА)",
+    "Базовый уровень (МСА)", "Расчет Индексация (П13)", "Расчет ИК (П14)",
+    "Расчет МЭОР (П4)", "НР (П17)", "ОР долгосрочный (П10)",
+    "Объем ТКО (П2)", "Масса ТКО (П3)",
+    "TEHSHEET", "REESTR_OBJECT", "REESTR_OBJ_MO", "REESTR_OBJ_TRANSP",
+    "REESTR_MO", "REESTR_ORG", "REESTR_DOP", "REESTR_SEP_DIV",
+    "REESTR_IP_KS", "DICTIONARIES",
+}
+_EIAS_SKIP_PREFIXES = ("Черновик",)
+
+_EIAS_SERVICE_KEYS = {
+    "PJ_YEAR","PJ_PF","PJ_DOP","PJ_PERIOD","PJ_DOP_FIN",
+    "PJ_DYN","PJ_DYN_V","PJ_NAME","PJ_NAME_UNIT","PJ_NAME_ED_IZM",
+    "PJ_NAME_DOP","PJ_NAME_FUEL","PJ_UNIT","PJ_DOP_FIN",
+    "dyn_names","dyn_name","uni_prd_data","uni_org_reg","uni_pf",
+    "V_POK","D_YEAR","obj_mo","obj_obj",
 }
 
-# Сигналы заголовков периодов (шапка таблицы)
-_PERIOD_KEYWORDS = {
-    "план", "факт", "ожид", "рсо", "урт",
-    "заяв", "дельта", "откл", "норм",
+_PF_NORM = {
+    "предложение организации":   "Предложение",
+    "предложения организации":   "Предложение",
+    "план организации":          "Предложение",
+    "принято органом регулирования": "Принято",
+    "утверждено":                "Принято",
+    "факт по данным организации":"Факт",
+    "факт, принятый органом регулирования": "Факт",
+    "факт":                      "Факт",
+    "план":                      "План",
+    "ожидаемое за период по данным организации": "Ожидаемое",
 }
-# Слова, запрещающие трактовать ячейку как заголовок периода
-_PERIOD_BLACKLIST = {
-    "приказ", "методич", "утвержден", "федераль", "постановл",
-    "приложен", "указани", "инструкц",
-}
-_YEAR_RANGE = set(range(2015, 2032))
-
-# Маркеры пометок на полях — такие строки пропускаем
-_NOTE_PREFIXES = ("*", "#", "примечание", "см.", "(", "!", "//", "note")
-
-# Единицы измерения — признак строки данных
-_UNIT_PATTERNS = re.compile(
-    r"тыс\.?\s*руб|руб\./|тыс\.\s*гкал|тыс\.\s*квт|ед\.|чел\.|%|гкал|квт",
-    re.IGNORECASE,
-)
+_YEAR_MIN, _YEAR_MAX = 2010, 2040
 
 
-# ---------------------------------------------------------------------------
-# 1. Классификация листа
-# ---------------------------------------------------------------------------
-def classify_sheet(ws) -> Tuple[str, str]:
-    """
-    Возвращает (тип_листа, сигнальная_фраза).
-    Читает первые 80 строк, собирает весь текст, ищет сигналы.
-    """
-    texts: List[str] = []
-    for row in ws.iter_rows(max_row=80, values_only=True):
-        for cell in row:
-            if isinstance(cell, str) and cell.strip():
-                texts.append(cell.lower().strip())
+# ─────────────────────────────────────────────────────────────────────────────
+# Утилиты
+# ─────────────────────────────────────────────────────────────────────────────
 
-    joined = " ".join(texts)
-
-    for sheet_type, signals in _SHEET_SIGNALS.items():
-        for sig in signals:
-            if sig in joined:
-                return sheet_type, sig
-
-    # Fallback по признакам
-    has_tys = "тыс. руб" in joined or "тыс.руб" in joined
-    year_cnt = sum(1 for t in texts
-                   if t.strip().isdigit() and int(t.strip()) in _YEAR_RANGE)
-    if has_tys and year_cnt >= 2:
-        return "смета_неизвестная", "по признакам"
-    if len(texts) < 3:
-        return "пустой", ""
-    return "неизвестный", texts[0][:40] if texts else ""
-
-
-# ---------------------------------------------------------------------------
-# 2. Поиск прямоугольника таблицы
-# ---------------------------------------------------------------------------
-def find_table_rect(ws) -> Optional[Dict]:
-    """
-    Находит прямоугольник таблицы на листе по плотности данных.
-
-    Алгоритм:
-      A) Строит карту заполненных ячеек
-      B) Ищет строку-шапку по годам (приоритет) или ключевым словам периодов.
-         Требует ≥2 найденных столбцов периодов ИЛИ ≥1 год-число + данные ниже.
-      C) Определяет столбец боковика: предпочитает длинные тексты перед числами.
-      D) Определяет правую и нижнюю границы.
-    """
-    # ── A: карта ячеек ──────────────────────────────────────────────────────
-    cells: Dict[Tuple[int, int], object] = {}
-    max_r = max_c = 0
-
-    for row in ws.iter_rows():
-        for cell in row:
-            v = cell.value
-            if v is None:
-                continue
-            if isinstance(v, str) and not v.strip():
-                continue
-            cells[(cell.row, cell.column)] = v
-            max_r = max(max_r, cell.row)
-            max_c = max(max_c, cell.column)
-
-    if not cells:
-        return None
-
-    # ── B: строка шапки ─────────────────────────────────────────────────────
-    # Два прохода: сначала ищем строку с ≥2 годами-числами (надёжно),
-    # затем fallback — строка с ≥2 текстовыми ключевыми словами периодов.
-    header_row: Optional[int] = None
-    header_cols: Dict[int, str] = {}
-
-    def _has_data_below(r: int, period_cols: Dict[int, str]) -> bool:
-        for r2 in range(r + 1, min(r + 20, max_r + 1)):
-            for c in period_cols:
-                v2 = cells.get((r2, c))
-                if isinstance(v2, (int, float)):
-                    return True
+def _is_year(v) -> bool:
+    try:
+        y = int(str(v).strip())
+        return _YEAR_MIN <= y <= _YEAR_MAX
+    except Exception:
         return False
 
-    def _is_blacklisted(text: str) -> bool:
-        tl = text.lower()
-        return any(bl in tl for bl in _PERIOD_BLACKLIST)
+def _norm_year(v) -> str:
+    return str(int(str(v).strip()))
 
-    # Проход 1: строки с ≥2 year-числами
-    for r in range(1, min(max_r, 60)):
-        year_cols: Dict[int, str] = {}
-        for c in range(1, max_c + 1):
-            v = cells.get((r, c))
-            if isinstance(v, (int, float)) and int(v) in _YEAR_RANGE:
-                year_cols[c] = str(int(v))
-        if len(year_cols) >= 2 and _has_data_below(r, year_cols):
-            header_row = r
-            header_cols = year_cols
-            break
-        # Одиночный год — запоминаем как кандидата, но продолжаем искать лучше
-        if len(year_cols) == 1 and header_row is None:
-            if _has_data_below(r, year_cols):
-                header_row = r
-                header_cols = year_cols
+def _norm_pf(v) -> str:
+    if not v:
+        return ""
+    s = str(v).strip().lower()
+    for key, norm in _PF_NORM.items():
+        if key in s:
+            return norm
+    return str(v).strip()[:30]
 
-    # Проход 2: если год не нашли — ищем по ключевым словам периодов (≥2)
-    if not header_cols:
-        for r in range(1, min(max_r, 60)):
-            kw_cols: Dict[int, str] = {}
-            for c in range(1, max_c + 1):
-                v = cells.get((r, c))
-                if not isinstance(v, str):
-                    continue
-                vl = v.lower().strip()
-                if _is_blacklisted(vl):
-                    continue
-                if len(v.strip()) > 35:  # слишком длинный — не заголовок
-                    continue
-                for kw in _PERIOD_KEYWORDS:
-                    if kw in vl:
-                        kw_cols[c] = v.strip()[:25]
-                        break
-            if len(kw_cols) >= 2 and _has_data_below(r, kw_cols):
-                header_row = r
-                header_cols = kw_cols
-                break
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
-    if header_row is None or not header_cols:
-        return None
+def _is_article_name(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if len(s) < 4:
+        return False
+    if s in _EIAS_SERVICE_KEYS:
+        return False
+    if re.match(r'^[MmPpDd]?\d+[\d.]*$', s):
+        return False
+    if re.match(r'^[\d\s.,:;/\\()\-]+$', s):
+        return False
+    # Исключаем JSON-подобный мусор
+    if s.startswith("{") or "funcDyn" in s:
+        return False
+    # Исключаем технические коды ЕИАС (camelCase без пробелов)
+    if re.match(r"^(check|ИТОГО_|et_|DYN_|P_)[A-Za-zА-Яа-я0-9_.]+$", s):
+        return False
+    # Исключаем составные идентификаторы типа "M11580::ТЭ.50::..."
+    if "::" in s:
+        return False
+    # Исключаем строки-индексы типа "1.1", "2.1.3" (номер без текста)
+    if re.match(r"^\d+(\.\d+)*$", s):
+        return False
+    return True
 
-    # ── C: столбец боковика ─────────────────────────────────────────────────
-    # Боковик = столбец левее столбцов значений, у которого:
-    #   - ниже шапки есть текстовые строки (≥3)
-    #   - средняя длина текста > 5 символов (чтобы не взять столбец с "1","2","3")
-    min_period_col = min(header_cols.keys())
-    article_col: Optional[int] = None
-    best_score = -1
+def _load_workbook(source) -> openpyxl.Workbook:
+    if isinstance(source, (bytes, bytearray)):
+        return openpyxl.load_workbook(io.BytesIO(source), data_only=True)
+    return openpyxl.load_workbook(source, data_only=True)
 
-    for c in range(1, min_period_col + 1):
-        texts_below = [
-            str(cells.get((r2, c)))
-            for r2 in range(header_row + 1, min(header_row + 25, max_r + 1))
-            if isinstance(cells.get((r2, c)), str)
-            and len(str(cells.get((r2, c))).strip()) > 1
-        ]
-        if len(texts_below) < 3:
-            continue
-        avg_len = sum(len(t) for t in texts_below) / len(texts_below)
-        # Предпочитаем столбец с более длинными текстами
-        score = len(texts_below) * avg_len
-        if score > best_score:
-            best_score = score
-            article_col = c
-
-    if article_col is None:
-        article_col = 1
-
-    # ── D: границы прямоугольника ───────────────────────────────────────────
-    right_col = max(header_cols.keys())
-    bottom_row = header_row
-    for r in range(header_row + 1, max_r + 1):
-        for c in header_cols:
-            v = cells.get((r, c))
-            if isinstance(v, (int, float)):
-                bottom_row = r
-                break
-
-    return {
-        "header_row":  header_row,
-        "article_col": article_col,
-        "value_cols":  header_cols,
-        "top":         header_row + 1,
-        "bottom":      bottom_row,
-        "left":        article_col,
-        "right":       right_col,
-    }
+def _detect_eias(wb: openpyxl.Workbook) -> bool:
+    for sname in wb.sheetnames:
+        ws = wb[sname]
+        for row in ws.iter_rows(min_row=1, max_row=15, values_only=True):
+            if row and row[0] == "PJ_YEAR":
+                return True
+    return False
 
 
-# ---------------------------------------------------------------------------
-# 3. Unpivot: двумерная таблица → плоский DataFrame
-# ---------------------------------------------------------------------------
-def extract_flat(ws, rect: Dict, sheet_name: str = "",
-                 sheet_type: str = "") -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────────────────────
+# ЕИАС-парсер
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Заголовки колонок и единицы измерения — не статьи затрат
+_HEADER_STRINGS = {
+    "PJ_NAME", "Наименование", "Наименование показателя",
+    "№ п/п", "Ед. изм.", "Единица измерения",
+}
+_UNIT_PATTERN = re.compile(
+    r"^(тыс\.?\s*руб|руб\.|Гкал|куб\.?\s*м|кВт|тонн|чел\.|%|руб\./чел\.|тыс\.куб\.м)$",
+    re.I
+)
+
+def _find_name_col(rows: List, data_start: int, year_cols: Dict[int,Tuple]) -> Optional[int]:
     """
-    Извлекает данные из прямоугольника таблицы в плоский вид.
-
-    Возвращает DataFrame с колонками:
-      sheet, sheet_type, article, period, value, is_total, section
+    Автоматически определяет колонку с наименованием статьи.
+    Выбирает колонку с наибольшим суммарным числом символов в длинных строках
+    (>15 символов), исключая единицы измерения и заголовки.
     """
-    rows_out: List[Dict] = []
-    current_section = ""
+    col_scores: Dict[int, int] = {}   # сумма длин длинных строк
+    col_counts: Dict[int, int] = {}   # количество длинных строк
 
-    for r in range(rect["top"], rect["bottom"] + 1):
-        # Боковик
-        raw_article = ws.cell(row=r, column=rect["article_col"]).value
-        if raw_article is None:
-            # Попробуем соседние столбцы (объединённые ячейки)
-            for dc in (1, 2, -1):
-                nc = rect["article_col"] + dc
-                if nc < 1:
-                    continue
-                alt = ws.cell(row=r, column=nc).value
-                if alt is not None:
-                    raw_article = alt
-                    break
-        if raw_article is None:
+    for row in rows[data_start: data_start + 40]:
+        if not row:
             continue
-
-        article_str = str(raw_article).strip()
-        if not article_str:
-            continue
-
-        # ── Пометка на полях ────────────────────────────────────────────────
-        article_lower = article_str.lower()
-        if any(article_lower.startswith(p) for p in _NOTE_PREFIXES):
-            continue
-
-
-        # ── Строка-раздел (заголовок группы, нет чисел) ─────────────────────
-        has_any_number = any(
-            isinstance(ws.cell(row=r, column=c).value, (int, float))
-            for c in rect["value_cols"]
-        )
-        if not has_any_number:
-            # Запоминаем как текущий раздел
-            current_section = article_str
-            continue
-
-        # ── Итоговая строка ──────────────────────────────────────────────────
-        is_total = any(
-            kw in article_lower
-            for kw in ("итого", "всего", "total", "нвв", "sum")
-        )
-
-        # ── Собираем значения по периодам ────────────────────────────────────
-        for col_idx, period_label in rect["value_cols"].items():
-            v = ws.cell(row=r, column=col_idx).value
-            if not isinstance(v, (int, float)):
+        for col_idx, v in enumerate(row):
+            if col_idx in year_cols:
                 continue
-            rows_out.append({
-                "sheet":       sheet_name,
-                "sheet_type":  sheet_type,
-                "section":     current_section,
-                "article":     article_str,
-                "period":      period_label,
-                "value":       v,
-                "is_total":    is_total,
-            })
+            if not isinstance(v, str):
+                continue
+            s = v.strip()
+            if not s or s in _HEADER_STRINGS:
+                continue
+            if _UNIT_PATTERN.match(s):
+                continue
+            if not _is_article_name(s):
+                continue
+            if len(s) > 15:   # только достаточно длинные строки — статьи
+                col_scores[col_idx] = col_scores.get(col_idx, 0) + len(s)
+                col_counts[col_idx] = col_counts.get(col_idx, 0) + 1
 
-    if not rows_out:
-        return pd.DataFrame()
+    if not col_scores:
+        return None
+    # Выбираем колонку с наибольшим суммарным объёмом длинного текста
+    return max(col_scores, key=col_scores.__getitem__)
 
-    return pd.DataFrame(rows_out)
+
+def _find_unit_col(rows: List, data_start: int, name_col: int) -> Optional[int]:
+    """Ищет колонку с единицами измерения (тыс.руб., руб., Гкал и т.д.)."""
+    unit_pattern = re.compile(
+        r'тыс\.?\s*руб|руб\.|Гкал|куб\.?\s*м|кВт|тонн|чел\.|%', re.I
+    )
+    col_scores: Dict[int, int] = {}
+    for row in rows[data_start: data_start + 15]:
+        if not row:
+            continue
+        for col_idx, v in enumerate(row):
+            if col_idx == name_col:
+                continue
+            if isinstance(v, str) and unit_pattern.search(v):
+                col_scores[col_idx] = col_scores.get(col_idx, 0) + 1
+    if not col_scores:
+        return None
+    return max(col_scores, key=col_scores.__getitem__)
 
 
-# ---------------------------------------------------------------------------
-# 4. Основная функция: разбор всей книги
-# ---------------------------------------------------------------------------
-def parse_workbook(source) -> Tuple[pd.DataFrame, str]:
-    """
-    Разбирает Excel-файл (путь или bytes) по всем листам.
+def _parse_eias_sheet(ws) -> List[Dict]:
+    rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
 
-    Возвращает:
-      df   — плоский DataFrame всех данных
-      info — строка с диагностикой (какие листы нашли, сколько строк)
-    """
-    try:
-        import openpyxl
-    except ImportError:
-        return pd.DataFrame(), "[calc_parser] openpyxl не установлен"
+    # Найти PJ_YEAR и PJ_PF
+    pj_year_idx = pj_pf_idx = None
+    for i, row in enumerate(rows):
+        if row and row[0] == "PJ_YEAR" and pj_year_idx is None:
+            pj_year_idx = i
+        if row and row[0] == "PJ_PF" and pj_pf_idx is None:
+            pj_pf_idx = i
+        if pj_year_idx is not None and pj_pf_idx is not None:
+            break
 
-    try:
-        if isinstance(source, (bytes, bytearray)):
-            wb = openpyxl.load_workbook(
-                io.BytesIO(source), data_only=True
-            )
+    if pj_year_idx is None:
+        return []
+
+    year_row = rows[pj_year_idx]
+    pf_row   = rows[pj_pf_idx] if pj_pf_idx is not None else [None] * len(year_row)
+
+    # Маппинг: col_idx → (year, pf_norm)
+    col_map: Dict[int, Tuple[str, str]] = {}
+    for col_idx, yval in enumerate(year_row):
+        if _is_year(yval):
+            pf_val = pf_row[col_idx] if col_idx < len(pf_row) else None
+            col_map[col_idx] = (_norm_year(yval), _norm_pf(pf_val))
+
+    if not col_map:
+        return []
+
+    data_start = (pj_pf_idx if pj_pf_idx is not None else pj_year_idx) + 1
+
+    # Автоопределение колонки с именем статьи
+    name_col = _find_name_col(rows, data_start, col_map)
+    unit_col = _find_unit_col(rows, data_start, name_col) if name_col is not None else None
+
+    records = []
+    sheet_name = ws.title
+
+    for row in rows[data_start:]:
+        if not row:
+            continue
+        key = row[0]
+        # Пропускаем явно служебные строки (ключ в первой ячейке)
+        if key in _EIAS_SERVICE_KEYS:
+            continue
+        if isinstance(key, bool) or (isinstance(key, str) and key.startswith("{")):
+            continue
+
+        # Получаем имя статьи
+        article_name = None
+        if name_col is not None and name_col < len(row):
+            v = row[name_col]
+            if _is_article_name(v):
+                article_name = str(v).strip()
+
+        # Fallback: ищем в фиксированных позициях (когда key=None, данные сдвинуты)
+        if not article_name:
+            for col_idx in (2, 3, 1, 0):
+                if col_idx < len(row) and _is_article_name(row[col_idx]):
+                    article_name = str(row[col_idx]).strip()
+                    break
+
+        if not article_name:
+            continue
+
+        # Единица измерения
+        unit = ""
+        if unit_col is not None and unit_col < len(row):
+            u = row[unit_col]
+            if isinstance(u, str) and len(u) < 30:
+                unit = u.strip()
+
+        # Извлекаем значения
+        for col_idx, (year, pf) in col_map.items():
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx]
+            if _is_number(val) and val != 0:
+                records.append({
+                    "sheet":   sheet_name,
+                    "article": article_name,
+                    "period":  year,
+                    "pf":      pf,
+                    "value":   float(val),
+                    "unit":    unit,
+                })
+
+    return records
+
+
+def _parse_eias(wb: openpyxl.Workbook) -> Tuple[pd.DataFrame, Dict]:
+    all_records = []
+    skipped = []
+
+    for sname in wb.sheetnames:
+        if sname in _EIAS_SKIP_SHEETS:
+            skipped.append(sname)
+            continue
+        if any(sname.startswith(p) for p in _EIAS_SKIP_PREFIXES):
+            skipped.append(sname)
+            continue
+        ws = wb[sname]
+        records = _parse_eias_sheet(ws)
+        if records:
+            all_records.extend(records)
+
+    df = pd.DataFrame(all_records) if all_records else pd.DataFrame(
+        columns=["sheet","article","period","pf","value","unit"])
+    meta = {
+        "format": "ЕИАС",
+        "sheets_parsed":  len(wb.sheetnames) - len(skipped),
+        "sheets_skipped": len(skipped),
+        "records_total":  len(df),
+    }
+    return df, meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Эвристический парсер для произвольных файлов
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_year_cols_heuristic(rows: List, max_scan: int = 20) -> Dict[int, str]:
+    year_cols: Dict[int, str] = {}
+    for row in rows[:max_scan]:
+        found = {i: _norm_year(v) for i, v in enumerate(row)
+                 if v is not None and _is_year(v)}
+        if len(found) >= 2:
+            year_cols.update(found)
+    return year_cols
+
+
+def _parse_arbitrary_sheet(ws) -> List[Dict]:
+    rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
+    if not rows:
+        return []
+
+    year_cols = _find_year_cols_heuristic(rows)
+    sheet_name = ws.title
+    records = []
+
+    for row in rows:
+        if not row:
+            continue
+        article_name = None
+        name_col_idx = None
+        for col_idx in range(min(5, len(row))):
+            v = row[col_idx]
+            if _is_article_name(v) and len(str(v).strip()) > 5 and not _is_year(v):
+                article_name = str(v).strip()
+                name_col_idx = col_idx
+                break
+
+        if not article_name:
+            continue
+
+        num_vals = [
+            (i, v) for i, v in enumerate(row)
+            if _is_number(v) and v != 0 and i != name_col_idx
+        ]
+        if not num_vals:
+            continue
+
+        if year_cols:
+            for col_idx, val in num_vals:
+                year = year_cols.get(col_idx, "")
+                records.append({
+                    "sheet":   sheet_name,
+                    "article": article_name,
+                    "period":  year,
+                    "pf":      "",
+                    "value":   float(val),
+                    "unit":    "",
+                })
         else:
-            wb = openpyxl.load_workbook(source, data_only=True)
-    except Exception as e:
-        return pd.DataFrame(), f"[calc_parser] Ошибка открытия файла: {e}"
+            # Нет явных годов — берём все числа, период пустой
+            for col_idx, val in num_vals:
+                records.append({
+                    "sheet":   sheet_name,
+                    "article": article_name,
+                    "period":  "",
+                    "pf":      "",
+                    "value":   float(val),
+                    "unit":    "",
+                })
 
-    all_frames: List[pd.DataFrame] = []
-    info_lines: List[str] = []
+    return records
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
 
-        # Классификация
-        sheet_type, signal = classify_sheet(ws)
-        if sheet_type in ("пустой", "неизвестный",
-                          "нормативы_численности", "баланс"):
-            info_lines.append(f"  [{sheet_name}] → пропущен ({sheet_type})")
+def _parse_arbitrary(wb: openpyxl.Workbook) -> Tuple[pd.DataFrame, Dict]:
+    all_records = []
+    skip = {"Инструкция","TEHSHEET","DICTIONARIES"}
+    for sname in wb.sheetnames:
+        if sname in skip:
             continue
-
-        # Поиск прямоугольника
-        rect = find_table_rect(ws)
-        if rect is None:
-            info_lines.append(
-                f"  [{sheet_name}] ({sheet_type}) → таблица не найдена"
-            )
+        ws = wb[sname]
+        if ws.max_row < 3 or ws.max_column < 2:
             continue
+        all_records.extend(_parse_arbitrary_sheet(ws))
 
-        # Извлечение
-        df = extract_flat(ws, rect, sheet_name=sheet_name,
-                          sheet_type=sheet_type)
-        if df.empty:
-            info_lines.append(
-                f"  [{sheet_name}] ({sheet_type}) → нет данных"
-            )
-            continue
-
-        all_frames.append(df)
-        info_lines.append(
-            f"  [{sheet_name}] ({sheet_type}) "
-            f"→ {len(df)} записей, "
-            f"периоды: {sorted(df['period'].unique().tolist())}"
-        )
-
-    info = "\n".join(info_lines)
-    if not all_frames:
-        return pd.DataFrame(), info
-
-    result = pd.concat(all_frames, ignore_index=True)
-    return result, info
+    df = pd.DataFrame(all_records) if all_records else pd.DataFrame(
+        columns=["sheet","article","period","pf","value","unit"])
+    meta = {
+        "format":        "Произвольный",
+        "sheets_parsed": len(wb.sheetnames),
+        "records_total": len(df),
+    }
+    return df, meta
 
 
-# ---------------------------------------------------------------------------
-# 5. Форматирование для LLM
-# ---------------------------------------------------------------------------
-def to_llm_context(df: pd.DataFrame, max_chars: int = 8000) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# Постобработка
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _deduplicate(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    pf_priority = {"Принято":0,"Предложение":1,"Факт":2,"План":3,"Ожидаемое":4,"":5}
+    df = df.copy()
+    df["_rank"] = df["pf"].map(lambda x: pf_priority.get(x, 6))
+    df = df.sort_values("_rank").drop_duplicates(
+        subset=["article","period","pf"], keep="first"
+    ).drop(columns=["_rank"])
+    return df.reset_index(drop=True)
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["article"] = df["article"].str.strip().str[:200]
+    # Убираем строки где article — только цифры/короткое
+    df = df[~(df["article"].str.match(r'^\d') & (df["article"].str.len() < 5))]
+    # Убираем явный мусор
+    df = df[~df["article"].str.startswith("{")]
+    return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Публичный API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_workbook(source) -> Tuple[pd.DataFrame, Dict]:
     """
-    Превращает плоский DataFrame в читаемый текст для LLM-анализа.
+    Главная точка входа.
+    source: bytes | str (путь)
+    Возвращает (df, meta) — только ненулевые статьи затрат.
+    """
+    wb = _load_workbook(source)
+    if _detect_eias(wb):
+        df, meta = _parse_eias(wb)
+    else:
+        df, meta = _parse_arbitrary(wb)
 
-    Формат:
-      [тип_листа: имя_листа]
-      Статья | период1=значение, период2=значение, ...
-      ...
+    if not df.empty:
+        df = _clean(df)
+        df = _deduplicate(df)
+        df = df[df["value"] != 0].reset_index(drop=True)
 
-    Итоговые строки помечаются ★
+    meta["records_final"] = len(df)
+    return df, meta
+
+
+def to_llm_context(df: pd.DataFrame, max_articles: int = 50) -> str:
+    """
+    Полный формат для LLM — сгруппирован по листу и статье.
+    Только ненулевые статьи, отсортированы по убыванию значения.
     """
     if df.empty:
-        return ""
+        return "Расчётный файл не содержит данных."
 
-    lines: List[str] = []
-
-    for (sheet_type, sheet_name), group in df.groupby(
-        ["sheet_type", "sheet"], sort=False
-    ):
-        lines.append(f"\n[{sheet_type}: {sheet_name}]")
-        current_section = ""
-
-        # Pivot: article × period → values
-        pivot = (
-            group.groupby(["section", "article", "period", "is_total"])["value"]
-            .first()
-            .reset_index()
+    lines = []
+    for sheet, sdf in df.groupby("sheet", sort=False):
+        lines.append(f"\n# {sheet}")
+        top = (
+            sdf.groupby("article")["value"].max().abs()
+            .sort_values(ascending=False).head(max_articles).index
         )
-
-        for _, row_meta in (
-            pivot.groupby(["section", "article", "is_total"], sort=False)
-            .first()
-            .reset_index()[["section", "article", "is_total"]]
-            .drop_duplicates()
-            .iterrows()
-        ):
-            sec    = row_meta["section"]
-            art    = row_meta["article"]
-            total  = row_meta["is_total"]
-
-            # Заголовок раздела
-            if sec and sec != current_section:
-                lines.append(f"  # {sec}")
-                current_section = sec
-
-            # Значения по периодам
-            vals = pivot[
-                (pivot["article"] == art) & (pivot["is_total"] == total)
-            ][["period", "value"]].set_index("period")["value"].to_dict()
-
-            vals_str = ", ".join(
-                f"{p}={v:,.0f}" for p, v in sorted(vals.items(), key=lambda x: str(x[0]))
-            )
-            prefix = "  ★ " if total else "    "
-            lines.append(f"{prefix}{art}: {vals_str}")
-
-        # Ограничение по символам
-        if sum(len(l) for l in lines) > max_chars:
-            lines.append("  ... [обрезано по лимиту символов]")
-            break
-
+        for article in top:
+            adf = sdf[sdf["article"] == article].sort_values("period")
+            lines.append(f"\n★ {article}")
+            for _, row in adf.iterrows():
+                period = row["period"] or "—"
+                pf     = f" ({row['pf']})" if row["pf"] else ""
+                val    = row["value"]
+                unit   = row["unit"] or "тыс.руб."
+                if abs(val) >= 1_000_000:
+                    vs = f"{val/1_000_000:.2f} млн"
+                elif abs(val) >= 1_000:
+                    vs = f"{val:,.0f}"
+                else:
+                    vs = f"{val:.2f}"
+                lines.append(f"  {period}{pf}: {vs} {unit}")
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# 6. Быстрая диагностика (для отладки)
-# ---------------------------------------------------------------------------
-def diagnose(source) -> str:
-    """Возвращает краткий отчёт о структуре файла — для вывода в UI."""
-    df, info = parse_workbook(source)
+def to_llm_context_compact(df: pd.DataFrame, max_articles: int = 30) -> str:
+    """
+    Компактный формат для промпта (меньше токенов).
+    Статья: год/тип=значение, ...
+    """
     if df.empty:
-        return f"Данные не извлечены.\n{info}"
+        return "Нет данных."
 
-    sheet_counts = df.groupby(["sheet_type", "sheet"]).size().reset_index(name="записей")
-    summary = sheet_counts.to_string(index=False)
-    periods = sorted(df["period"].unique().tolist())
-    articles_count = df["article"].nunique()
-
-    return (
-        f"Извлечено: {len(df)} записей, "
-        f"{articles_count} уникальных статей, "
-        f"периоды: {periods}\n\n"
-        f"Листы:\n{summary}\n\n"
-        f"Диагностика:\n{info}"
+    top = (
+        df.groupby("article")["value"].max().abs()
+        .sort_values(ascending=False).head(max_articles).index
     )
+    lines = []
+    for article in top:
+        adf = df[df["article"] == article].sort_values("period")
+        parts = []
+        for _, row in adf.iterrows():
+            period = row["period"] or "—"
+            pf     = f"/{row['pf'][:3]}" if row["pf"] else ""
+            val    = row["value"]
+            vs = f"{val/1000:.0f}млн" if abs(val) >= 1_000_000 else f"{val:,.0f}"
+            parts.append(f"{period}{pf}={vs}")
+        lines.append(f"  {article}: {', '.join(parts)}")
+    return "\n".join(lines)

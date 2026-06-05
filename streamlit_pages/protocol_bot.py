@@ -954,6 +954,7 @@ def show_protocol_bot():
 
 
                 if do_transcribe:
+                    st.warning("⚠️ Идёт транскрибация аудио — не переключайте раздел и не закрывайте вкладку")
                     import time as _time
                     audio_bytes = uploaded_audio.read()
                     _mb = len(audio_bytes) / 1024 / 1024
@@ -1064,6 +1065,7 @@ def show_protocol_bot():
             if not source_text.strip():
                 st.warning("⚠️ Введите текст или загрузите файл / аудио")
             else:
+                st.warning("⚠️ Идёт составление протокола — не переключайте раздел и не закрывайте вкладку")
                 with st.spinner("🔄 AI составляет протокол..."):
                     res = generate_protocol(
                         text=source_text,
