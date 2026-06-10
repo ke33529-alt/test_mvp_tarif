@@ -661,15 +661,35 @@ def _extract_text_from_file(uf_bytes: bytes, uf_name: str) -> str:
     Извлекает текст из одного файла (PDF, DOCX, DOC).
     Возвращает пустую строку при ошибке.
     """
+    print(f"[INVENTORY] Читаю: {uf_name} ({len(uf_bytes):,} байт)")
     try:
-        from streamlit_pages.doc_scanner import extract_text
-        pages = extract_text(uf_bytes, uf_name)
-        return "\n".join(p["text"] for p in pages).strip()
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    # Fallback: попытка декодировать как UTF-8 (txt файлы)
+        # Пробуем оба пути импорта — зависит от контекста запуска
+        try:
+            from streamlit_pages.doc_scanner import extract_text as _et
+        except ImportError:
+            from doc_scanner import extract_text as _et
+        pages = _et(uf_bytes, uf_name)
+        text = "\n".join(p["text"] for p in pages).strip()
+        print(f"[INVENTORY] Текст: {len(text):,} симв, {len(pages)} стр")
+
+        # Если 0 символов и PDF — скан, пробуем _extract_pdf напрямую (с OCR)
+        if not text and uf_name.lower().endswith(".pdf"):
+            print(f"[INVENTORY] Скан, пробую OCR через _extract_pdf: {uf_name}")
+            try:
+                try:
+                    from streamlit_pages.doc_scanner import _extract_pdf as _epdf
+                except ImportError:
+                    from doc_scanner import _extract_pdf as _epdf
+                ocr_pages = _epdf(uf_bytes, uf_name)
+                ocr_text = "\n".join(p["text"] for p in ocr_pages).strip()
+                print(f"[INVENTORY] OCR результат: {len(ocr_text):,} симв")
+                if ocr_text:
+                    return ocr_text
+            except Exception as e_ocr:
+                print(f"[INVENTORY] OCR ошибка: {type(e_ocr).__name__}: {e_ocr}")
+        return text
+    except Exception as e:
+        print(f"[INVENTORY] Ошибка: {type(e).__name__}: {e}")
     try:
         return uf_bytes.decode("utf-8", errors="ignore").strip()
     except Exception:
@@ -723,19 +743,23 @@ def _inventory_single_file(file_name: str, file_text: str) -> List[Dict]:
     )
 
     try:
-        raw = _lm_call(system, user, max_tokens=1000).strip()
+        raw = _lm_call(system, user, max_tokens=800).strip()
+        print(f"[INVENTORY] LLM ({file_name[:30]}): {raw[:200] if raw else '(пусто)'}")
 
-        # Убираем markdown-обёртку если модель всё же добавила
+        if not raw:
+            print(f"[INVENTORY] Пустой ответ — пропускаем {file_name}")
+            return []
+
         if "```" in raw:
             raw = re.sub(r"```[a-z]*", "", raw).replace("```", "").strip()
 
-        # Извлекаем JSON-массив даже если модель добавила текст вокруг
         if "[" in raw and "]" in raw:
             raw = raw[raw.index("[") : raw.rindex("]") + 1]
 
         docs = json.loads(raw)
 
         if not isinstance(docs, list):
+            print(f"[INVENTORY] Не список: {type(docs)}")
             return []
 
         # Добавляем источник и чистим пустые записи
@@ -784,6 +808,17 @@ def _build_doc_inventory(
     if not doc_files:
         return []
 
+    # Инициализируем OCR как в doc_scanner (один раз за сессию)
+    try:
+        try:
+            from streamlit_pages.doc_scanner import _init_ocr
+        except ImportError:
+            from doc_scanner import _init_ocr
+        _init_ocr()
+        print("[INVENTORY] OCR инициализирован")
+    except Exception as e:
+        print(f"[INVENTORY] OCR инициализация пропущена: {e}")
+
     for i, file_name in enumerate(doc_files, 1):
         if progress_cb:
             progress_cb(i / len(doc_files), f"Инвентаризация: {file_name[:40]}...")
@@ -827,21 +862,41 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _match_docs_to_article(article_name: str, inventory: List[Dict]) -> List[Dict]:
+# Пороги уверенности для детерминированного назначения цвета
+SIMILARITY_GREEN  = 0.85   # >= 85% → 🟢 принудительно
+SIMILARITY_YELLOW = 0.60   # >= 60% → 🟡 принудительно, < 60% → не учитываем
+
+# Строки-маркеры для фильтрации тарифных показателей (не статей затрат)
+# Намеренно НЕ включаем слово "тариф" — оно встречается в названиях параметров ФОТ
+_SKIP_ARTICLE_PATTERNS = re.compile(
+    r"^(нвв|необходимая валовая выручка|средневзвешенный тариф|"
+    r"всего по тарифу|итого нвв|итого по тарифу|"
+    r"тариф на .+воду|тариф для населения|тариф \(в рамках)",
+    re.IGNORECASE,
+)
+
+
+def _should_skip_article(name: str) -> bool:
+    """True если статья является тарифным показателем а не статьёй затрат."""
+    return bool(_SKIP_ARTICLE_PATTERNS.search(name.strip()))
+
+
+def _match_docs_to_article(article_name: str,
+                            inventory: List[Dict],
+                            top_k: int = 3) -> List[Dict]:
     """
     Сопоставляет статью затрат с документами из инвентаря.
 
     Стратегия — двухуровневая:
-    1. Лексическое совпадение (мгновенно) — точные подстроки ключевых слов.
-    2. Семантическое сходство через эмбеддинги (уже загружены для RAG) —
-       ловит синонимы: «ГСМ» ↔ «дизельное топливо», «ФОТ» ↔ «зарплата» и т.д.
+    1. Лексическое совпадение — даёт score=1.0 (точное вхождение ключевых слов)
+    2. Семантическое сходство через эмбеддинги — батчевое, один вызов GPU
 
-    Если embedder недоступен — работает только лексика.
+    Возвращает топ-k документов выше SIMILARITY_YELLOW, отсортированных
+    по убыванию score. Каждый документ содержит поле _similarity (0.0-1.0).
     """
     if not inventory:
         return []
 
-    # ── Уровень 1: лексическое совпадение ────────────────────────────────────
     stop_words = {
         "расходы", "затраты", "оплата", "труда", "итого",
         "прочие", "всего", "общие", "иные", "прочих",
@@ -852,63 +907,244 @@ def _match_docs_to_article(article_name: str, inventory: List[Dict]) -> List[Dic
         if len(w) > 3 and w not in stop_words
     ]
 
-    lexical_matches: List[Dict] = []
-    unmatched_docs:  List[Dict] = []
-
+    # Назначаем всем документам базовый score через лексику
+    scored: List[Dict] = []
     for doc in inventory:
         doc_text = (doc.get("name", "") + " " + doc.get("articles", "")).lower()
+        d = dict(doc)
         if keywords and any(kw in doc_text for kw in keywords):
-            lexical_matches.append(doc)
+            d["_similarity"] = 1.0   # лексическое совпадение = максимум
         else:
-            unmatched_docs.append(doc)
+            d["_similarity"] = 0.0   # будет уточнено через эмбеддинги
+        scored.append(d)
 
-    # Если лексика нашла все документы — возвращаем сразу
-    if not unmatched_docs:
-        return lexical_matches
+    # Документы без лексического совпадения — проверяем через эмбеддинги
+    unscored = [d for d in scored if d["_similarity"] == 0.0]
 
-    # ── Уровень 2: семантическое сходство через эмбеддинги ───────────────────
-    # Батчевое энкодирование — все документы за один вызов модели
-    semantic_matches: List[Dict] = []
+    if unscored:
+        try:
+            from core.advisor import get_st_model
+            model = get_st_model()
+            if model is not None:
+                article_vec = model.encode(
+                    [f"query: {article_name}"],
+                    normalize_embeddings=True,
+                )[0].tolist()
+
+                doc_texts = [
+                    f"passage: {d.get('name', '')} {d.get('details', '')}".strip()
+                    for d in unscored
+                ]
+                doc_vecs = model.encode(
+                    doc_texts,
+                    normalize_embeddings=True,
+                    batch_size=32,
+                    show_progress_bar=False,
+                )
+                for doc, doc_vec in zip(unscored, doc_vecs):
+                    sim = _cosine_similarity(article_vec, doc_vec.tolist())
+                    doc["_similarity"] = round(sim, 3)
+                    if sim >= SIMILARITY_YELLOW:
+                        print(f"[SEMANTIC MATCH] {article_name[:30]} ↔ "
+                              f"{doc.get('name','')[:30]} sim={sim:.3f}")
+        except Exception as e:
+            print(f"[SEMANTIC MATCH] Ошибка: {e}")
+
+    # Возвращаем топ-k выше порога SIMILARITY_YELLOW, по убыванию score
+    above_threshold = [d for d in scored if d["_similarity"] >= SIMILARITY_YELLOW]
+    above_threshold.sort(key=lambda x: x["_similarity"], reverse=True)
+    return above_threshold[:top_k]
+
+def _init_ocr_for_analysis():
+    """Инициализирует OCR как в doc_scanner — автоматически, один раз за сессию."""
     try:
-        from core.advisor import get_st_model
-        model = get_st_model()
-        if model is None:
-            return lexical_matches
-
-        # Эмбеддинг статьи (один вектор)
-        article_vec = model.encode(
-            [f"query: {article_name}"],
-            normalize_embeddings=True,
-        )[0].tolist()
-
-        # Тексты всех непроверенных документов — батч
-        doc_texts = [
-            f"passage: {d.get('name', '')} {d.get('details', '')}".strip()
-            for d in unmatched_docs
-        ]
-
-        if doc_texts:
-            # Один вызов encode на весь батч документов
-            doc_vecs = model.encode(
-                doc_texts,
-                normalize_embeddings=True,
-                batch_size=32,
-                show_progress_bar=False,
-            )
-
-            for doc, doc_vec in zip(unmatched_docs, doc_vecs):
-                similarity = _cosine_similarity(article_vec, doc_vec.tolist())
-                if similarity >= _SEMANTIC_MATCH_THRESHOLD:
-                    doc_with_score = dict(doc)
-                    doc_with_score["_similarity"] = round(similarity, 3)
-                    semantic_matches.append(doc_with_score)
-                    print(f"[SEMANTIC MATCH] {article_name[:30]} ↔ "
-                          f"{doc.get('name','')[:30]} sim={similarity:.3f}")
-
+        try:
+            from streamlit_pages.doc_scanner import _init_ocr
+        except ImportError:
+            from doc_scanner import _init_ocr
+        _init_ocr()
+        print("[ANALYSIS] OCR инициализирован")
     except Exception as e:
-        print(f"[SEMANTIC MATCH] Ошибка: {e} — используем только лексику")
+        print(f"[ANALYSIS] OCR инициализация: {e}")
 
-    return lexical_matches + semantic_matches
+
+def _extract_file_text(file_bytes: bytes, file_name: str) -> str:
+    """
+    Извлекает текст из файла через doc_scanner.extract_text.
+    OCR запускается автоматически для сканов (< 50 симв/страница).
+    """
+    try:
+        try:
+            from streamlit_pages.doc_scanner import extract_text
+        except ImportError:
+            from doc_scanner import extract_text
+        pages = extract_text(file_bytes, file_name)
+        text  = "\n".join(p["text"] for p in pages).strip()
+        ocr_count = sum(1 for p in pages if p.get("method") == "ocr")
+        print(f"[ANALYSIS] {file_name}: {len(text):,} симв, {len(pages)} стр"
+              + (f", {ocr_count} OCR" if ocr_count else ""))
+        return text
+    except Exception as e:
+        print(f"[ANALYSIS] Ошибка извлечения {file_name}: {e}")
+        return ""
+
+
+# Параметры MAP-REDUCE для суммаризации файлов
+_FILE_SUMMARY_CHUNK_SIZE   = 6_000
+_FILE_SUMMARY_MAP_TOKENS   = 100
+_FILE_SUMMARY_FINAL_TOKENS = 300
+_FILE_SUMMARY_THRESHOLD    = 6_000
+
+
+def _summarize_file(file_name: str, file_text: str) -> str:
+    """
+    Суммаризирует один файл через LLM.
+    Короткие < 6000 симв: один вызов 300 токенов.
+    Длинные: MAP-REDUCE — MAP 100 токенов/чанк, REDUCE 300 токенов.
+    """
+    if not file_text or len(file_text.strip()) < 50:
+        return ""
+
+    prompts = load_prompts()
+    system  = prompts.get(
+        "claim_file_summary_system",
+        "Ты аудитор тарифных заявок. Кратко описываешь документы. Только русский язык."
+    )
+
+    if len(file_text) <= _FILE_SUMMARY_THRESHOLD:
+        user = (
+            f"Документ: {file_name}\n\n"
+            "Напиши краткое резюме (2-4 предложения). "
+            "Что за документ, стороны, предмет, суммы/даты, к каким расходам относится.\n\n"
+            f"ТЕКСТ:\n{file_text}"
+        )
+        result = _lm_call(system, user, max_tokens=_FILE_SUMMARY_FINAL_TOKENS).strip()
+        print(f"[ANALYSIS] Самари {file_name[:30]}: {len(result)} симв (прямой)")
+        return result
+
+    chunks = _split_chunks_dynamic(file_text, _FILE_SUMMARY_CHUNK_SIZE)
+    total  = len(chunks)
+    print(f"[ANALYSIS] MAP-REDUCE {file_name[:30]}: {total} чанков")
+
+    mini_summaries = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"[ANALYSIS] MAP {i}/{total}: {file_name[:25]}...")
+        map_user = (
+            f"Часть {i}/{total} документа «{file_name}».\n"
+            "Выдели ключевые факты (1-2 предложения): "
+            "что за документ, стороны, суммы, даты, предмет.\n\n"
+            f"ТЕКСТ:\n{chunk}"
+        )
+        mini = _lm_call(system, map_user, max_tokens=_FILE_SUMMARY_MAP_TOKENS).strip()
+        if mini:
+            mini_summaries.append(mini)
+
+    if not mini_summaries:
+        return ""
+
+    combined = "\n".join(f"- {m}" for m in mini_summaries)
+    reduce_user = (
+        f"Документ: {file_name}\n\n"
+        "На основе этих фрагментов составь единое резюме (2-4 предложения).\n\n"
+        f"ФРАГМЕНТЫ:\n{combined}"
+    )
+    result = _lm_call(system, reduce_user, max_tokens=_FILE_SUMMARY_FINAL_TOKENS).strip()
+    print(f"[ANALYSIS] Самари {file_name[:30]}: {len(result)} симв (MAP-REDUCE {total} чанков)")
+    return result
+
+
+def _build_file_summaries(
+    uploaded_bytes: Dict[str, bytes],
+    calc_file_names: List[str],
+    progress_cb=None,
+) -> Dict[str, str]:
+    """
+    Суммаризирует все документальные файлы заявки (не Excel).
+    Возвращает {имя_файла: краткое_содержание}.
+    """
+    doc_files = [
+        name for name in uploaded_bytes
+        if name not in calc_file_names
+        and os.path.splitext(name.lower())[1] in (".pdf", ".docx", ".doc", ".txt")
+    ]
+    print(f"[ANALYSIS] Файлов для суммаризации: {len(doc_files)}")
+    if not doc_files:
+        return {}
+
+    _init_ocr_for_analysis()
+
+    summaries: Dict[str, str] = {}
+    for i, file_name in enumerate(doc_files, 1):
+        if progress_cb:
+            progress_cb(i / len(doc_files),
+                        f"Суммаризация {i}/{len(doc_files)}: {file_name[:35]}...")
+        file_text = _extract_file_text(uploaded_bytes[file_name], file_name)
+        if not file_text:
+            print(f"[ANALYSIS] Пустой текст: {file_name} — пропускаем")
+            continue
+        summary = _summarize_file(file_name, file_text)
+        if summary:
+            summaries[file_name] = summary
+
+    print(f"[ANALYSIS] Суммаризировано файлов: {len(summaries)}")
+    return summaries
+
+
+def _match_files_to_article(
+    article_name: str,
+    file_summaries: Dict[str, str],
+    top_k: int = 3,
+) -> List[Dict]:
+    """
+    Находит топ-k файлов релевантных статье затрат.
+    Возвращает список {file_name, summary, _similarity}.
+    Уровень 1 — лексика, уровень 2 — эмбеддинги.
+    """
+    if not file_summaries:
+        return []
+
+    stop_words = {
+        "расходы", "затраты", "оплата", "труда", "итого",
+        "прочие", "всего", "общие", "иные", "прочих",
+    }
+    name_lower = article_name.lower()
+    keywords = [
+        w for w in re.split(r"\W+", name_lower)
+        if len(w) > 3 and w not in stop_words
+    ]
+
+    scored: List[Dict] = []
+    for fname, summary in file_summaries.items():
+        text = (fname + " " + summary).lower()
+        sim  = 1.0 if (keywords and any(kw in text for kw in keywords)) else 0.0
+        scored.append({"file_name": fname, "summary": summary, "_similarity": sim})
+
+    unscored = [d for d in scored if d["_similarity"] == 0.0]
+    if unscored:
+        try:
+            from core.advisor import get_st_model
+            model = get_st_model()
+            if model is not None:
+                article_vec = model.encode(
+                    [f"query: {article_name}"],
+                    normalize_embeddings=True,
+                )[0].tolist()
+                texts = [f"passage: {d['file_name']} {d['summary']}" for d in unscored]
+                vecs  = model.encode(texts, normalize_embeddings=True,
+                                     batch_size=32, show_progress_bar=False)
+                for doc, vec in zip(unscored, vecs):
+                    sim = _cosine_similarity(article_vec, vec.tolist())
+                    doc["_similarity"] = round(sim, 3)
+                    if sim >= SIMILARITY_YELLOW:
+                        print(f"[SEMANTIC] {article_name[:25]} ↔ "
+                              f"{doc['file_name'][:25]} sim={sim:.3f}")
+        except Exception as e:
+            print(f"[SEMANTIC] Ошибка: {e}")
+
+    above = [d for d in scored if d["_similarity"] >= SIMILARITY_YELLOW]
+    above.sort(key=lambda x: x["_similarity"], reverse=True)
+    return above[:top_k]
+
 
 def _parse_article_result(text: str) -> Dict:
     """Парсит структурированный ответ модели по одной статье."""
@@ -934,7 +1170,7 @@ def _parse_article_result(text: str) -> Dict:
             result["basis"] = s[10:].strip()
         elif up.startswith("РЕКОМЕНДАЦИЯ:"):
             result["recommendation"] = s[13:].strip()
-    # Fallback: если модель не дала РИСК: — ищем эмодзи в тексте
+    # Fallback 1: ищем эмодзи в любом месте текста
     if result["risk"] == "unknown":
         if "🔴" in text:
             result["risk"] = "red";    result["risk_emoji"] = "🔴"
@@ -942,9 +1178,13 @@ def _parse_article_result(text: str) -> Dict:
             result["risk"] = "yellow"; result["risk_emoji"] = "🟡"
         elif "🟢" in text:
             result["risk"] = "green";  result["risk_emoji"] = "🟢"
-        # basis fallback — весь текст
-        if not result["basis"]:
-            result["basis"] = text.strip()[:300]
+    # Fallback 2: если вообще ничего — ставим красный (нет документа = риск)
+    if result["risk"] == "unknown":
+        result["risk"]       = "red"
+        result["risk_emoji"] = "🔴"
+    # basis fallback — весь текст если не распарсился
+    if not result["basis"]:
+        result["basis"] = text.strip()[:300]
     return result
 
 
@@ -1007,13 +1247,12 @@ def _render_risks_tab(risks_json: str):
     show_red    = f_col1.checkbox("🔴 Высокий", value=True,  key="ca_f_red")
     show_yellow = f_col2.checkbox("🟡 Средний",  value=True,  key="ca_f_yellow")
     show_green  = f_col3.checkbox("🟢 Норма",    value=False, key="ca_f_green")
-    show_unkn   = f_col4.checkbox("⚪ Неизвестно", value=True, key="ca_f_unkn")
-
+    # Неизвестно больше не используется — fallback всегда даёт 🔴
     filter_map = {
         "red":     show_red,
         "yellow":  show_yellow,
         "green":   show_green,
-        "unknown": show_unkn,
+        "unknown": show_red,   # unknown = красный для целей фильтрации
     }
     visible = [a for a in articles if filter_map.get(a.get("risk", "unknown"), True)]
     st.caption(f"Показано: {len(visible)} из {n_total}")
@@ -1052,9 +1291,26 @@ def _render_risks_tab(risks_json: str):
             c_left, c_right = st.columns([3, 2])
             with c_left:
                 st.markdown(f"**{emoji} {label}**")
-                st.markdown(f"{doc_icon} **Документ:** {doc}")
+
+                # Топ-3 файла со score и самари
+                matched_files = art.get("matched_files", [])
+                best_sim      = art.get("best_sim", 0.0)
+                if matched_files:
+                    st.markdown("**Файлы из заявки:**")
+                    for d in matched_files:
+                        sim_pct   = int(d.get("_similarity", 0) * 100)
+                        sim_bar   = "🟩" * (sim_pct // 20) + "⬜" * (5 - sim_pct // 20)
+                        fname     = d.get("file_name", "—")
+                        file_sum  = d.get("summary", "")[:120]
+                        st.caption(f"{sim_bar} **{sim_pct}%** — {fname}")
+                        if file_sum:
+                            st.caption(f"   *{file_sum}*")
+                else:
+                    st.markdown("❌ **Файл-обоснование:** не найден")
+
                 if not has_npa:
                     st.caption("⚠️ НПА по этой статье в базе знаний не найдены")
+
             with c_right:
                 if amounts:
                     st.markdown("**Значения:**")
@@ -1092,13 +1348,11 @@ def _render_risks_tab(risks_json: str):
 
 def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                   spheres: Optional[List[str]] = None,
-                  doc_inventory: Optional[List[Dict]] = None) -> str:
+                  file_summaries: Optional[Dict[str, str]] = None) -> str:
     """
-    Постатейный RAG-анализ рисков — батчевый режим для Qwen 9B.
-
-    BATCH_SIZE=3: для каждого батча сначала RAG, потом LLM.
-    spheres:       список сфер для фильтрации RAG (None = все сферы).
-    doc_inventory: список документов из заявки (из _build_doc_inventory).
+    Постатейный RAG-анализ рисков.
+    spheres:        фильтр RAG по сфере (None = все).
+    file_summaries: {имя_файла: самари} из _build_file_summaries().
     """
     BATCH_SIZE = 10
     CHUNK_LIMIT_PER_ARTICLE = 8000
@@ -1224,72 +1478,104 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                     f"LLM {llm_done + 1}/{total}: {name[:40]}..."
                 )
 
+            # ── Фильтр: пропускаем тарифные показатели ───────────────────
+            if _should_skip_article(name):
+                print(f"[SKIP] Пропускаем тарифный показатель: {name[:50]}")
+                llm_done += 1
+                continue
+
             npa_context = _format_chunks_for_prompt(
                 chunks, max_chars=CHUNK_LIMIT_PER_ARTICLE
             )
             has_npa = bool(chunks)
 
-            # ── Сопоставление с инвентарём документов ────────────────────
-            inventory = doc_inventory or []
-            matched   = _match_docs_to_article(name, inventory)
+            # ── Сопоставление с инвентарём документов (топ-3 по score) ───
+            summaries = file_summaries or {}
+            matched   = _match_files_to_article(name, summaries, top_k=3)
 
-            if matched:
-                docs_lines = "\n".join(
-                    f"  - {d['name']}" + (f" ({d['details']})" if d['details'] else "")
-                    for d in matched
-                )
-                docs_block = f"ДОКУМЕНТЫ ИЗ ЗАЯВКИ:\n{docs_lines}"
-                doc_instr  = (
-                    "Документы выше ПРИСУТСТВУЮТ в заявке. "
-                    "Проверь соответствие каждого документа требованиям НПА "
-                    "и отрази это в ответе."
-                )
+            # Детерминированный цвет по best similarity
+            best_sim  = matched[0]["_similarity"] if matched else 0.0
+            if best_sim >= SIMILARITY_GREEN:
+                forced_risk       = "green"
+                forced_risk_emoji = "🟢"
+            elif best_sim >= SIMILARITY_YELLOW:
+                forced_risk       = "yellow"
+                forced_risk_emoji = "🟡"
             else:
-                docs_block = "ДОКУМЕНТЫ ИЗ ЗАЯВКИ: не найдены"
-                doc_instr  = (
-                    "Обосновывающий документ по этой статье НЕ найден в заявке. "
-                    "Отсутствие документа само по себе является нарушением — "
-                    "ставь 🔴 если НПА требует обоснования."
-                )
+                # Документов нет — красный принудительно
+                forced_risk       = "red"
+                forced_risk_emoji = "🔴"
 
+            # НПА инструкция
             npa_instr = (
                 "Используй ТОЛЬКО нормы НПА приведённые выше. Укажи документ и пункт."
                 if has_npa else
                 "НПА в базе не найдены. НЕ придумывай ссылки. "
-                "Напиши в ОСНОВАНИИ: нормативная база не найдена."
+                "В РЕКОМЕНДАЦИИ опиши какой документ нужен исходя из здравого смысла."
             )
 
-            prompt = (
-                f"Проверь статью затрат тарифной заявки:\n"
-                f"СТАТЬЯ: {name}\n"
-                f"ЗНАЧЕНИЯ: {amounts}\n\n"
-                f"{docs_block}\n\n"
-                f"{doc_instr}\n\n"
-                f"НПА ИЗ БАЗЫ ЗНАНИЙ:\n{npa_context}\n\n"
-                f"{npa_instr}\n\n"
-                f"Ответ строго в формате (4 строки):\n"
-                f"РИСК: 🔴 или 🟡 или 🟢\n"
-                f"ДОКУМЕНТ: название из заявки или 'отсутствует'\n"
-                f"ОСНОВАНИЕ: один пункт НПА — нарушен или соблюдён\n"
-                f"РЕКОМЕНДАЦИЯ: что сделать заявителю"
-            )
+            if matched:
+                # Файлы найдены: оцениваем соответствие НПА
+                files_block = "\n".join(
+                    f"  - {d['file_name']} [{int(d['_similarity']*100)}%]:\n"
+                    f"    {d['summary'][:200]}"
+                    for d in matched
+                )
+                prompt = (
+                    f"Оцени статью затрат тарифной заявки.\n\n"
+                    f"СТАТЬЯ: {name}\n"
+                    f"ЗНАЧЕНИЯ: {amounts}\n\n"
+                    f"НАЙДЕННЫЕ ФАЙЛЫ В ЗАЯВКЕ:\n{files_block}\n\n"
+                    f"НПА ИЗ БАЗЫ ЗНАНИЙ:\n{npa_context}\n\n"
+                    f"{npa_instr}\n\n"
+                    f"Цвет риска уже определён автоматически. "
+                    f"Оцени содержание найденных файлов.\n\n"
+                    f"Ответ строго в формате (3 строки):\n"
+                    f"ДОКУМЕНТ: название наиболее подходящего файла\n"
+                    f"ОСНОВАНИЕ: пункт НПА — соблюдён или есть замечание\n"
+                    f"РЕКОМЕНДАЦИЯ: что проверить или исправить заявителю"
+                )
+            else:
+                # Файлов нет: рекомендуем что приложить
+                prompt = (
+                    f"Статья затрат тарифной заявки НЕ подтверждена документами.\n\n"
+                    f"СТАТЬЯ: {name}\n"
+                    f"ЗНАЧЕНИЯ: {amounts}\n\n"
+                    f"НПА ИЗ БАЗЫ ЗНАНИЙ:\n{npa_context}\n\n"
+                    f"{npa_instr}\n\n"
+                    f"Цвет: 🔴 (документ отсутствует — определено автоматически).\n"
+                    f"Укажи какой именно документ требуется.\n\n"
+                    f"Ответ строго в формате (3 строки):\n"
+                    f"ДОКУМЕНТ: отсутствует\n"
+                    f"ОСНОВАНИЕ: какой пункт НПА требует обоснования\n"
+                    f"РЕКОМЕНДАЦИЯ: какой именно документ нужно приложить"
+                )
+
             art_result = _lm_call(
                 prompts["claim_risks_system"],
                 prompt,
                 max_tokens=MAX_TOKENS_PER_ARTICLE,
             )
-            # Парсим структурированный ответ модели
+
+            # Парсим ответ модели
             parsed = _parse_article_result(art_result)
+
+            # Применяем принудительный цвет если он был назначен
+            final_risk       = forced_risk       or parsed["risk"]
+            final_risk_emoji = forced_risk_emoji or parsed["risk_emoji"]
+
             article_results.append({
                 "name":           name,
                 "amounts":        amounts,
-                "risk":           parsed["risk"],        # "red"|"yellow"|"green"|"unknown"
-                "risk_emoji":     parsed["risk_emoji"],
+                "risk":           final_risk,
+                "risk_emoji":     final_risk_emoji,
                 "document":       parsed["document"],
                 "basis":          parsed["basis"],
                 "recommendation": parsed["recommendation"],
                 "raw":            art_result,
                 "has_npa":        has_npa,
+                "matched_files":  matched,          # топ-3 файла со score
+                "best_sim":       round(best_sim, 3),
             })
             llm_done += 1
 
@@ -1322,12 +1608,13 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         f"ОЦЕНКИ:\n{''.join(items_for_agg[:5000])}\n\n"
         f"РЕЗЮМЕ:\n{summary[:1500]}"
     )
-    summary_result = _lm_call_full(
+    summary_result = _lm_call(
         prompts["claim_risks_system"],
         aggregate_prompt,
-        max_tokens=700,
-        status_cb=lambda m: progress_cb(0.94, m) if progress_cb else None,
+        max_tokens=500,
     )
+    if progress_cb:
+        progress_cb(0.94, "Итоговое заключение готово")
 
     # Возвращаем JSON-совместимую структуру как строку через json.dumps
     output = json.dumps({
@@ -1516,22 +1803,22 @@ def show_claim_analyzer():
         ("ca_uploaded_meta",  []),
         ("ca_uploaded_bytes", {}),
         ("ca_spheres",        []),   # выбранные сферы для RAG
-        ("ca_doc_inventory",  []),   # инвентарь документов из заявки
+        ("ca_file_summaries", {}),   # словарь {файл: самари} из суммаризации
     ]:
         if k not in ss:
             ss[k] = v
 
-    # ── Миграция старых значений сфер ────────────────────────────────────────────
-    # Старые id ('water','heat','power'...) заменяем на новые ('Водоснабжение'...)
+    # ── Миграция и дедупликация сфер ─────────────────────────────────────────────
     _sphere_id_migration = {
         'water': 'Водоснабжение', 'heat': 'Теплоснабжение',
         'power': 'Электроэнергетика', 'gas': 'Газоснабжение',
         'waste': 'ТКО', 'trans': 'Транспорт', 'other': 'Прочее',
     }
     if ss.get('ca_spheres'):
-        ss.ca_spheres = [
-            _sphere_id_migration.get(s, s) for s in ss.ca_spheres
-        ]
+        # Мигрируем старые id и дедуплицируем
+        migrated = [_sphere_id_migration.get(s, s) for s in ss.ca_spheres]
+        seen_sph = set()
+        ss.ca_spheres = [x for x in migrated if not (x in seen_sph or seen_sph.add(x))]
 
     # ── Настройки Map-Reduce ──────────────────────────────────────────────────
     _show_mr_settings()
@@ -1572,37 +1859,16 @@ def show_claim_analyzer():
     # ── Загрузка файлов ───────────────────────────────────────────────────────
     st.subheader("📁 Файлы заявки")
 
-    # Вкладки: отдельные файлы vs папка
-    tab_files, tab_folder = st.tabs(["📄 Файлы", "📂 Папка (Windows)"])
-
-    with tab_files:
-        uploaded_direct = st.file_uploader(
-            "Перетащите файлы или нажмите «Browse files»",
-            type=["xlsx", "xls", "pdf", "docx", "doc"],
-            accept_multiple_files=True,
-            key="ca_uploader",
-        )
-
-    with tab_folder:
-        st.caption(
-            "Выберите все файлы из папки: в проводнике откройте папку, "
-            "нажмите **Ctrl+A** для выделения всех файлов, затем перетащите их сюда."
-        )
-        uploaded_folder = st.file_uploader(
-            "Перетащите содержимое папки",
-            type=["xlsx", "xls", "pdf", "docx", "doc"],
-            accept_multiple_files=True,
-            key="ca_uploader_folder",
-            label_visibility="collapsed",
-        )
-
-    # Объединяем оба источника, дедуплицируем по имени
-    _seen_names: set = set()
-    uploaded: list = []
-    for uf in (uploaded_direct or []) + (uploaded_folder or []):
-        if uf.name not in _seen_names:
-            _seen_names.add(uf.name)
-            uploaded.append(uf)
+    st.caption(
+        "Чтобы загрузить папку целиком: откройте папку в проводнике, "
+        "нажмите **Ctrl+A** для выделения всех файлов, затем перетащите их сюда."
+    )
+    uploaded = st.file_uploader(
+        "Перетащите файлы или нажмите «Browse files»",
+        type=["xlsx", "xls", "pdf", "docx", "doc"],
+        accept_multiple_files=True,
+        key="ca_uploader",
+    ) or []
 
     if uploaded:
         # Разделяем Excel и документы
@@ -1779,7 +2045,7 @@ def show_claim_analyzer():
                     pbar.progress(val)
                 status.text(msg)
 
-            # ── Шаг 2.5: инвентаризация обосновывающих документов ────────
+            # ── Шаг 2: суммаризация документальных файлов заявки ────────
             n_doc_files = sum(
                 1 for name in ss.ca_uploaded_bytes
                 if name not in calc_names
@@ -1787,45 +2053,37 @@ def show_claim_analyzer():
                 in ('.pdf', '.docx', '.doc', '.txt')
             )
             if n_doc_files > 0:
-                status.text(
-                    f'Инвентаризация документов ({n_doc_files} файлов)...'
-                )
-                pbar.progress(0.66)
+                status.text(f'Суммаризация документов ({n_doc_files} файлов)...')
+                pbar.progress(0.60)
 
-                def _pcb_inv(frac, msg):
-                    val = 0.66 + frac * 0.03
-                    pbar.progress(min(val, 0.69))
+                def _pcb_sum(frac, msg):
+                    val = 0.60 + frac * 0.06
+                    pbar.progress(min(val, 0.66))
                     status.text(msg)
 
-                doc_inventory = _build_doc_inventory(
+                file_summaries = _build_file_summaries(
                     uploaded_bytes=ss.ca_uploaded_bytes,
                     calc_file_names=calc_names,
-                    progress_cb=_pcb_inv,
+                    progress_cb=_pcb_sum,
                 )
-                ss['ca_doc_inventory'] = doc_inventory
+                ss["ca_file_summaries"] = file_summaries
 
-                if doc_inventory:
-                    names_preview = ', '.join(
-                        d['name'][:25] for d in doc_inventory[:3]
-                    )
-                    suffix = '...' if len(doc_inventory) > 3 else ''
+                if file_summaries:
+                    names_preview = ', '.join(list(file_summaries.keys())[:3])
+                    suffix = '...' if len(file_summaries) > 3 else ''
                     st.info(
-                        f'Найдено документов в заявке: '
-                        f'**{len(doc_inventory)}** — '
+                        f'Суммаризировано файлов: **{len(file_summaries)}** — '
                         f'{names_preview}{suffix}'
                     )
                 else:
-                    st.caption(
-                        'Документы в тексте заявки не обнаружены — '
-                        'анализ будет только по НПА.'
-                    )
+                    st.caption('Документальные файлы не обработаны — анализ только по НПА.')
             else:
-                doc_inventory = []
-                ss['ca_doc_inventory'] = []
+                file_summaries = {}
+                ss["ca_file_summaries"] = {}
 
             risks = analyze_risks(calc_context, summary, _pcb_risk,
                                   spheres=ss.ca_spheres or None,
-                                  doc_inventory=doc_inventory)
+                                  file_summaries=ss.get("ca_file_summaries", {}))
             ss.ca_risks    = risks
             ss.ca_done     = True
             ss.ca_project_id = None  # сброс — анализ обновлён, нужно пересохранить
@@ -1868,8 +2126,9 @@ def show_claim_analyzer():
                         st.warning(f"calc_parser [{uf_name}]: {e}")
                 ss.ca_calc_context = combined_calc
 
-            # Инвентаризация документов если ещё не сделана
-            if not ss.get('ca_doc_inventory'):
+            # Инвентаризация документов — запускаем всегда при нажатии кнопки
+            # Суммаризация файлов если ещё не сделана
+            if not ss.get("ca_file_summaries"):
                 n_doc_files = sum(
                     1 for name in ss.ca_uploaded_bytes
                     if name not in calc_names
@@ -1877,19 +2136,26 @@ def show_claim_analyzer():
                     in ('.pdf', '.docx', '.doc', '.txt')
                 )
                 if n_doc_files > 0:
-                    status.text(f'Инвентаризация документов ({n_doc_files} файлов)...')
+                    status.text(f'Суммаризация документов ({n_doc_files} файлов)...')
                     pbar.progress(0.12)
-                    doc_inventory = _build_doc_inventory(
+
+                    def _pcb_sum_r(frac, msg):
+                        val = 0.12 + frac * 0.03
+                        pbar.progress(min(val, 0.15))
+                        status.text(msg)
+
+                    file_summaries = _build_file_summaries(
                         uploaded_bytes=ss.ca_uploaded_bytes,
                         calc_file_names=calc_names,
+                        progress_cb=_pcb_sum_r,
                     )
-                    ss['ca_doc_inventory'] = doc_inventory
-                    if doc_inventory:
-                        names_preview = ', '.join(d['name'][:25] for d in doc_inventory[:3])
-                        suffix = '...' if len(doc_inventory) > 3 else ''
-                        st.info(f'Найдено документов: **{len(doc_inventory)}** — {names_preview}{suffix}')
+                    ss["ca_file_summaries"] = file_summaries
+                    if file_summaries:
+                        names_preview = ', '.join(list(file_summaries.keys())[:3])
+                        suffix = '...' if len(file_summaries) > 3 else ''
+                        st.info(f'Суммаризировано: **{len(file_summaries)}** — {names_preview}{suffix}')
                     else:
-                        st.caption('Документы в тексте не обнаружены — анализ только по НПА.')
+                        st.caption('Документы не обработаны — анализ только по НПА.')
 
             ss["_pbar_max"] = 0.15
 
@@ -1903,7 +2169,7 @@ def show_claim_analyzer():
             ss.ca_risks      = analyze_risks(
                 ss.ca_calc_context, ss.ca_summary, _pcb_r,
                 spheres=ss.ca_spheres or None,
-                doc_inventory=ss.get('ca_doc_inventory', []),
+                file_summaries=ss.get("ca_file_summaries", {}),
             )
             ss.ca_done       = True
             ss.ca_project_id = None
@@ -1972,21 +2238,17 @@ def show_claim_analyzer():
                 st.error(f"⚠️ {diag}")
             else:
                 st.caption(f"✅ {diag}")
-        # Реестр найденных документов
-        doc_inv = ss.get('ca_doc_inventory', [])
-        if doc_inv:
+        # Реестр суммаризированных файлов
+        file_sums = ss.get("ca_file_summaries", {})
+        if file_sums:
             with st.expander(
-                f'Документы из заявки ({len(doc_inv)})',
+                f'Файлы заявки ({len(file_sums)} суммаризировано)',
                 expanded=False,
             ):
-                for doc in doc_inv:
-                    c1, c2, c3 = st.columns([3, 2, 2])
-                    c1.markdown(f"**{doc.get('name', '—')}**")
-                    c2.caption(doc.get('details', ''))
-                    c3.caption(
-                        doc.get('articles', '')
-                        or doc.get('source', '')
-                    )
+                for fname, fsum in file_sums.items():
+                    st.markdown(f"**{fname}**")
+                    st.caption(fsum[:200] if fsum else "—")
+                    st.divider()
 
         if ss.ca_risks:
             _render_risks_tab(ss.ca_risks)
