@@ -26,13 +26,13 @@ import streamlit as st
 # Справочник сфер регулирования
 # ─────────────────────────────────────────────────────────────────────────────
 REGULATION_SPHERES: List[Dict] = [
-    {"id": "heat",    "label": "Теплоснабжение",          "icon": "🔥"},
+    {"id": "heat",    "label": "Теплоснабжение",               "icon": "🔥"},
     {"id": "water",   "label": "Водоснабжение и водоотведение", "icon": "💧"},
-    {"id": "power",   "label": "Электроэнергетика",        "icon": "⚡"},
-    {"id": "gas",     "label": "Газоснабжение",            "icon": "🔵"},
-    {"id": "waste",   "label": "Обращение с ТКО",          "icon": "♻️"},
-    {"id": "trans",   "label": "Транспорт (перевозки)",    "icon": "🚌"},
-    {"id": "other",   "label": "Прочее",                   "icon": "📄"},
+    {"id": "power",   "label": "Электроэнергетика",             "icon": "⚡"},
+    {"id": "gas",     "label": "Газоснабжение",                 "icon": "🔵"},
+    {"id": "waste",   "label": "Обращение с ТКО",               "icon": "♻️"},
+    {"id": "trans",   "label": "Транспорт (перевозки)",         "icon": "🚌"},
+    {"id": "other",   "label": "Прочее",                        "icon": "📄"},
 ]
 SPHERE_IDS   = [s["id"]   for s in REGULATION_SPHERES]
 SPHERE_LABELS = {s["id"]: f"{s['icon']} {s['label']}" for s in REGULATION_SPHERES}
@@ -1218,25 +1218,25 @@ def _render_risks_tab(risks_json: str):
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Всего статей",   n_total)
-    col2.metric("🔴 Высокий риск", n_red,   delta=None,
+    col2.metric("Высокий риск", n_red,   delta=None,
                 delta_color="inverse" if n_red > 0 else "normal")
-    col3.metric("🟡 Средний риск", n_yellow)
-    col4.metric("🟢 Без замечаний", n_green)
+    col3.metric("Средний риск", n_yellow)
+    col4.metric("Без замечаний", n_green)
 
     # Общий индикатор
     if n_red > 0:
-        st.error(f"🔴 **ВЫСОКИЙ РИСК** — {n_red} статей требуют немедленного внимания")
+        st.error(f"ВЫСОКИЙ РИСК — {n_red} статей требуют немедленного внимания")
     elif n_yellow > 0:
-        st.warning(f"🟡 **СРЕДНИЙ РИСК** — {n_yellow} статей с замечаниями")
+        st.warning(f"СРЕДНИЙ РИСК — {n_yellow} статей с замечаниями")
     else:
-        st.success("🟢 **НИЗКИЙ РИСК** — существенных замечаний не выявлено")
+        st.success("НИЗКИЙ РИСК — существенных замечаний не выявлено")
 
     if rag_note:
         st.caption(rag_note)
 
     # ── Заключение LLM ───────────────────────────────────────────────────────
     if summary:
-        with st.expander("📋 Итоговое заключение", expanded=True):
+        with st.expander("Итоговое заключение", expanded=True):
             st.markdown(summary)
 
     st.divider()
@@ -1244,9 +1244,9 @@ def _render_risks_tab(risks_json: str):
     # ── Фильтр ───────────────────────────────────────────────────────────────
     st.markdown("**Постатейный анализ**")
     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-    show_red    = f_col1.checkbox("🔴 Высокий", value=True,  key="ca_f_red")
-    show_yellow = f_col2.checkbox("🟡 Средний",  value=True,  key="ca_f_yellow")
-    show_green  = f_col3.checkbox("🟢 Норма",    value=False, key="ca_f_green")
+    show_red    = f_col1.checkbox("Высокий риск", value=True,  key="ca_f_red")
+    show_yellow = f_col2.checkbox("Средний риск",  value=True,  key="ca_f_yellow")
+    show_green  = f_col3.checkbox("Без замечаний",    value=False, key="ca_f_green")
     # Неизвестно больше не используется — fallback всегда даёт 🔴
     filter_map = {
         "red":     show_red,
@@ -1306,10 +1306,10 @@ def _render_risks_tab(risks_json: str):
                         if file_sum:
                             st.caption(f"   *{file_sum}*")
                 else:
-                    st.markdown("❌ **Файл-обоснование:** не найден")
+                    st.markdown("**Файл-обоснование:** не найден")
 
                 if not has_npa:
-                    st.caption("⚠️ НПА по этой статье в базе знаний не найдены")
+                    st.caption("НПА по этой статье в базе знаний не найдены")
 
             with c_right:
                 if amounts:
@@ -1320,7 +1320,7 @@ def _render_risks_tab(risks_json: str):
             if basis:
                 st.markdown(f"**Основание:** {basis}")
             if rec:
-                st.info(f"💡 {rec}")
+                st.info(rec)
 
     # ── Кнопка скачать только проблемные ─────────────────────────────────────
     st.divider()
@@ -1338,7 +1338,7 @@ def _render_risks_tab(risks_json: str):
             lines.append("-"*40)
         report_text = "\n".join(lines)
         st.download_button(
-            f"⬇️ Скачать замечания ({len(problem_articles)} статей)",
+            f"Скачать замечания ({len(problem_articles)} статей)",
             data=report_text.encode("utf-8"),
             file_name="замечания_регулятора.txt",
             mime="text/plain",
@@ -1584,9 +1584,9 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
     # ── Итоговый отчёт (агрегация через LLM) ─────────────────────────────────
     rag_note = (
-        "⚠️ Часть статей без данных НПА — добавьте НПА в базу знаний."
+        "Часть статей без данных НПА — добавьте НПА в базу знаний."
         if not rag_available else
-        "✅ Анализ выполнен с привлечением нормативной базы знаний."
+        "Анализ выполнен с привлечением нормативной базы знаний."
     )
 
     # Краткая текстовая выжимка для LLM-агрегации
@@ -1669,7 +1669,7 @@ def _show_mr_settings():
     """Панель настроек Map-Reduce с калькулятором контекста."""
     cfg = load_mr_config()
 
-    with st.expander("⚙️ Настройки Map-Reduce", expanded=False):
+    with st.expander("Настройки Map-Reduce", expanded=False):
         st.caption("Параметры разбивки текста и расчёт контекста для LM Studio")
 
         c1, c2, c3 = st.columns(3)
@@ -1773,13 +1773,13 @@ def _show_mr_settings():
 
         # ── Кнопки сохранить / сбросить ───────────────────────────────────────
         bc1, bc2 = st.columns(2)
-        if bc1.button("💾 Сохранить настройки", key="mr_save",
+        if bc1.button("Сохранить настройки", key="mr_save",
                       use_container_width=True, type="primary"):
             save_mr_config(new_cfg)
             st.success("Настройки сохранены.")
             st.rerun()
 
-        if bc2.button("↺ Сбросить к умолчаниям", key="mr_reset",
+        if bc2.button("Сбросить к умолчаниям", key="mr_reset",
                       use_container_width=True):
             save_mr_config(MR_DEFAULTS)
             st.success("Настройки сброшены к умолчаниям.")
@@ -1824,30 +1824,30 @@ def show_claim_analyzer():
     _show_mr_settings()
 
     # ── Выбор сферы регулирования ─────────────────────────────────────────────
-    st.subheader("🏭 Сфера регулирования")
+    st.subheader("Сфера регулирования")
     st.caption("Выберите сферу — RAG будет искать НПА только по ней. "
                "Не выбрано = поиск по всей базе.")
 
-    sphere_cols = st.columns(len(REGULATION_SPHERES))
-    for col, sph in zip(sphere_cols, REGULATION_SPHERES):
-        sid   = sph["id"]
-        label = f"{sph['icon']}\n{sph['label']}"
-        checked = sid in ss.ca_spheres
-        if col.checkbox(label, value=checked, key=f"ca_sphere_{sid}"):
-            if sid not in ss.ca_spheres:
-                ss.ca_spheres.append(sid)
-        else:
-            if sid in ss.ca_spheres:
-                ss.ca_spheres.remove(sid)
+    selected_sphere_labels = st.multiselect(
+        "Сферы регулирования",
+        options=[f"{s['icon']} {s['label']}" for s in REGULATION_SPHERES],
+        default=[SPHERE_LABELS[sid] for sid in ss.ca_spheres if sid in SPHERE_LABELS],
+        label_visibility="collapsed",
+        key="ca_spheres_select",
+        placeholder="Все сферы (без фильтра)",
+    )
+    # Конвертируем "иконка label" → id
+    label_to_id = {f"{s['icon']} {s['label']}": s["id"] for s in REGULATION_SPHERES}
+    ss.ca_spheres = [label_to_id[lbl] for lbl in selected_sphere_labels if lbl in label_to_id]
 
     if ss.ca_spheres:
         selected_names = [SPHERE_LABELS.get(s, s) for s in ss.ca_spheres]
-        st.info(f"Фильтр RAG: {' · '.join(selected_names)}")
+        st.caption(f"Фильтр RAG: {' · '.join(selected_names)}")
     else:
         st.caption("Фильтр не задан — поиск по всей нормативной базе.")
 
     # ── Реквизиты ─────────────────────────────────────────────────────────────
-    with st.expander("📋 Реквизиты заявки", expanded=not ss.ca_done):
+    with st.expander("Реквизиты заявки", expanded=not ss.ca_done):
         c1, c2 = st.columns(2)
         ss.ca_org    = c1.text_input("Организация", value=ss.ca_org,
                                      placeholder="ООО «Теплоснабжение»",
@@ -1857,11 +1857,11 @@ def show_claim_analyzer():
                                      key="ca_period_input")
 
     # ── Загрузка файлов ───────────────────────────────────────────────────────
-    st.subheader("📁 Файлы заявки")
+    st.subheader("Файлы заявки")
 
     st.caption(
         "Чтобы загрузить папку целиком: откройте папку в проводнике, "
-        "нажмите **Ctrl+A** для выделения всех файлов, затем перетащите их сюда."
+        "нажмите Ctrl+A для выделения всех файлов, затем перетащите их сюда."
     )
     uploaded = st.file_uploader(
         "Перетащите файлы или нажмите «Browse files»",
@@ -1879,26 +1879,25 @@ def show_claim_analyzer():
 
         st.success(
             f"Загружено: **{len(uploaded)}** файл(ов) — "
-            f"📊 {len(xlsx_files)} расчётных · 📄 {len(doc_files)} документов"
+            f"{len(xlsx_files)} расчётных · {len(doc_files)} документов"
         )
 
         # ── Список файлов с выбором расчётной модели ─────────────────────────
-        st.markdown("**Отметьте расчётные модели** (Excel-файлы со статьями затрат):")
+        st.markdown("Отметьте расчётные модели (Excel-файлы со статьями затрат):")
 
         calc_checked: List[str] = []
         for uf in uploaded:
             ext = os.path.splitext(uf.name.lower())[1]
             is_xlsx = ext in (".xlsx", ".xls")
             c1, c2 = st.columns([5, 1])
-            icon = "📊" if is_xlsx else "📄"
-            c1.write(f"{icon} {uf.name} · {_format_size(uf.size)}")
+            c1.write(f"{uf.name} · {_format_size(uf.size)}")
             if is_xlsx:
                 default_checked = (
                     uf.name in ss.get("ca_calc_files_checked", [])
                     or (not ss.get("ca_calc_files_checked") and len(xlsx_files) == 1)
                 )
                 if c2.checkbox(
-                    "🧮", key=f"ca_calc_{uf.name}",
+                    "расч.", key=f"ca_calc_{uf.name}",
                     value=default_checked,
                     help="Отметить как расчётную модель"
                 ):
@@ -1912,13 +1911,13 @@ def show_claim_analyzer():
         has_calc = bool(calc_checked)
         if xlsx_files and not has_calc:
             st.warning(
-                "⚠️ Не выбрана ни одна расчётная модель. "
+                "Не выбрана ни одна расчётная модель. "
                 "Отметьте галочкой 🧮 хотя бы один Excel-файл со статьями затрат — "
                 "без него анализ рисков будет неполным."
             )
         elif not xlsx_files:
             st.info(
-                "ℹ️ В загруженных файлах нет Excel-таблиц. "
+                "В загруженных файлах нет Excel-таблиц. "
                 "Анализ рисков будет выполнен только на основе текста документов."
             )
 
@@ -1935,18 +1934,18 @@ def show_claim_analyzer():
         # Блокируем кнопки если есть Excel но ни одна не помечена
         _block_run = bool(xlsx_files) and not has_calc
         run_full  = c2.button(
-            "🔍 Полный анализ", type="primary",
+            "Полный анализ", type="primary",
             use_container_width=True, key="ca_run_full",
             disabled=_block_run,
         )
         run_risks = c3.button(
-            "⚡ Только риски",
+            "Только риски",
             use_container_width=True, key="ca_run_risks",
             disabled=_block_run,
         )
         if _block_run:
             st.error(
-                "🚫 Выберите хотя бы одну расчётную модель (галочка 🧮 напротив Excel-файла), "
+                "Выберите хотя бы одну расчётную модель (галочка напротив Excel-файла), "
                 "чтобы запустить анализ."
             )
 
@@ -1973,7 +1972,7 @@ def show_claim_analyzer():
                     continue
                 if calc_names and uf_name not in calc_names:
                     continue
-                status.text(f"📊 Парсю расчётный файл: {uf_name}...")
+                status.text(f"Парсю расчётный файл: {uf_name}...")
                 pbar.progress(0.05)
                 try:
                     from core.calc_parser import parse_workbook, to_llm_context
@@ -1981,13 +1980,13 @@ def show_claim_analyzer():
                     if not df_calc.empty:
                         calc_context += f"\n\n# {uf_name}\n" + to_llm_context(df_calc)
                         st.info(
-                            f"✅ {uf_name}: "
+                            f"{uf_name}: "
                             f"{df_calc['article'].nunique()} статей · "
                             f"формат: {meta_calc.get('format','?')} · "
                             f"периоды: {sorted(df_calc['period'].unique().tolist())}"
                         )
                     else:
-                        st.warning(f"⚠️ {uf_name}: статьи затрат не найдены (пустой файл или незаполненный шаблон)")
+                        st.warning(f"{uf_name}: статьи затрат не найдены (пустой файл или незаполненный шаблон)")
                 except Exception as e:
                     st.warning(f"calc_parser [{uf_name}]: {e}")
 
@@ -1998,7 +1997,7 @@ def show_claim_analyzer():
             for uf_name, uf_bytes in ss.ca_uploaded_bytes.items():
                 if uf_name in calc_names:
                     continue
-                status.text(f"📄 Читаю {uf_name}...")
+                status.text(f"Читаю {uf_name}...")
                 try:
                     try:
                         from streamlit_pages.doc_scanner import extract_text
@@ -2022,7 +2021,7 @@ def show_claim_analyzer():
                 st.error("Не удалось извлечь данные.")
                 st.stop()
 
-            st.info(f"📊 Подготовлено: **{len(combined.split()):,} слов**")
+            st.info(f"Подготовлено: **{len(combined.split()):,} слов**")
 
             ss["_pbar_max"] = 0.25
 
@@ -2090,7 +2089,7 @@ def show_claim_analyzer():
 
             _save_log(ss.ca_org, ss.ca_period, summary, risks)
             pbar.progress(1.0)
-            status.success("✅ Анализ завершён!")
+            status.success("Анализ завершён!")
             st.rerun()
 
         if run_risks:
@@ -2115,7 +2114,7 @@ def show_claim_analyzer():
                         continue
                     if calc_names and uf_name not in calc_names:
                         continue
-                    status.text(f"📊 Парсю расчётный файл: {uf_name}...")
+                    status.text(f"Парсю расчётный файл: {uf_name}...")
                     pbar.progress(0.1)
                     try:
                         from core.calc_parser import parse_workbook, to_llm_context
@@ -2174,7 +2173,7 @@ def show_claim_analyzer():
             ss.ca_done       = True
             ss.ca_project_id = None
             pbar.progress(1.0)
-            status.success("✅ Риски обновлены!")
+            status.success("Риски обновлены!")
             st.rerun()
 
     # ── Баннер + кнопка «Сохранить в реестр» ─────────────────────────────────
@@ -2182,17 +2181,17 @@ def show_claim_analyzer():
         col_info, col_save = st.columns([4, 1])
         if ss.ca_project_id:
             col_info.success(
-                f"✅ Сохранено в реестр · ID: `{ss.ca_project_id}`"
+                f"Сохранено в реестр · ID: `{ss.ca_project_id}`"
                 + ("" if uploaded else f" · **{ss.ca_org or '—'}** · {ss.ca_period or '—'}")
             )
         elif not uploaded:
             col_info.info(
-                f"💾 Данные в памяти: **{ss.ca_org or '—'}** · {ss.ca_period or '—'}"
+                f"Данные в памяти: **{ss.ca_org or '—'}** · {ss.ca_period or '—'}"
             )
 
         if ss.ca_summary or ss.ca_risks:
             if col_save.button(
-                "💾 В реестр" if not ss.ca_project_id else "🔄 Обновить",
+                "Сохранить в реестр" if not ss.ca_project_id else "Обновить",
                 type="primary" if not ss.ca_project_id else "secondary",
                 use_container_width=True,
                 key="ca_save_registry",
@@ -2214,7 +2213,7 @@ def show_claim_analyzer():
                         project_id   = ss.ca_project_id,
                     )
                     ss.ca_project_id = pid
-                    st.success(f"✅ Сохранено: `{pid}`")
+                    st.success(f"Сохранено: `{pid}`")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Ошибка сохранения: {e}")
@@ -2235,9 +2234,9 @@ def show_claim_analyzer():
         diag = _rag_diagnose()
         if diag:
             if "недоступен" in diag or "Не удалось" in diag:
-                st.error(f"⚠️ {diag}")
+                st.error(diag)
             else:
-                st.caption(f"✅ {diag}")
+                st.caption(diag)
         # Реестр суммаризированных файлов
         file_sums = ss.get("ca_file_summaries", {})
         if file_sums:
@@ -2264,7 +2263,7 @@ def show_claim_analyzer():
     with tab_summary:
         st.subheader("Структурированное резюме заявки")
         if ss.ca_calc_context:
-            with st.expander("📊 Данные расчётного файла", expanded=False):
+            with st.expander("Данные расчётного файла", expanded=False):
                 st.code(ss.ca_calc_context[:5000], language=None)
                 if len(ss.ca_calc_context) > 5000:
                     st.caption(f"… ещё {len(ss.ca_calc_context)-5000} символов")
@@ -2272,7 +2271,7 @@ def show_claim_analyzer():
             st.caption(f"Объём: {len(ss.ca_summary.split()):,} слов")
             st.markdown(ss.ca_summary)
             st.download_button(
-                "⬇️ Скачать резюме (.txt)",
+                "Скачать резюме (.txt)",
                 data=ss.ca_summary.encode("utf-8"),
                 file_name=f"резюме_{ss.ca_org or 'заявка'}.txt",
                 mime="text/plain",
@@ -2289,7 +2288,7 @@ def show_claim_analyzer():
 
     # ── Обратная связь ────────────────────────────────────────────────────────
     st.divider()
-    with st.expander("📝 Сообщить об ошибке", expanded=False):
+    with st.expander("Сообщить об ошибке", expanded=False):
         with st.form("ca_fb"):
             issue = st.selectbox("Тип проблемы", [
                 "Файл не распознан", "Ошибка расчётного файла",
@@ -2303,7 +2302,7 @@ def show_claim_analyzer():
                         submit_feedback("user", issue, desc)
                     except Exception:
                         pass
-                    st.success("✅ Спасибо!")
+                    st.success("Отправлено. Спасибо!")
                 else:
                     st.warning("Опишите проблему")
 
@@ -2326,7 +2325,7 @@ def _show_registry():
 
     # ── Фильтры ───────────────────────────────────────────────────────────────
     fc1, fc2 = st.columns([3, 1])
-    search        = fc1.text_input("🔍 Поиск", placeholder="организация, период, тег...",
+    search        = fc1.text_input("Поиск", placeholder="организация, период, тег...",
                                    key="reg_search", label_visibility="collapsed")
     status_filter = fc2.selectbox("Статус", ["все"] + STATUSES,
                                   key="reg_status_filter", label_visibility="collapsed")
@@ -2335,7 +2334,7 @@ def _show_registry():
 
     if not projects:
         st.info(
-            "Реестр пуст. Выполните анализ заявки и нажмите «💾 В реестр»."
+            "Реестр пуст. Выполните анализ заявки и нажмите «Сохранить в реестр»."
             if not search and status_filter == "все"
             else "Нет заявок по выбранным фильтрам."
         )
@@ -2376,7 +2375,7 @@ def _show_registry():
                 update_status(pid, new_status)
                 st.rerun()
 
-            if hc3.button("🗑️", key=f"reg_del_{pid}",
+            if hc3.button("Удалить", key=f"reg_del_{pid}",
                           help="Удалить из реестра"):
                 ss = st.session_state
                 ss[f"reg_confirm_del_{pid}"] = True
@@ -2384,7 +2383,7 @@ def _show_registry():
             if st.session_state.get(f"reg_confirm_del_{pid}"):
                 st.warning(f"Удалить **{org} · {period}**? Это действие необратимо.")
                 da, db = st.columns(2)
-                if da.button("✅ Да, удалить", key=f"reg_del_yes_{pid}",
+                if da.button("Да, удалить", key=f"reg_del_yes_{pid}",
                              type="primary", use_container_width=True):
                     delete_project(pid)
                     st.session_state.pop(f"reg_confirm_del_{pid}", None)
@@ -2406,13 +2405,13 @@ def _show_registry():
 
                     fc1_f, fc2_f = st.columns([4, 1])
                     fc1_f.caption(
-                        f"{'📄' if not fpath else '📎'} {fname} · "
+                        f"{fname} · "
                         f"{_format_size(fsize)}"
                     )
                     if fpath:
                         with open(fpath, "rb") as f_bin:
                             fc2_f.download_button(
-                                "⬇️",
+                                "Скачать",
                                 data=f_bin.read(),
                                 file_name=fname,
                                 key=f"reg_dl_{pid}_{fname}",
@@ -2438,7 +2437,7 @@ def _show_registry():
                 if summary:
                     st.markdown(summary)
                     st.download_button(
-                        "⬇️ Скачать резюме (.txt)",
+                        "Скачать резюме (.txt)",
                         data=summary.encode("utf-8"),
                         file_name=f"резюме_{org}_{period}.txt",
                         mime="text/plain",
@@ -2451,7 +2450,7 @@ def _show_registry():
                 if risks:
                     st.markdown(risks)
                     st.download_button(
-                        "⬇️ Скачать риски (.txt)",
+                        "Скачать риски (.txt)",
                         data=risks.encode("utf-8"),
                         file_name=f"риски_{org}_{period}.txt",
                         mime="text/plain",
@@ -2463,7 +2462,7 @@ def _show_registry():
             # ── Загрузить в рабочую область ───────────────────────────────
             st.divider()
             if st.button(
-                f"↩️ Открыть в анализаторе",
+                f"Открыть в анализаторе",
                 key=f"reg_load_{pid}",
                 use_container_width=True,
                 help="Загрузить резюме и риски в текущую рабочую область",
