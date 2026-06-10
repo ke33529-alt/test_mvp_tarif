@@ -459,10 +459,11 @@ def parse_workbook(source) -> Tuple[pd.DataFrame, Dict]:
     return df, meta
 
 
-def to_llm_context(df: pd.DataFrame, max_articles: int = 50) -> str:
+def to_llm_context(df: pd.DataFrame, max_articles: int = 0) -> str:
     """
     Полный формат для LLM — сгруппирован по листу и статье.
     Только ненулевые статьи, отсортированы по убыванию значения.
+    max_articles=0 — без ограничений (отбор делается на этапе апрува заявки).
     """
     if df.empty:
         return "Расчётный файл не содержит данных."
@@ -470,10 +471,8 @@ def to_llm_context(df: pd.DataFrame, max_articles: int = 50) -> str:
     lines = []
     for sheet, sdf in df.groupby("sheet", sort=False):
         lines.append(f"\n# {sheet}")
-        top = (
-            sdf.groupby("article")["value"].max().abs()
-            .sort_values(ascending=False).head(max_articles).index
-        )
+        ranked = sdf.groupby("article")["value"].max().abs().sort_values(ascending=False)
+        top = ranked.head(max_articles).index if max_articles > 0 else ranked.index
         for article in top:
             adf = sdf[sdf["article"] == article].sort_values("period")
             lines.append(f"\n★ {article}")
@@ -492,18 +491,17 @@ def to_llm_context(df: pd.DataFrame, max_articles: int = 50) -> str:
     return "\n".join(lines)
 
 
-def to_llm_context_compact(df: pd.DataFrame, max_articles: int = 30) -> str:
+def to_llm_context_compact(df: pd.DataFrame, max_articles: int = 0) -> str:
     """
     Компактный формат для промпта (меньше токенов).
     Статья: год/тип=значение, ...
+    max_articles=0 — без ограничений.
     """
     if df.empty:
         return "Нет данных."
 
-    top = (
-        df.groupby("article")["value"].max().abs()
-        .sort_values(ascending=False).head(max_articles).index
-    )
+    ranked = df.groupby("article")["value"].max().abs().sort_values(ascending=False)
+    top = ranked.head(max_articles).index if max_articles > 0 else ranked.index
     lines = []
     for article in top:
         adf = df[df["article"] == article].sort_values("period")

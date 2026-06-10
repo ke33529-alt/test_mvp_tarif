@@ -596,9 +596,16 @@ def _format_chunks_for_prompt(chunks: List[Dict], max_chars: int = 6500) -> str:
     return "\n\n".join(lines)
 
 
+def _has_nonzero_value(amounts: str) -> bool:
+    """True если есть хоть одно ненулевое значение (после = или :, не годы)."""
+    nums = re.findall(r"[=:]\s*([\d]+(?:[.,]\d+)?)", amounts)
+    return any(float(n.replace(",", ".")) != 0.0 for n in nums if n)
+
+
 def _extract_articles_from_context(calc_context: str) -> List[Dict]:
     """
     Извлекает список статей затрат из контекста calc_parser.
+    Статьи, у которых все значения нулевые, пропускаются.
 
     Поддерживает два формата:
 
@@ -632,8 +639,11 @@ def _extract_articles_from_context(calc_context: str) -> List[Dict]:
                 j += 1
             amounts = " | ".join(amounts_parts)
             if name and name not in seen and len(name) > 3:
-                seen.add(name)
-                articles.append({"name": name, "amounts": amounts})
+                if _has_nonzero_value(amounts):
+                    seen.add(name)
+                    articles.append({"name": name, "amounts": amounts})
+                else:
+                    print(f"[EXTRACT] Пропускаю нулевую статью: {name[:50]}")
             i = j
             continue
 
@@ -643,12 +653,15 @@ def _extract_articles_from_context(calc_context: str) -> List[Dict]:
             name  = parts[0].strip()
             amounts = parts[1].strip() if len(parts) > 1 else ""
             if name and name not in seen and len(name) > 3:
-                seen.add(name)
-                articles.append({"name": name, "amounts": amounts})
+                if _has_nonzero_value(amounts):
+                    seen.add(name)
+                    articles.append({"name": name, "amounts": amounts})
+                else:
+                    print(f"[EXTRACT] Пропускаю нулевую статью: {name[:50]}")
 
         i += 1
 
-    return articles[:40]
+    return articles
 
 
 
@@ -866,19 +879,17 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 SIMILARITY_GREEN  = 0.85   # >= 85% → 🟢 принудительно
 SIMILARITY_YELLOW = 0.60   # >= 60% → 🟡 принудительно, < 60% → не учитываем
 
-# Строки-маркеры для фильтрации тарифных показателей (не статей затрат)
-# Намеренно НЕ включаем слово "тариф" — оно встречается в названиях параметров ФОТ
+# Минимальный фильтр — только чистые строки-итоги без содержательных статей затрат.
+# calc_parser сам отбирает статьи; здесь отсекаем лишь технические агрегаты.
 _SKIP_ARTICLE_PATTERNS = re.compile(
-    r"^(нвв|необходимая валовая выручка|средневзвешенный тариф|"
-    r"всего по тарифу|итого нвв|итого по тарифу|"
-    r"тариф на .+воду|тариф для населения|тариф \(в рамках)",
+    r"^(средневзвешенный тариф$|всего по тарифу$|итого нвв$|итого по тарифу$)",
     re.IGNORECASE,
 )
 
 
 def _should_skip_article(name: str) -> bool:
-    """True если статья является тарифным показателем а не статьёй затрат."""
-    return bool(_SKIP_ARTICLE_PATTERNS.search(name.strip()))
+    """True только для агрегирующих строк-итогов без содержательных данных."""
+    return bool(_SKIP_ARTICLE_PATTERNS.match(name.strip()))
 
 
 def _match_docs_to_article(article_name: str,
@@ -989,68 +1000,111 @@ def _extract_file_text(file_bytes: bytes, file_name: str) -> str:
         return ""
 
 
-# Параметры MAP-REDUCE для суммаризации файлов
-_FILE_SUMMARY_CHUNK_SIZE   = 6_000
-_FILE_SUMMARY_MAP_TOKENS   = 100
-_FILE_SUMMARY_FINAL_TOKENS = 300
-_FILE_SUMMARY_THRESHOLD    = 6_000
+# Параметры суммаризации файлов
+_FILE_SUMMARY_FINAL_TOKENS = 300   # токенов на ответ одиночного вызова (fallback)
+
+
+# Параметры батчевой суммаризации файлов
+_FILE_HEAD_CHARS  = 1_500   # символов с начала каждого файла
+_FILE_BATCH_SIZE  = 10      # файлов в одном LLM-вызове
+
+
+def _extract_file_head(file_bytes: bytes, file_name: str,
+                       max_chars: int = _FILE_HEAD_CHARS) -> str:
+    """Извлекает первые max_chars символов из файла (только первая страница)."""
+    try:
+        try:
+            from streamlit_pages.doc_scanner import extract_text as _et_h
+        except ImportError:
+            from doc_scanner import extract_text as _et_h
+        pages = _et_h(file_bytes, file_name)
+        # Читаем только первую страницу — не запускаем OCR на всём документе
+        text = (pages[0]["text"] if pages else "").strip()
+        if not text and len(pages) > 1:
+            text = pages[1].get("text", "").strip()
+    except Exception:
+        text = file_bytes.decode("utf-8", errors="ignore").strip()
+    head = text[:max_chars]
+    print(f"[ANALYSIS] Голова {file_name[:30]}: {len(head)} симв")
+    return head
+
+
+def _summarize_file_batch(file_heads: Dict[str, str]) -> Dict[str, str]:
+    """
+    Суммаризирует батч файлов за ОДИН LLM-вызов.
+    file_heads: {имя_файла: первые 1500 симв}
+    Возвращает {имя_файла: краткое_резюме}.
+
+    Бюджет токенов при батче 10 файлов × 1500 симв:
+      10 × 1500 / 4 ≈ 3750 токенов входа — комфортно для 20k контекста.
+    Ответ: 10 файлов × 2 предложения ≈ 500 токенов.
+    """
+    if not file_heads:
+        return {}
+
+    prompts = load_prompts()
+    system = prompts.get(
+        "claim_file_summary_system",
+        "Ты аудитор тарифных заявок РФ. Кратко описываешь документы. Только русский язык."
+    )
+
+    # Формируем блок с нумерованными файлами
+    blocks = []
+    file_list = list(file_heads.items())
+    for idx, (fname, head) in enumerate(file_list, 1):
+        blocks.append(f"=== Документ {idx}: {fname} ===\n{head}")
+
+    user = (
+        f"Для каждого из {len(file_list)} документов напиши краткое резюме "
+        "(1-2 предложения): что за документ, стороны, предмет, суммы/даты, "
+        "к каким статьям затрат относится.\n\n"
+        "Формат ответа — строго для каждого документа:\n"
+        "Документ 1: <резюме>\n"
+        "Документ 2: <резюме>\n"
+        "...и так далее.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+    max_tokens = len(file_list) * 80  # ~80 токенов на файл
+    raw = _lm_call(system, user, max_tokens=max(max_tokens, 400)).strip()
+    print(f"[ANALYSIS] Батч-самари {len(file_list)} файлов: {len(raw)} симв ответа")
+
+    # Парсим ответ: "Документ N: текст"
+    results: Dict[str, str] = {}
+    pat = re.compile(r"Документ\s+(\d+)\s*:\s*(.+?)(?=Документ\s+\d+\s*:|$)",
+                     re.DOTALL | re.IGNORECASE)
+    for m in pat.finditer(raw):
+        idx = int(m.group(1)) - 1
+        text = m.group(2).strip().replace("\n", " ")
+        if 0 <= idx < len(file_list):
+            fname = file_list[idx][0]
+            results[fname] = text
+            print(f"[ANALYSIS]   [{idx+1}] {fname[:30]}: {text[:60]}")
+
+    # Fallback: если парсинг не сработал — весь ответ на первый файл
+    if not results and file_list:
+        results[file_list[0][0]] = raw[:200]
+
+    return results
 
 
 def _summarize_file(file_name: str, file_text: str) -> str:
-    """
-    Суммаризирует один файл через LLM.
-    Короткие < 6000 симв: один вызов 300 токенов.
-    Длинные: MAP-REDUCE — MAP 100 токенов/чанк, REDUCE 300 токенов.
-    """
+    """Одиночная суммаризация (fallback, используется из _build_claim_summary_from_heads)."""
     if not file_text or len(file_text.strip()) < 50:
         return ""
-
     prompts = load_prompts()
     system  = prompts.get(
         "claim_file_summary_system",
         "Ты аудитор тарифных заявок. Кратко описываешь документы. Только русский язык."
     )
-
-    if len(file_text) <= _FILE_SUMMARY_THRESHOLD:
-        user = (
-            f"Документ: {file_name}\n\n"
-            "Напиши краткое резюме (2-4 предложения). "
-            "Что за документ, стороны, предмет, суммы/даты, к каким расходам относится.\n\n"
-            f"ТЕКСТ:\n{file_text}"
-        )
-        result = _lm_call(system, user, max_tokens=_FILE_SUMMARY_FINAL_TOKENS).strip()
-        print(f"[ANALYSIS] Самари {file_name[:30]}: {len(result)} симв (прямой)")
-        return result
-
-    chunks = _split_chunks_dynamic(file_text, _FILE_SUMMARY_CHUNK_SIZE)
-    total  = len(chunks)
-    print(f"[ANALYSIS] MAP-REDUCE {file_name[:30]}: {total} чанков")
-
-    mini_summaries = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"[ANALYSIS] MAP {i}/{total}: {file_name[:25]}...")
-        map_user = (
-            f"Часть {i}/{total} документа «{file_name}».\n"
-            "Выдели ключевые факты (1-2 предложения): "
-            "что за документ, стороны, суммы, даты, предмет.\n\n"
-            f"ТЕКСТ:\n{chunk}"
-        )
-        mini = _lm_call(system, map_user, max_tokens=_FILE_SUMMARY_MAP_TOKENS).strip()
-        if mini:
-            mini_summaries.append(mini)
-
-    if not mini_summaries:
-        return ""
-
-    combined = "\n".join(f"- {m}" for m in mini_summaries)
-    reduce_user = (
+    head = file_text[:_FILE_HEAD_CHARS].strip()
+    user = (
         f"Документ: {file_name}\n\n"
-        "На основе этих фрагментов составь единое резюме (2-4 предложения).\n\n"
-        f"ФРАГМЕНТЫ:\n{combined}"
+        "Напиши краткое резюме (1-2 предложения): "
+        "что за документ, стороны, предмет, суммы/даты, к каким расходам относится.\n\n"
+        f"НАЧАЛО ТЕКСТА:\n{head}"
     )
-    result = _lm_call(system, reduce_user, max_tokens=_FILE_SUMMARY_FINAL_TOKENS).strip()
-    print(f"[ANALYSIS] Самари {file_name[:30]}: {len(result)} симв (MAP-REDUCE {total} чанков)")
-    return result
+    return _lm_call(system, user, max_tokens=_FILE_SUMMARY_FINAL_TOKENS).strip()
 
 
 def _build_file_summaries(
@@ -1060,6 +1114,8 @@ def _build_file_summaries(
 ) -> Dict[str, str]:
     """
     Суммаризирует все документальные файлы заявки (не Excel).
+    Батч по _FILE_BATCH_SIZE файлов за один LLM-вызов.
+    Читает только первые _FILE_HEAD_CHARS символов каждого файла.
     Возвращает {имя_файла: краткое_содержание}.
     """
     doc_files = [
@@ -1073,20 +1129,38 @@ def _build_file_summaries(
 
     _init_ocr_for_analysis()
 
-    summaries: Dict[str, str] = {}
-    for i, file_name in enumerate(doc_files, 1):
-        if progress_cb:
-            progress_cb(i / len(doc_files),
-                        f"Суммаризация {i}/{len(doc_files)}: {file_name[:35]}...")
-        file_text = _extract_file_text(uploaded_bytes[file_name], file_name)
-        if not file_text:
+    # Шаг 1: извлекаем заголовки всех файлов
+    if progress_cb:
+        progress_cb(0.1, f"Читаю заголовки {len(doc_files)} файлов...")
+    file_heads: Dict[str, str] = {}
+    for file_name in doc_files:
+        head = _extract_file_head(uploaded_bytes[file_name], file_name)
+        if head:
+            file_heads[file_name] = head
+        else:
             print(f"[ANALYSIS] Пустой текст: {file_name} — пропускаем")
-            continue
-        summary = _summarize_file(file_name, file_text)
-        if summary:
-            summaries[file_name] = summary
 
-    print(f"[ANALYSIS] Суммаризировано файлов: {len(summaries)}")
+    if not file_heads:
+        return {}
+
+    # Шаг 2: батчевая суммаризация — по _FILE_BATCH_SIZE файлов за вызов
+    summaries: Dict[str, str] = {}
+    items     = list(file_heads.items())
+    n_batches = -(-len(items) // _FILE_BATCH_SIZE)  # ceil
+
+    for b_idx in range(n_batches):
+        batch = dict(items[b_idx * _FILE_BATCH_SIZE : (b_idx + 1) * _FILE_BATCH_SIZE])
+        if progress_cb:
+            progress_cb(
+                0.2 + (b_idx + 1) / n_batches * 0.8,
+                f"Суммаризация батча {b_idx + 1}/{n_batches} "
+                f"({len(batch)} файлов)..."
+            )
+        batch_result = _summarize_file_batch(batch)
+        summaries.update(batch_result)
+
+    print(f"[ANALYSIS] Суммаризировано файлов: {len(summaries)} "
+          f"за {n_batches} батч(а/ей)")
     return summaries
 
 
@@ -1149,7 +1223,7 @@ def _match_files_to_article(
 def _parse_article_result(text: str) -> Dict:
     """Парсит структурированный ответ модели по одной статье."""
     result = {
-        "risk": "unknown", "risk_emoji": "⚪",
+        "risk": "red", "risk_emoji": "🔴",
         "document": "не указан",
         "basis": "", "recommendation": "",
     }
@@ -1188,27 +1262,532 @@ def _parse_article_result(text: str) -> Dict:
     return result
 
 
-def _render_risks_tab(risks_json: str):
+
+
+# =============================================================================
+# Расчёт роста статей затрат (детерминированный цвет)
+# =============================================================================
+
+def _parse_amounts_timeseries(amounts_str: str) -> List[Tuple[int, str, float]]:
+    """
+    Разбирает строку amounts в список (year, label, value).
+    Поддерживает форматы:
+      - "2024 (Факт): 12 345 тыс.руб. | 2025 (Принято): 13 000 тыс.руб."
+      - "2024/Фак=12345, 2025/При=13000"
+    Возвращает отсортированный по году список.
+    """
+    results: List[Tuple[int, str, float]] = []
+
+    # Формат полный: "2025 (Принято): 12 345 тыс.руб."
+    pat_full = re.compile(
+        r"(\d{4})\s*\(([^)]+)\)\s*:\s*([\d\s]+(?:[.,]\d+)?)\s*тыс",
+        re.IGNORECASE,
+    )
+    for m in pat_full.finditer(amounts_str):
+        yr  = int(m.group(1))
+        lbl = m.group(2).strip()
+        val_str = m.group(3).replace(" ", "").replace(",", ".")
+        try:
+            results.append((yr, lbl, float(val_str)))
+        except ValueError:
+            pass
+
+    # Формат компактный: "2025/При=13000"
+    if not results:
+        pat_compact = re.compile(r"(\d{4})/([^=,\s]+)=([\d.]+)")
+        for m in pat_compact.finditer(amounts_str):
+            yr  = int(m.group(1))
+            lbl = m.group(2).strip()
+            try:
+                results.append((yr, lbl, float(m.group(3))))
+            except ValueError:
+                pass
+
+    results.sort(key=lambda x: x[0])
+    return results
+
+
+def _classify_label_priority(label: str) -> int:
+    """Приоритет типа значения: факт > предвар. > план > принято > прочее."""
+    lbl = label.lower()
+    if any(k in lbl for k in ("факт", "отч")):
+        return 0
+    if any(k in lbl for k in ("предв", "пред")):
+        return 1
+    if any(k in lbl for k in ("план", "план")):
+        return 2
+    if any(k in lbl for k in ("прин", "при")):
+        return 3
+    return 4
+
+
+def _get_growth_color(amounts_str: str, reg_year: int,
+                      target_pct: float, risk_pct: float
+                      ) -> Tuple[str, str, Optional[float], Optional[float]]:
+    """
+    Определяет цвет риска по росту статьи затрат.
+
+    reg_year    — регулируемый год (год, по которому ищем значение)
+    target_pct  — целевой индекс роста, % (например 5.0 → 1.05)
+    risk_pct    — порог риска, % поверх целевого (например 10.0 → 1.15)
+
+    Возвращает (color, reason, base_val, reg_val).
+    """
+    ts = _parse_amounts_timeseries(amounts_str)
+    if not ts:
+        return "yellow", "нет данных для расчёта роста", None, None
+
+    # Значение регулируемого года
+    reg_vals = [(yr, lbl, v) for yr, lbl, v in ts if yr == reg_year]
+    if not reg_vals:
+        return "yellow", f"год {reg_year} не найден в данных", None, None
+    reg_vals.sort(key=lambda x: _classify_label_priority(x[1]))
+    _, reg_lbl, reg_val = reg_vals[0]
+
+    # Базовое значение: лучший вариант предыдущего года
+    prev_vals = [(yr, lbl, v) for yr, lbl, v in ts if yr < reg_year]
+    if not prev_vals:
+        return "yellow", "нет предыдущего периода для сравнения", None, reg_val
+    prev_vals.sort(key=lambda x: (-x[0], _classify_label_priority(x[1])))
+    _, base_lbl, base_val = prev_vals[0]
+
+    if base_val <= 0:
+        return "yellow", "базовое значение равно нулю", base_val, reg_val
+
+    growth = (reg_val - base_val) / base_val * 100  # в процентах
+    target = target_pct
+    risk   = target_pct + risk_pct
+
+    if growth > risk:
+        reason = (f"рост {growth:+.1f}% превышает критический порог {risk:.1f}% "
+                  f"(целевой {target:.1f}% + рисковый {risk_pct:.1f}%)")
+        return "red", reason, base_val, reg_val
+    elif growth > target:
+        reason = (f"рост {growth:+.1f}% превышает целевой индекс {target:.1f}%")
+        return "yellow", reason, base_val, reg_val
+    else:
+        reason = (f"рост {growth:+.1f}% в пределах целевого индекса {target:.1f}%")
+        return "green", reason, base_val, reg_val
+
+
+# =============================================================================
+# Резюме заявки на основе первых 1000 симв каждого файла
+# =============================================================================
+
+# Размер группы статей для одного MAP-вызова резюме
+_SUMMARY_MAP_GROUP = 50
+
+
+def _build_claim_summary_from_heads(
+    uploaded_bytes: Dict[str, bytes],
+    calc_file_names: List[str],
+    calc_context: str,
+    article_results: List[Dict],
+    org: str,
+    period: str,
+    progress_cb=None,
+) -> str:
+    """
+    Строит итоговое резюме заявки в стиле регулятора РФ.
+
+    MAP-REDUCE по статьям затрат:
+      - Группы по _SUMMARY_MAP_GROUP статей → промежуточное резюме (MAP)
+      - Все промежуточные резюме + документы + calc → финальное резюме (REDUCE)
+
+    Укладывается в 20 000 токенов контекста при любом числе статей.
+    """
+    prompts = load_prompts()
+
+    system = prompts.get(
+        "claim_summary_system",
+        (
+            "Ты — старший эксперт-аудитор тарифного регулятора РФ (ФАС/РЭК). "
+            "Составляешь официальное заключение о тарифной заявке. "
+            "Стиль — деловой, лаконичный. Только русский язык."
+        )
+    )
+
+    # ── Собираем заголовки документов (первые 1000 симв, макс 8 файлов) ────────
+    doc_heads = []
+    for fname, fbytes in uploaded_bytes.items():
+        if fname in calc_file_names:
+            continue
+        ext = os.path.splitext(fname.lower())[1]
+        if ext not in (".pdf", ".docx", ".doc", ".txt"):
+            continue
+        try:
+            try:
+                from streamlit_pages.doc_scanner import extract_text as _et2
+            except ImportError:
+                from doc_scanner import extract_text as _et2
+            pages = _et2(fbytes, fname)
+            raw = "\n".join(p["text"] for p in pages).strip()
+        except Exception:
+            raw = fbytes.decode("utf-8", errors="ignore").strip()
+        head = raw[:1000].strip()
+        if head:
+            doc_heads.append(f"[{fname}]:\n{head}")
+        if len(doc_heads) >= 8:
+            break
+
+    docs_block = "\n\n".join(doc_heads)[:3000] or "(документы не приложены)"
+    calc_block = calc_context[:1500] if calc_context else "(расчётный файл не загружен)"
+
+    # ── MAP: группы по _SUMMARY_MAP_GROUP статей → промежуточные блоки ─────────
+    art_items = [
+        f"• {a['name']} [{a.get('risk','?')}]: {a.get('article_summary','')[:120]}"
+        for a in article_results
+        if a.get("article_summary") or a.get("name")
+    ]
+
+    map_blocks: List[str] = []
+
+    if not art_items:
+        # Нет статей — пропускаем MAP-фазу
+        map_blocks = ["(статьи затрат не распознаны)"]
+
+    elif len(art_items) <= _SUMMARY_MAP_GROUP:
+        # Мало статей — MAP не нужен, используем напрямую
+        map_blocks = ["\n".join(art_items)]
+
+    else:
+        # Много статей — MAP по группам
+        groups = [
+            art_items[i: i + _SUMMARY_MAP_GROUP]
+            for i in range(0, len(art_items), _SUMMARY_MAP_GROUP)
+        ]
+        n_groups = len(groups)
+        print(f"[SUMMARY] MAP: {len(art_items)} статей → {n_groups} групп")
+
+        for gi, group in enumerate(groups):
+            if progress_cb:
+                progress_cb(
+                    0.1 + gi / n_groups * 0.6,
+                    f"Резюме: группа статей {gi + 1}/{n_groups}..."
+                )
+            group_text = "\n".join(group)
+            map_user = (
+                f"Группа {gi + 1}/{n_groups} статей затрат тарифной заявки "
+                f"({org or '—'}, {period or '—'}).\n\n"
+                "Кратко (3-5 предложений) опиши структуру и динамику этих статей: "
+                "общий объём, наиболее значимые статьи, характер роста.\n\n"
+                f"СТАТЬИ:\n{group_text}"
+            )
+            block = _lm_call(system, map_user, max_tokens=250).strip()
+            if block:
+                map_blocks.append(f"=== Группа {gi + 1} ===\n{block}")
+            print(f"[SUMMARY] MAP {gi + 1}/{n_groups}: {len(block)} симв")
+
+    # ── REDUCE: финальное резюме ─────────────────────────────────────────────
+    if progress_cb:
+        progress_cb(0.75, "Формирую итоговое резюме заявки...")
+
+    arts_combined = "\n\n".join(map_blocks)[:4000]
+
+    reduce_user = (
+        f"Организация: {org or 'не указана'}\n"
+        f"Период регулирования: {period or 'не указан'}\n\n"
+        "Составь РЕЗЮМЕ ТАРИФНОЙ ЗАЯВКИ (200–300 слов) в стиле заключения регулятора.\n\n"
+        "Структура:\n"
+        "**1. Суть заявки** — что организация просит утвердить, вид деятельности, период.\n"
+        "**2. Состав заявки** — какие документы приложены, общая укомплектованность.\n"
+        "**3. Структура затрат** — ключевые статьи и их динамика (цифры если есть).\n"
+        "**4. Предварительная оценка** — уровень обоснованности, уязвимые позиции.\n\n"
+        f"РАСЧЁТНЫЙ ФАЙЛ:\n{calc_block}\n\n"
+        f"АНАЛИЗ СТАТЕЙ ЗАТРАТ:\n{arts_combined}\n\n"
+        f"ДОКУМЕНТЫ ЗАЯВКИ:\n{docs_block}"
+    )
+
+    result = _lm_call(system, reduce_user, max_tokens=700).strip()
+    if progress_cb:
+        progress_cb(1.0, "Резюме готово")
+    print(f"[SUMMARY] Итог: {len(result)} симв, {len(art_items)} статей, "
+          f"{len(map_blocks)} MAP-блоков")
+    return result
+
+
+
+
+
+def _strip_leading_emoji(s: str) -> str:
+    """Убирает эмодзи и мусорные символы с начала строки."""
+    return re.sub(r"^[🌀-🿿☀-⟿\s🟴🔴🟡🟢⚪]+", "", s).strip()
+
+
+def _parse_article_result_v2(text: str) -> Dict:
+    """Парсит ответ LLM по одной статье (новый формат: ДИНАМИКА/ОСНОВАНИЕ/РЕКОМЕНДАЦИЯ)."""
+    result = {"dynamics": "", "basis": "", "recommendation": ""}
+    for line in text.splitlines():
+        s = line.strip()
+        up = s.upper()
+        if up.startswith("ДИНАМИКА:"):
+            result["dynamics"] = _strip_leading_emoji(s[9:])
+        elif up.startswith("ОСНОВАНИЕ:"):
+            result["basis"] = _strip_leading_emoji(s[10:])
+        elif up.startswith("РЕКОМЕНДАЦИЯ:"):
+            result["recommendation"] = _strip_leading_emoji(s[13:])
+    # Fallback: если модель не использовала метки — берём весь текст как динамику
+    if not result["dynamics"] and not result["basis"]:
+        result["dynamics"] = _strip_leading_emoji(text.strip()[:250])
+    return result
+
+
+
+
+
+# Фирменный цвет платформы
+_BRAND_COLOR       = "#1a6b7c"
+_BRAND_COLOR_LIGHT = "#2a8fa5"
+_COLOR_RED         = "#e05252"
+_COLOR_YELLOW      = "#d4a017"
+_COLOR_GREEN       = "#3a9e6e"
+
+
+def _render_timeseries_chart(ts, reg_year, risk, target_pct=5.0):
+    """
+    SVG-график временного ряда статьи затрат.
+    ts: список (year, label, value) отсортированный по году.
+    Строит отдельную линию для каждого уникального label.
+    """
+    if not ts or len(ts) < 2:
+        return ""
+
+    from collections import OrderedDict
+
+    # ── Группируем по label ───────────────────────────────────────────────────
+    series: dict = OrderedDict()
+    for yr, lbl, v in ts:
+        series.setdefault(lbl, []).append((yr, v))
+    for lbl in series:
+        series[lbl].sort(key=lambda x: x[0])
+    if not series:
+        return ""
+
+    # Серии с >= 2 точками — линии; с 1 точкой — только маркер
+    line_series  = {k: v for k, v in series.items() if len(v) >= 2}
+    point_series = {k: v for k, v in series.items() if len(v) == 1}
+    # Если нет ни одной линейной серии — рисуем все как точки
+    if not line_series:
+        line_series  = series
+        point_series = {}
+
+    n_series = len(series)
+    # Легенда справа от графика
+    max_lbl_len = max(len(lbl) for lbl in series) if series else 6
+    LEG_W    = 26 + max_lbl_len * 7   # ширина колонки легенды (пикселей)
+    W        = 420
+    H        = 155
+    PAD_L    = 56
+    PAD_R    = 12 + LEG_W             # правый отступ = место под легенду
+    PAD_T    = 18
+    PAD_B    = 34
+    CW       = W - PAD_L - PAD_R
+    CH       = H - PAD_T - PAD_B
+
+    all_vals  = [v for pts in series.values() for _, v in pts]
+    vmin, vmax = min(all_vals), max(all_vals)
+    vrange    = vmax - vmin or 1
+
+    all_years = sorted({yr for pts in series.values() for yr, _ in pts})
+    n_years   = len(all_years)
+    year_idx  = {yr: i for i, yr in enumerate(all_years)}
+
+    def px(yr):
+        i = year_idx.get(yr, 0)
+        return PAD_L + (i / (n_years - 1)) * CW if n_years > 1 else PAD_L + CW / 2
+
+    def py(v):
+        return PAD_T + CH - ((v - vmin) / vrange) * CH
+
+    def fmt_val(v):
+        if abs(v) >= 1_000_000:
+            return f"{v/1_000_000:.1f}М"
+        if abs(v) >= 10_000:
+            return f"{v/1000:.0f}К"
+        return f"{v:,.0f}"
+
+    base_color = {"red": _COLOR_RED, "yellow": _COLOR_YELLOW,
+                  "green": _COLOR_GREEN}.get(risk, _BRAND_COLOR)
+    _PAL = [base_color, "#2a8fa5", "#6cb4c2", "#9ecdd6", "#aaaaaa"]
+    lbl_colors = {lbl: _PAL[i % len(_PAL)] for i, lbl in enumerate(series)}
+
+    uid = abs(hash(str(ts) + str(reg_year))) % 999999
+
+    # Целевой рост — пунктир от первой точки первой серии
+    target_svg = ""
+    first_pts  = next(iter(series.values()))
+    if len(first_pts) >= 2:
+        base_v = first_pts[0][1]
+        coords = []
+        for yr in all_years:
+            i     = year_idx[yr]
+            t_val = base_v * ((1 + target_pct / 100) ** i)
+            y_c   = max(PAD_T, min(PAD_T + CH, py(
+                min(max(t_val, vmin - vrange * 0.05), vmax + vrange * 0.05)
+            )))
+            coords.append(f"{px(yr):.1f},{y_c:.1f}")
+        target_svg = (
+            '<polyline points="' + " ".join(coords) + '" '
+            'fill="none" stroke="' + _COLOR_YELLOW + '" '
+            'stroke-width="1.2" stroke-dasharray="5,3" opacity="0.5"/>'
+        )
+
+    # Ось X — прореживаем
+    step = max(1, n_years // 14)
+    x_labels = ""
+    for i, yr in enumerate(all_years):
+        if i % step == 0 or yr == reg_year:
+            x_labels += (
+                f'<text x="{px(yr):.1f}" y="{H - PAD_B + 14}" '
+                f'text-anchor="middle" font-size="9" fill="#999">{yr}</text>'
+            )
+
+    y_labels = (
+        f'<text x="{PAD_L - 4}" y="{PAD_T + CH}" '
+        f'text-anchor="end" font-size="10" fill="#999">{fmt_val(vmin)}</text>'
+        f'<text x="{PAD_L - 4}" y="{PAD_T + 8}" '
+        f'text-anchor="end" font-size="10" fill="#999">{fmt_val(vmax)}</text>'
+    )
+
+    lines_svg = grad_svg = circles_svg = legend_svg = ""
+
+    for s_idx, (lbl, pts) in enumerate(line_series.items()):
+        color      = lbl_colors[lbl]
+        is_primary = s_idx == 0
+        poly_pts   = " ".join(f"{px(yr):.1f},{py(v):.1f}" for yr, v in pts)
+        sw         = "2.5" if is_primary else "1.8"
+        dash       = "" if is_primary else ' stroke-dasharray="6,3"'
+
+        lines_svg += (
+            f'<polyline points="{poly_pts}" fill="none" stroke="{color}" '
+            f'stroke-width="{sw}" stroke-linejoin="round" '
+            f'stroke-linecap="round"{dash} opacity="0.9"/>'
+        )
+
+        if is_primary and len(pts) >= 2:
+            area_p = (
+                f"{px(pts[0][0]):.1f},{PAD_T + CH} "
+                + poly_pts
+                + f" {px(pts[-1][0]):.1f},{PAD_T + CH}"
+            )
+            grad_svg += (
+                f'<defs><linearGradient id="ag{uid}" x1="0" y1="0" x2="0" y2="1">'
+                f'<stop offset="0%" stop-color="{color}" stop-opacity="0.18"/>'
+                f'<stop offset="100%" stop-color="{color}" stop-opacity="0.01"/>'
+                f'</linearGradient></defs>'
+                f'<polygon points="{area_p}" fill="url(#ag{uid})"/>'
+            )
+
+        for yr, v in pts:
+            cx, cy = px(yr), py(v)
+            is_reg = (yr == reg_year)
+            r      = 5 if is_reg else 3
+            cf     = color if is_reg else "#fff"
+            cs     = "#fff" if is_reg else color
+            tip    = f"{yr} ({lbl}): {v:,.0f} тыс.руб."
+            circles_svg += (
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" '
+                f'fill="{cf}" stroke="{cs}" stroke-width={"2" if is_reg else "1.5"}>'
+                f'<title>{tip}</title></circle>'
+            )
+            if is_reg and is_primary:
+                ty = cy - 9 if cy - 9 >= PAD_T + 6 else cy + 14
+                circles_svg += (
+                    f'<text x="{cx:.1f}" y="{ty:.1f}" '
+                    f'text-anchor="middle" font-size="9" font-weight="bold" '
+                    f'fill="{color}">{fmt_val(v)}</text>'
+                )
+
+    # Однопунктные серии — только маркеры (ромб) без линии
+    for lbl, pts in point_series.items():
+        color = lbl_colors[lbl]
+        yr, v = pts[0]
+        cx, cy = px(yr), py(v)
+        is_reg = (yr == reg_year)
+        r = 5 if is_reg else 4
+        tip = f"{yr} ({lbl}): {v:,.0f} тыс.руб."
+        # Ромб вместо круга — визуально отличается от линейных серий
+        d = r
+        circles_svg += (
+            f'<polygon points="{cx:.1f},{cy-d:.1f} {cx+d:.1f},{cy:.1f} '
+            f'{cx:.1f},{cy+d:.1f} {cx-d:.1f},{cy:.1f}" '
+            f'fill="{color}" stroke="#fff" stroke-width="1.5" opacity="0.9">'
+            f'<title>{tip}</title></polygon>'
+        )
+        # Подпись значения
+        ty = cy - 9 if cy - 9 >= PAD_T + 6 else cy + 14
+        circles_svg += (
+            f'<text x="{cx:.1f}" y="{ty:.1f}" '
+            f'text-anchor="middle" font-size="9" fill="{color}">{fmt_val(v)}</text>'
+        )
+
+    # Легенда справа от области графика
+    leg_x = W - LEG_W + 4   # X-начало легенды
+    for i, (lbl, _) in enumerate(series.items()):
+        color  = lbl_colors[lbl]
+        ly     = PAD_T + i * 18
+        is_pt  = lbl in point_series
+        if is_pt:
+            mx, my = leg_x + 9, ly + 4
+            legend_svg += (
+                f'<polygon points="{mx},{my-4} {mx+4},{my} {mx},{my+4} {mx-4},{my}" '
+                f'fill="{color}" opacity="0.9"/>'
+            )
+        else:
+            dash_l = "" if i == 0 else ' stroke-dasharray="5,3"'
+            legend_svg += (
+                f'<line x1="{leg_x}" y1="{ly+4}" x2="{leg_x+18}" y2="{ly+4}" '
+                f'stroke="{color}" stroke-width="2"{dash_l}/>'
+            )
+        legend_svg += (
+            f'<text x="{leg_x + 22}" y="{ly + 8}" '
+            f'font-size="10" fill="#888">{lbl}</text>'
+        )
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {W} {H}" '
+        f'style="font-family:sans-serif;display:block;width:60%;min-height:180px;">'
+        f'{grad_svg}'
+        f'<line x1="{PAD_L}" y1="{PAD_T}" x2="{PAD_L}" y2="{PAD_T+CH}" stroke="#e0e0e0" stroke-width="1"/>'
+        f'<line x1="{PAD_L}" y1="{PAD_T+CH}" x2="{PAD_L+CW}" y2="{PAD_T+CH}" stroke="#e0e0e0" stroke-width="1"/>'
+        f'{target_svg}{lines_svg}{circles_svg}{x_labels}{y_labels}{legend_svg}'
+        f'</svg>'
+    )
+
+
+def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bool = True, key_prefix: str = "ca"):
     """
     Кастомный рендеринг постатейного анализа рисков.
-    risks_json — строка JSON от analyze_risks() или старый markdown.
+    risks_json    — строка JSON от analyze_risks() или старый markdown.
+    claim_summary — итоговое резюме заявки (отображается над списком статей).
     """
-    # Пробуем распарсить JSON
     data = None
     try:
         data = json.loads(risks_json)
     except Exception:
         pass
 
-    # Старый формат (markdown) — просто рендерим
     if data is None or "articles" not in data:
         st.markdown(risks_json)
         return
 
-    articles = data.get("articles", [])
-    stats    = data.get("stats", {})
-    summary  = data.get("summary", "")
-    rag_note = data.get("rag_note", "")
+    articles   = data.get("articles", [])
+    stats      = data.get("stats", {})
+    rag_note   = data.get("rag_note", "")
+    _reg_year  = data.get("reg_year", 0)
+    _tgt_pct   = data.get("target_pct", 5.0)
+
+    # ── Резюме заявки (над списком статей) ───────────────────────────────────
+    if show_summary:
+        if claim_summary:
+            st.subheader("Резюме заявки")
+            st.markdown(claim_summary)
+            st.divider()
+        elif data.get("summary"):
+            st.subheader("Резюме заявки")
+            st.markdown(data["summary"])
+            st.divider()
 
     # ── Сводная шапка ────────────────────────────────────────────────────────
     n_red    = stats.get("red", 0)
@@ -1217,124 +1796,138 @@ def _render_risks_tab(risks_json: str):
     n_total  = stats.get("total", len(articles))
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Всего статей",   n_total)
-    col2.metric("Высокий риск", n_red,   delta=None,
-                delta_color="inverse" if n_red > 0 else "normal")
-    col3.metric("Средний риск", n_yellow)
-    col4.metric("Без замечаний", n_green)
+    col1.metric("Всего статей",  n_total)
+    col2.metric("🔴 Высокий риск", n_red)
+    col3.metric("🟡 Средний риск", n_yellow)
+    col4.metric("🟢 Без замечаний", n_green)
 
-    # Общий индикатор
     if n_red > 0:
-        st.error(f"ВЫСОКИЙ РИСК — {n_red} статей требуют немедленного внимания")
+        st.error(f"ВЫСОКИЙ РИСК — {n_red} статей с превышением критического порога")
     elif n_yellow > 0:
-        st.warning(f"СРЕДНИЙ РИСК — {n_yellow} статей с замечаниями")
+        st.warning(f"СРЕДНИЙ РИСК — {n_yellow} статей с превышением целевого индекса")
     else:
-        st.success("НИЗКИЙ РИСК — существенных замечаний не выявлено")
+        st.success("НИЗКИЙ РИСК — рост статей в пределах целевого индекса")
 
     if rag_note:
         st.caption(rag_note)
-
-    # ── Заключение LLM ───────────────────────────────────────────────────────
-    if summary:
-        with st.expander("Итоговое заключение", expanded=True):
-            st.markdown(summary)
 
     st.divider()
 
     # ── Фильтр ───────────────────────────────────────────────────────────────
     st.markdown("**Постатейный анализ**")
-    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-    show_red    = f_col1.checkbox("Высокий риск", value=True,  key="ca_f_red")
-    show_yellow = f_col2.checkbox("Средний риск",  value=True,  key="ca_f_yellow")
-    show_green  = f_col3.checkbox("Без замечаний",    value=False, key="ca_f_green")
-    # Неизвестно больше не используется — fallback всегда даёт 🔴
-    filter_map = {
-        "red":     show_red,
-        "yellow":  show_yellow,
-        "green":   show_green,
-        "unknown": show_red,   # unknown = красный для целей фильтрации
-    }
-    visible = [a for a in articles if filter_map.get(a.get("risk", "unknown"), True)]
+    f_col1, f_col2, f_col3 = st.columns(3)
+    show_red    = f_col1.checkbox("🔴 Высокий риск", value=True,  key=f"{key_prefix}_f_red")
+    show_yellow = f_col2.checkbox("🟡 Средний риск",  value=True,  key=f"{key_prefix}_f_yellow")
+    show_green  = f_col3.checkbox("🟢 Без замечаний", value=False, key=f"{key_prefix}_f_green")
+    filter_map  = {"red": show_red, "yellow": show_yellow,
+                   "green": show_green}
+    visible = [a for a in articles if filter_map.get(a.get("risk", "red"), True)]
     st.caption(f"Показано: {len(visible)} из {n_total}")
 
-    # ── Expander на каждую статью ────────────────────────────────────────────
-    RISK_COLOR = {"red": "🔴", "yellow": "🟡", "green": "🟢", "unknown": "⚪"}
+    RISK_COLOR = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
     RISK_LABEL = {"red": "Высокий риск", "yellow": "Средний риск",
-                  "green": "Без замечаний", "unknown": "Не определён"}
+                  "green": "Без замечаний"}
 
     for art in visible:
-        risk     = art.get("risk", "unknown")
-        emoji    = RISK_COLOR[risk]
-        label    = RISK_LABEL[risk]
-        name     = art.get("name", "—")
-        amounts  = art.get("amounts", "")
-        doc      = art.get("document", "не указан")
-        basis    = art.get("basis", "")
-        rec      = art.get("recommendation", "")
-        has_npa  = art.get("has_npa", False)
+        risk          = art.get("risk", "unknown")
+        emoji         = RISK_COLOR[risk]
+        label         = RISK_LABEL[risk]
+        name          = art.get("name", "—")
+        amounts       = art.get("amounts", "")
+        basis         = art.get("basis", "")
+        rec           = art.get("recommendation", "")
+        dynamics      = art.get("article_summary", "")
+        growth_reason = art.get("growth_reason", "")
+        base_val      = art.get("base_val")
+        reg_val       = art.get("reg_val")
+        has_npa       = art.get("has_npa", False)
+        matched_files = art.get("matched_files", [])
 
-        # Заголовок expander
+        # Заголовок: emoji + название + значение регулируемого года
         exp_title = f"{emoji} {name[:70]}"
-        if amounts:
-            # Берём первое значение из amounts для отображения в заголовке
-            first_val = amounts.split("|")[0].strip() if amounts else ""
+        if reg_val is not None:
+            exp_title += f"  ·  {reg_val:,.0f} тыс.руб."
+        elif amounts:
+            first_val = amounts.split("|")[0].strip()
             if first_val:
                 exp_title += f"  ·  {first_val[:40]}"
 
-        expanded_default = risk in ("red", "yellow")
+        with st.expander(exp_title, expanded=(risk in ("red", "yellow"))):
 
-        with st.expander(exp_title, expanded=expanded_default):
-            # Строка статуса
-            doc_ok = doc.lower() not in ("отсутствует", "не указан", "нет", "")
-            doc_icon = "✅" if doc_ok else "❌"
+            # Две колонки: 2/3 — аналитика, 1/3 — временной ряд цифрами
+            c_left, c_right = st.columns([2, 1])
 
-            c_left, c_right = st.columns([3, 2])
-            with c_left:
-                st.markdown(f"**{emoji} {label}**")
-
-                # Топ-3 файла со score и самари
-                matched_files = art.get("matched_files", [])
-                best_sim      = art.get("best_sim", 0.0)
-                if matched_files:
-                    st.markdown("**Файлы из заявки:**")
-                    for d in matched_files:
-                        sim_pct   = int(d.get("_similarity", 0) * 100)
-                        sim_bar   = "🟩" * (sim_pct // 20) + "⬜" * (5 - sim_pct // 20)
-                        fname     = d.get("file_name", "—")
-                        file_sum  = d.get("summary", "")[:120]
-                        st.caption(f"{sim_bar} **{sim_pct}%** — {fname}")
-                        if file_sum:
-                            st.caption(f"   *{file_sum}*")
-                else:
-                    st.markdown("**Файл-обоснование:** не найден")
-
-                if not has_npa:
-                    st.caption("НПА по этой статье в базе знаний не найдены")
-
+            # ── Правая колонка: временной ряд ────────────────────────────────
             with c_right:
                 if amounts:
-                    st.markdown("**Значения:**")
-                    for v in amounts.split("|")[:4]:
-                        st.caption(v.strip())
+                    ts = _parse_amounts_timeseries(amounts)
+                    if ts:
+                        for yr, lbl, val in ts:
+                            marker = "→" if (reg_val is not None and
+                                             abs(val - reg_val) < 0.01) else " "
+                            st.caption(f"{marker} {yr} ({lbl}): {val:,.0f} тыс.руб.")
+                    else:
+                        for v in amounts.split("|")[:5]:
+                            st.caption(v.strip())
 
-            if basis:
-                st.markdown(f"**Основание:** {basis}")
-            if rec:
-                st.info(rec)
+            # ── Левая колонка: статус, текст, график, НПА ────────────────────
+            with c_left:
+                st.markdown(f"**{emoji} {label}**")
+                if growth_reason:
+                    st.caption(f"Индекс роста: {growth_reason}")
 
-    # ── Кнопка скачать только проблемные ─────────────────────────────────────
+                if dynamics:
+                    st.markdown(dynamics)
+
+                # График под текстом
+                if amounts:
+                    ts = _parse_amounts_timeseries(amounts)
+                    if ts and len(ts) >= 2:
+                        svg = _render_timeseries_chart(
+                            ts, _reg_year, risk, target_pct=_tgt_pct,
+                        )
+                        if svg:
+                            st.markdown(svg, unsafe_allow_html=True)
+
+                if basis:
+                    st.markdown(f"**Нормативное основание:** {basis}")
+
+                if rec:
+                    st.info(f"**Что необходимо обосновать:** {rec}")
+
+                if matched_files:
+                    st.markdown("**Наиболее вероятные документы-обоснования:**")
+                    for d in matched_files:
+                        sim_pct = int(d.get("_similarity", 0) * 100)
+                        fname   = d.get("file_name", "—")
+                        st.caption(f"{'▓' * (sim_pct // 20)}{'░' * (5 - sim_pct // 20)} "
+                                   f"{sim_pct}%  —  {fname}")
+                else:
+                    st.caption("Файлы-обоснования в загруженных документах не найдены.")
+
+                if not has_npa:
+                    st.caption("НПА по этой статье в базе знаний не найдены.")
+
+    # ── Скачать замечания ─────────────────────────────────────────────────────
     st.divider()
     problem_articles = [a for a in articles if a.get("risk") in ("red", "yellow")]
     if problem_articles:
         lines = [f"АНАЛИЗ РИСКОВ ТАРИФНОЙ ЗАЯВКИ\n{'='*50}\n"]
-        if summary:
-            lines.append(summary + "\n\n" + "="*50 + "\n")
         for a in problem_articles:
-            lines.append(f"\n{a['risk_emoji']} {a['name']}")
-            lines.append(f"Значения: {a['amounts']}")
-            lines.append(f"Документ: {a['document']}")
-            lines.append(f"Основание: {a['basis']}")
-            lines.append(f"Рекомендация: {a['recommendation']}")
+            gr = a.get("growth_reason", "")
+            lines.append(f"\n{a.get('risk_emoji', '🔴')} {a['name']}")
+            if gr:
+                lines.append(f"Рост: {gr}")
+            bv = a.get("base_val")
+            rv = a.get("reg_val")
+            if bv is not None and rv is not None:
+                lines.append(f"База: {bv:,.0f} → Регул.год: {rv:,.0f} тыс.руб.")
+            if a.get("article_summary"):
+                lines.append(f"Динамика: {a['article_summary']}")
+            if a.get("basis"):
+                lines.append(f"Основание: {a['basis']}")
+            if a.get("recommendation"):
+                lines.append(f"Рекомендация: {a['recommendation']}")
             lines.append("-"*40)
         report_text = "\n".join(lines)
         st.download_button(
@@ -1342,24 +1935,33 @@ def _render_risks_tab(risks_json: str):
             data=report_text.encode("utf-8"),
             file_name="замечания_регулятора.txt",
             mime="text/plain",
-            key="ca_dl_problems",
+            key=f"{key_prefix}_dl_problems",
         )
 
 
 def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                   spheres: Optional[List[str]] = None,
-                  file_summaries: Optional[Dict[str, str]] = None) -> str:
+                  file_summaries: Optional[Dict[str, str]] = None,
+                  target_pct: float = 5.0,
+                  risk_pct: float = 10.0,
+                  reg_year: int = 0,
+                  approved_articles: Optional[List[Dict]] = None) -> str:
     """
     Постатейный RAG-анализ рисков.
-    spheres:        фильтр RAG по сфере (None = все).
-    file_summaries: {имя_файла: самари} из _build_file_summaries().
+    spheres:           фильтр RAG по сфере (None = все).
+    file_summaries:    {имя_файла: самари} из _build_file_summaries().
+    approved_articles: готовый список статей после апрува (если передан —
+                       парсинг calc_context не выполняется).
     """
-    BATCH_SIZE = 10
     CHUNK_LIMIT_PER_ARTICLE = 8000
     MAX_TOKENS_PER_ARTICLE  = 300
 
     prompts  = load_prompts()
-    articles = _extract_articles_from_context(calc_context) if calc_context else []
+    # Используем уже одобренный список если передан, иначе парсим контекст
+    if approved_articles is not None:
+        articles = approved_articles
+    else:
+        articles = _extract_articles_from_context(calc_context) if calc_context else []
 
     # ── Fallback: нет статей из расчётного файла ─────────────────────────────
     if not articles:
@@ -1379,8 +1981,18 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         return result
 
     total         = len(articles)
-    article_results: List[str] = []
+    article_results: List[Dict] = []
     rag_available = True
+
+    # Определяем регулируемый год автоматически если не задан явно
+    _reg_year = reg_year
+    if _reg_year == 0 and articles:
+        # берём максимальный год из amounts всех статей
+        all_years = []
+        for _a in articles:
+            ts = _parse_amounts_timeseries(_a.get("amounts", ""))
+            all_years.extend(yr for yr, _, _ in ts)
+        _reg_year = max(all_years) if all_years else datetime.now().year
 
     # ── Диапазоны прогресс-бара (монотонно возрастают) ───────────────────────
     # [0.00..0.05] — инициализация реранкера
@@ -1424,41 +2036,19 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     if progress_cb:
         progress_cb(P_INIT_END, f"Реранкер готов. Статей к анализу: {total}")
 
-    # Счётчики для независимого расчёта прогресса каждой фазы
-    rag_done = 0  # сколько статей прошло RAG
-    llm_done = 0  # сколько статей прошло LLM
+    # ── Фаза 1: RAG для всех статей (реранкер в памяти) ─────────────────────
+    # Каждые RAG_FLUSH_EVERY статей выгружаем реранкер чтобы не накапливать VRAM.
+    # После выгрузки следующий _rag_search загрузит его заново автоматически.
+    RAG_FLUSH_EVERY = 50
 
-    # ── Батчевая обработка ────────────────────────────────────────────────────
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch = articles[batch_start: batch_start + BATCH_SIZE]
-
-        # Шаг 1: RAG для всего батча подряд
-        batch_chunks: List[List[Dict]] = []
-        for j, art in enumerate(batch):
-            # Прогресс: позиция внутри RAG-диапазона по числу уже обработанных
-            rag_frac = rag_done / total  # 0..1 внутри фазы
-            if progress_cb:
-                progress_cb(
-                    P_RAG_START + rag_frac * (P_RAG_END - P_RAG_START),
-                    f"RAG {rag_done + 1}/{total}: {art['name'][:40]}..."
-                )
-            chunks = _rag_search(_make_rag_query(art["name"]), top_k=10,
-                                  spheres=spheres or None)
-            batch_chunks.append(chunks)
-            rag_done += 1
-            if not chunks:
-                rag_available = False
-
-        # Шаг 1.5: освобождаем реранкер перед LLM — он заново загрузился в RAG-фазе
+    def _flush_reranker():
         try:
             from core.advisor import invalidate_reranker, invalidate_hybrid_retriever
             invalidate_reranker()
             invalidate_hybrid_retriever()
         except Exception:
             pass
-        # Принудительная сборка мусора Python между батчами
-        import gc
-        gc.collect()
+        import gc; gc.collect()
         try:
             import torch
             if torch.cuda.is_available():
@@ -1466,17 +2056,39 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         except Exception:
             pass
 
-        # Шаг 2: LLM для всего батча
-        for j, (art, chunks) in enumerate(zip(batch, batch_chunks)):
-            name    = art["name"]
-            amounts = art["amounts"]
-            # Прогресс: позиция внутри LLM-диапазона по числу уже обработанных
-            llm_frac = llm_done / total  # 0..1 внутри фазы
-            if progress_cb:
-                progress_cb(
-                    P_LLM_START + llm_frac * (P_LLM_END - P_LLM_START),
-                    f"LLM {llm_done + 1}/{total}: {name[:40]}..."
-                )
+    all_chunks: List[List[Dict]] = []
+    for rag_done, art in enumerate(articles):
+        rag_frac = rag_done / total
+        if progress_cb:
+            progress_cb(
+                P_RAG_START + rag_frac * (P_RAG_END - P_RAG_START),
+                f"RAG {rag_done + 1}/{total}: {art['name'][:40]}..."
+            )
+        chunks = _rag_search(_make_rag_query(art["name"]), top_k=10,
+                             spheres=spheres or None)
+        all_chunks.append(chunks)
+        if not chunks:
+            rag_available = False
+
+        # Периодически освобождаем реранкер чтобы не держать VRAM весь цикл
+        if (rag_done + 1) % RAG_FLUSH_EVERY == 0:
+            print(f"[RAG] Flush реранкера после {rag_done + 1} статей")
+            _flush_reranker()
+
+    # ── Финальная выгрузка реранкера перед LLM-фазой ─────────────────────────
+    _flush_reranker()
+
+    # ── Фаза 2: LLM для всех статей ──────────────────────────────────────────
+    llm_done = 0
+    for (art, chunks) in zip(articles, all_chunks):
+        name    = art["name"]
+        amounts = art["amounts"]
+        llm_frac = llm_done / total
+        if progress_cb:
+            progress_cb(
+                P_LLM_START + llm_frac * (P_LLM_END - P_LLM_START),
+                f"LLM {llm_done + 1}/{total}: {name[:40]}..."
+            )
 
             # ── Фильтр: пропускаем тарифные показатели ───────────────────
             if _should_skip_article(name):
@@ -1489,24 +2101,19 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
             )
             has_npa = bool(chunks)
 
-            # ── Сопоставление с инвентарём документов (топ-3 по score) ───
+            # ── Сопоставление с файлами заявки (только имена + первые 1000 симв) ──
             summaries = file_summaries or {}
             matched   = _match_files_to_article(name, summaries, top_k=3)
 
-            # Детерминированный цвет по best similarity
-            best_sim  = matched[0]["_similarity"] if matched else 0.0
-            if best_sim >= SIMILARITY_GREEN:
-                forced_risk       = "green"
-                forced_risk_emoji = "🟢"
-            elif best_sim >= SIMILARITY_YELLOW:
-                forced_risk       = "yellow"
-                forced_risk_emoji = "🟡"
-            else:
-                # Документов нет — красный принудительно
-                forced_risk       = "red"
-                forced_risk_emoji = "🔴"
+            # ── Детерминированный цвет по росту затрат ────────────────────────
+            growth_color, growth_reason, base_val, reg_val = _get_growth_color(
+                amounts, _reg_year, target_pct, risk_pct
+            )
+            EMOJI_MAP = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
+            final_risk       = growth_color
+            final_risk_emoji = EMOJI_MAP[growth_color]
 
-            # НПА инструкция
+            # ── НПА инструкция ────────────────────────────────────────────────
             npa_instr = (
                 "Используй ТОЛЬКО нормы НПА приведённые выше. Укажи документ и пункт."
                 if has_npa else
@@ -1514,42 +2121,23 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                 "В РЕКОМЕНДАЦИИ опиши какой документ нужен исходя из здравого смысла."
             )
 
-            if matched:
-                # Файлы найдены: оцениваем соответствие НПА
-                files_block = "\n".join(
-                    f"  - {d['file_name']} [{int(d['_similarity']*100)}%]:\n"
-                    f"    {d['summary'][:200]}"
-                    for d in matched
-                )
-                prompt = (
-                    f"Оцени статью затрат тарифной заявки.\n\n"
-                    f"СТАТЬЯ: {name}\n"
-                    f"ЗНАЧЕНИЯ: {amounts}\n\n"
-                    f"НАЙДЕННЫЕ ФАЙЛЫ В ЗАЯВКЕ:\n{files_block}\n\n"
-                    f"НПА ИЗ БАЗЫ ЗНАНИЙ:\n{npa_context}\n\n"
-                    f"{npa_instr}\n\n"
-                    f"Цвет риска уже определён автоматически. "
-                    f"Оцени содержание найденных файлов.\n\n"
-                    f"Ответ строго в формате (3 строки):\n"
-                    f"ДОКУМЕНТ: название наиболее подходящего файла\n"
-                    f"ОСНОВАНИЕ: пункт НПА — соблюдён или есть замечание\n"
-                    f"РЕКОМЕНДАЦИЯ: что проверить или исправить заявителю"
-                )
-            else:
-                # Файлов нет: рекомендуем что приложить
-                prompt = (
-                    f"Статья затрат тарифной заявки НЕ подтверждена документами.\n\n"
-                    f"СТАТЬЯ: {name}\n"
-                    f"ЗНАЧЕНИЯ: {amounts}\n\n"
-                    f"НПА ИЗ БАЗЫ ЗНАНИЙ:\n{npa_context}\n\n"
-                    f"{npa_instr}\n\n"
-                    f"Цвет: 🔴 (документ отсутствует — определено автоматически).\n"
-                    f"Укажи какой именно документ требуется.\n\n"
-                    f"Ответ строго в формате (3 строки):\n"
-                    f"ДОКУМЕНТ: отсутствует\n"
-                    f"ОСНОВАНИЕ: какой пункт НПА требует обоснования\n"
-                    f"РЕКОМЕНДАЦИЯ: какой именно документ нужно приложить"
-                )
+            # ── LLM: динамика + рекомендация по обоснованию ───────────────────
+            # Только названия файлов без содержимого — экономим токены
+            files_list = ", ".join(d['file_name'] for d in matched) if matched else "не найдены"
+
+            prompt = (
+                f"Статья затрат тарифной заявки: {name}\n"
+                f"Значения: {amounts[:300]}\n"
+                f"Рост к предыдущему периоду: {growth_reason}\n\n"
+                f"Файлы обоснования в заявке: {files_list}\n\n"
+                f"НПА из базы знаний:\n{npa_context[:1500]}\n\n"
+                f"{npa_instr}\n\n"
+                "Ответ строго в формате (3 строки). БЕЗ эмодзи. БЕЗ лишнего текста.\n"
+                "ДИНАМИКА: что происходит с этой статьёй в динамике (1-2 предложения)\n"
+                "ОСНОВАНИЕ: закон/приказ/пункт НПА, который регулирует данную статью затрат\n"
+                "РЕКОМЕНДАЦИЯ: конкретный тип документа который РСО должна приложить к заявке "
+                "(договор/акт/расчёт/справка — без ссылок на НПА, только вид документа)"
+            )
 
             art_result = _lm_call(
                 prompts["claim_risks_system"],
@@ -1558,24 +2146,22 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
             )
 
             # Парсим ответ модели
-            parsed = _parse_article_result(art_result)
-
-            # Применяем принудительный цвет если он был назначен
-            final_risk       = forced_risk       or parsed["risk"]
-            final_risk_emoji = forced_risk_emoji or parsed["risk_emoji"]
+            parsed = _parse_article_result_v2(art_result)
 
             article_results.append({
-                "name":           name,
-                "amounts":        amounts,
-                "risk":           final_risk,
-                "risk_emoji":     final_risk_emoji,
-                "document":       parsed["document"],
-                "basis":          parsed["basis"],
-                "recommendation": parsed["recommendation"],
-                "raw":            art_result,
-                "has_npa":        has_npa,
-                "matched_files":  matched,          # топ-3 файла со score
-                "best_sim":       round(best_sim, 3),
+                "name":             name,
+                "amounts":          amounts,
+                "risk":             final_risk,
+                "risk_emoji":       final_risk_emoji,
+                "growth_reason":    growth_reason,
+                "base_val":         base_val,
+                "reg_val":          reg_val,
+                "article_summary":  parsed["dynamics"],
+                "basis":            parsed["basis"],
+                "recommendation":   parsed["recommendation"],
+                "raw":              art_result,
+                "has_npa":          has_npa,
+                "matched_files":    matched,
             })
             llm_done += 1
 
@@ -1590,12 +2176,14 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     )
 
     # Краткая текстовая выжимка для LLM-агрегации
+    EMOJI_AGG = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
     items_for_agg = []
     for a in article_results:
+        emoji = EMOJI_AGG.get(a.get("risk", "red"), "🔴")
         items_for_agg.append(
-            f"{a['risk_emoji']} {a['name']}: {a['amounts'][:80]}\n"
-            f"  Документ: {a['document']}\n"
-            f"  Основание: {a['basis'][:120]}"
+            f"{emoji} {a['name']}: {a.get('amounts', '')[:80]}\n"
+            f"  Рост: {a.get('growth_reason', '—')}\n"
+            f"  Основание: {a.get('basis', '')[:120]}"
         )
 
     aggregate_prompt = (
@@ -1616,21 +2204,24 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     if progress_cb:
         progress_cb(0.94, "Итоговое заключение готово")
 
-    # Возвращаем JSON-совместимую структуру как строку через json.dumps
+    # total = только реально обработанные статьи (без отсеянных _should_skip_article)
+    processed = len(article_results)
     output = json.dumps({
-        "summary":     summary_result,
-        "rag_note":    rag_note,
-        "articles":    article_results,
+        "summary":    summary_result,
+        "rag_note":   rag_note,
+        "articles":   article_results,
+        "reg_year":   _reg_year,
+        "target_pct": target_pct,
         "stats": {
-            "total":   total,
-            "red":     sum(1 for a in article_results if a["risk"] == "red"),
-            "yellow":  sum(1 for a in article_results if a["risk"] == "yellow"),
-            "green":   sum(1 for a in article_results if a["risk"] == "green"),
+            "total":  processed,
+            "red":    sum(1 for a in article_results if a["risk"] == "red"),
+            "yellow": sum(1 for a in article_results if a["risk"] == "yellow"),
+            "green":  sum(1 for a in article_results if a["risk"] == "green"),
         },
     }, ensure_ascii=False)
 
     if progress_cb:
-        progress_cb(1.0, f"Готово — {total} статей")
+        progress_cb(1.0, f"Готово — {processed} статей")
     return output
 
 
@@ -1786,9 +2377,321 @@ def _show_mr_settings():
             st.rerun()
 
 
+
+# =============================================================================
+# Апрув статей затрат после парсинга
+# =============================================================================
+
+def _classify_article(name: str, amounts: str) -> str:
+    """
+    Автоматически определяет тип строки:
+      'cost'  — статья затрат (подлежит анализу)
+      'agg'   — агрегат / итоговая строка
+      'ref'   — справочный показатель (тарифы, объёмы, индексы)
+      'zero'  — все значения нулевые
+    """
+    n = name.lower().strip()
+
+    # Итоговые агрегаты
+    if any(k in n for k in (
+        "итого", "всего", "нвв", "необходимая валовая выручка",
+        "средневзвешенный", "итого по тарифу", "всего по тарифу",
+    )):
+        return "agg"
+
+    # Справочные показатели
+    if any(k in n for k in (
+        "тариф", "руб./", "руб/", "индекс", "объём", "объем",
+        "полезный отпуск", "доля товарной", "численность",
+        "коэффициент", "норматив", "ставка 1 разряда",
+    )):
+        return "ref"
+
+    # Нулевые
+    if not _has_nonzero_value(amounts):
+        return "zero"
+
+    return "cost"
+
+
+def _extract_articles_from_context_unfiltered(calc_context: str) -> List[Dict]:
+    """
+    Извлекает ВСЕ строки из calc_context без фильтрации.
+    Каждой строке назначается автоматический тип через _classify_article.
+    Используется для показа таблицы апрува.
+    """
+    articles = []
+    seen = set()
+    lines = calc_context.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        if stripped.startswith("★"):
+            name = stripped.lstrip("★").strip()
+            parts = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j].strip()
+                if not nxt or nxt.startswith("★") or nxt.startswith("#"):
+                    break
+                parts.append(nxt)
+                j += 1
+            amounts = " | ".join(parts)
+            if name and name not in seen and len(name) > 3:
+                seen.add(name)
+                articles.append({
+                    "name":    name,
+                    "amounts": amounts,
+                    "type":    _classify_article(name, amounts),
+                    "checked": True,  # будет скорректировано ниже
+                })
+            i = j
+            continue
+
+        if stripped and ":" in stripped and "=" in stripped and not stripped.startswith("#"):
+            parts2 = stripped.split(":", 1)
+            name = parts2[0].strip()
+            amounts = parts2[1].strip() if len(parts2) > 1 else ""
+            if name and name not in seen and len(name) > 3:
+                seen.add(name)
+                articles.append({
+                    "name":    name,
+                    "amounts": amounts,
+                    "type":    _classify_article(name, amounts),
+                    "checked": True,
+                })
+        i += 1
+
+    # Авто-отбор: снимаем галочки с агрегатов, справочных и нулевых
+    for a in articles:
+        a["checked"] = a["type"] == "cost"
+
+    return articles
+
+
+def _show_article_approval(readonly: bool = False):
+    """
+    Отображает таблицу статей затрат с чекбоксами для апрува.
+    readonly=True: только просмотр, без изменений (после запуска анализа).
+    Сохраняет выбор в ss.ca_parsed_articles и выставляет ss.ca_articles_approved.
+    """
+    ss = st.session_state
+    articles = ss.ca_parsed_articles
+
+    TYPE_LABEL = {
+        "cost": "Статья затрат",
+        "agg":  "Агрегат / итог",
+        "ref":  "Справочно",
+        "zero": "Нулевые значения",
+    }
+    TYPE_COLOR = {
+        "cost": "success",
+        "agg":  "warning",
+        "ref":  "secondary",
+        "zero": "error",
+    }
+
+    n_total   = len(articles)
+    n_checked = sum(1 for a in articles if a["checked"])
+
+    st.subheader("Проверка статей затрат")
+    st.caption(
+        f"Найдено строк: **{n_total}** · "
+        f"К анализу: **{n_checked}** · "
+        f"Исключено: **{n_total - n_checked}**"
+    )
+
+    # ── Панель управления ────────────────────────────────────────────────────
+    if readonly:
+        tc1, tc2 = st.columns([2, 1])
+        search_q    = tc1.text_input("Поиск", placeholder="Фильтр по названию...",
+                                     key="ca_ap_search", label_visibility="collapsed")
+        type_filter = tc2.selectbox(
+            "Тип", ["Все", "Статья затрат", "Агрегат / итог", "Справочно", "Нулевые значения"],
+            key="ca_ap_type", label_visibility="collapsed",
+        )
+    else:
+        tc1, tc2, tc3, tc4, tc5, tc6 = st.columns([2, 1, 1, 1, 1, 1])
+        search_q = tc1.text_input("Поиск", placeholder="Фильтр по названию...",
+                                   key="ca_ap_search", label_visibility="collapsed")
+        type_filter = tc2.selectbox(
+            "Тип", ["Все", "Статья затрат", "Агрегат / итог", "Справочно", "Нулевые значения"],
+            key="ca_ap_type", label_visibility="collapsed",
+        )
+        def _reset_editor():
+            if "ca_ap_editor" in ss:
+                del ss["ca_ap_editor"]
+
+        if tc3.button("Авто-отбор", key="ca_ap_auto", use_container_width=True,
+                      help="Оставить только статьи затрат с ненулевыми значениями"):
+            for a in articles:
+                a["checked"] = a["type"] == "cost"
+            ss.ca_parsed_articles = articles
+            _reset_editor()
+            st.rerun()
+        if tc4.button("Выбрать все", key="ca_ap_all", use_container_width=True):
+            for a in articles:
+                a["checked"] = True
+            ss.ca_parsed_articles = articles
+            _reset_editor()
+            st.rerun()
+        if tc5.button("Убрать все", key="ca_ap_none", use_container_width=True):
+            for a in articles:
+                a["checked"] = False
+            ss.ca_parsed_articles = articles
+            _reset_editor()
+            st.rerun()
+        if tc6.button("Инверсия", key="ca_ap_inv", use_container_width=True,
+                      help="Инвертировать выбор"):
+            for a in articles:
+                a["checked"] = not a["checked"]
+            ss.ca_parsed_articles = articles
+            _reset_editor()
+            st.rerun()
+
+    # ── Таблица ──────────────────────────────────────────────────────────────
+    TYPE_FILTER_MAP = {
+        "Все": None,
+        "Статья затрат":    "cost",
+        "Агрегат / итог":   "agg",
+        "Справочно":        "ref",
+        "Нулевые значения": "zero",
+    }
+    tf = TYPE_FILTER_MAP[type_filter]
+
+    visible = [
+        (i, a) for i, a in enumerate(articles)
+        if (not search_q or search_q.lower() in a["name"].lower())
+        and (tf is None or a["type"] == tf)
+    ]
+
+    st.caption(f"Показано: {len(visible)} из {n_total}")
+
+    # ── Таблица через data_editor ────────────────────────────────────────────
+    import pandas as pd
+
+    TYPE_OPT_LBLS = {"cost": "Статья затрат", "agg": "Агрегат / итог",
+                     "ref": "Справочно", "zero": "Нулевые"}
+
+    # Берём реальные годы из временного ряда для заголовков колонок
+    _sample_ts = None
+    for _a in articles:
+        _ts = _parse_amounts_timeseries(_a["amounts"])
+        if len(_ts) >= 2:
+            _sample_ts = _ts
+            break
+    _yr_prev = str(_sample_ts[-2][0]) if _sample_ts and len(_sample_ts) >= 2 else "Прошлый"
+    _yr_reg  = str(_sample_ts[-1][0]) if _sample_ts else "Регул. год"
+
+    def _make_df(arts, filt_q, filt_type):
+        rows = []
+        for i, a in enumerate(arts):
+            if filt_q and filt_q.lower() not in a["name"].lower():
+                continue
+            if filt_type and filt_type != "Все":
+                tm = {"Статья затрат": "cost", "Агрегат / итог": "agg",
+                      "Справочно": "ref", "Нулевые значения": "zero"}
+                if a["type"] != tm.get(filt_type):
+                    continue
+            ts = _parse_amounts_timeseries(a["amounts"])
+            v_prev = ts[-2][2] if len(ts) >= 2 else None
+            v_reg  = ts[-1][2] if ts else None
+            rows.append({
+                "_idx":       i,
+                "Включить":   a["checked"],
+                "Наименование": a["name"],
+                _yr_prev:     f"{v_prev:,.0f}" if v_prev is not None else "—",
+                _yr_reg:      f"{v_reg:,.0f}"  if v_reg  is not None else "—",
+                "Тип":        TYPE_OPT_LBLS.get(a["type"], a["type"]),
+            })
+        return pd.DataFrame(rows)
+
+    df_show = _make_df(articles, search_q, type_filter)
+    st.caption(f"Показано: {len(df_show)} из {n_total}")
+
+    if not readonly and not df_show.empty:
+        edited = st.data_editor(
+            df_show.drop(columns=["_idx"]),
+            column_config={
+                "Включить": st.column_config.CheckboxColumn("Включить", width="small"),
+                "Наименование": st.column_config.TextColumn("Наименование", width="large", disabled=True),
+                _yr_prev: st.column_config.TextColumn(_yr_prev, width="small", disabled=True),
+                _yr_reg:  st.column_config.TextColumn(_yr_reg,  width="small", disabled=True),
+                "Тип": st.column_config.SelectboxColumn(
+                    "Тип", width="medium",
+                    options=list(TYPE_OPT_LBLS.values()),
+                ),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="ca_ap_editor",
+        )
+        # Считаем сколько отмечено прямо из edited — без rerun
+        n_sel_live = int(edited["Включить"].sum()) if edited is not None else 0
+
+    elif readonly and not df_show.empty:
+        st.dataframe(
+            df_show.drop(columns=["_idx"]).rename(columns={"Включить": "✓"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        n_sel_live = sum(1 for a in articles if a["checked"])
+    else:
+        n_sel_live = 0
+
+    # ── Кнопка подтверждения ─────────────────────────────────────────────────
+    st.divider()
+    ap_c1, ap_c2 = st.columns([3, 1])
+    ap_c1.caption(f"Отмечено к анализу: **{n_sel_live}** статей — нажмите «Подтвердить» чтобы продолжить")
+    if not readonly and ap_c2.button(
+        "Подтвердить и продолжить",
+        type="primary",
+        use_container_width=True,
+        key="ca_ap_confirm",
+        disabled=(n_sel_live == 0),
+    ):
+        # Читаем финальное состояние из data_editor и сохраняем
+        _lbl_to_type = {v: k for k, v in TYPE_OPT_LBLS.items()}
+        if edited is not None:
+            for row_i, row in edited.iterrows():
+                orig_i = int(df_show.iloc[row_i]["_idx"])
+                articles[orig_i]["checked"] = bool(row["Включить"])
+                articles[orig_i]["type"]    = _lbl_to_type.get(row["Тип"], "cost")
+
+        approved = [a for a in articles if a["checked"]]
+        ss.ca_parsed_articles   = approved   # только отмеченные идут в анализ
+        ss.ca_articles_approved = True
+        lines = []
+        for a in approved:
+            lines.append(f"★ {a['name']}")
+            for part in a["amounts"].split(" | "):
+                if part.strip():
+                    lines.append(f"  {part.strip()}")
+        ss.ca_calc_context = "\n".join(lines)
+        if "ca_ap_editor" in ss:
+            del ss["ca_ap_editor"]
+        st.rerun()
+
+
+
 def show_claim_analyzer():
-    st.header("Анализатор тарифных заявок")
-    st.caption("Риски · Резюме · Реестр заявок")
+    hdr_col, clear_col = st.columns([5, 1])
+    hdr_col.header("Анализатор тарифных заявок")
+    hdr_col.caption("Риски · Реестр заявок")
+    if clear_col.button("Очистить", key="ca_clear_all", use_container_width=True,
+                        help="Сбросить весь анализ и загруженные файлы"):
+        _CA_KEYS = [
+            "ca_summary", "ca_risks", "ca_calc_context", "ca_done",
+            "ca_project_id", "ca_uploaded_meta", "ca_uploaded_bytes",
+            "ca_file_summaries", "ca_claim_summary", "ca_calc_files_checked",
+            "ca_parsed_articles", "ca_articles_approved", "_pbar_max",
+        ]
+        for _k in _CA_KEYS:
+            st.session_state.pop(_k, None)
+        # Сбрасываем uploader через смену ключа
+        st.session_state["ca_uploader_key"] = st.session_state.get("ca_uploader_key", 0) + 1
+        st.rerun()
 
     ss = st.session_state
     for k, v in [
@@ -1798,12 +2701,16 @@ def show_claim_analyzer():
         ("ca_org",            ""),
         ("ca_period",         ""),
         ("ca_done",           False),
-        ("ca_summary_words",  2000),
         ("ca_project_id",     None),
         ("ca_uploaded_meta",  []),
         ("ca_uploaded_bytes", {}),
-        ("ca_spheres",        []),   # выбранные сферы для RAG
-        ("ca_file_summaries", {}),   # словарь {файл: самари} из суммаризации
+        ("ca_spheres",        []),      # выбранные сферы для RAG
+        ("ca_file_summaries", {}),      # словарь {файл: самари}
+        ("ca_target_pct",      5.0),     # целевой индекс роста, %
+        ("ca_risk_pct",        10.0),    # дополнительный рисковый порог, %
+        ("ca_claim_summary",   ""),      # итоговое резюме заявки
+        ("ca_parsed_articles", []),      # статьи после парсинга до апрува
+        ("ca_articles_approved", False), # флаг: пользователь апрувил список
     ]:
         if k not in ss:
             ss[k] = v
@@ -1819,9 +2726,6 @@ def show_claim_analyzer():
         migrated = [_sphere_id_migration.get(s, s) for s in ss.ca_spheres]
         seen_sph = set()
         ss.ca_spheres = [x for x in migrated if not (x in seen_sph or seen_sph.add(x))]
-
-    # ── Настройки Map-Reduce ──────────────────────────────────────────────────
-    _show_mr_settings()
 
     # ── Выбор сферы регулирования ─────────────────────────────────────────────
     st.subheader("Сфера регулирования")
@@ -1855,6 +2759,29 @@ def show_claim_analyzer():
         ss.ca_period = c2.text_input("Период регулирования", value=ss.ca_period,
                                      placeholder="2025 год",
                                      key="ca_period_input")
+        st.divider()
+        c3, c4 = st.columns(2)
+        ss.ca_target_pct = c3.number_input(
+            "Целевой индекс роста, %",
+            min_value=0.0, max_value=100.0,
+            value=float(ss.ca_target_pct), step=0.5, format="%.1f",
+            key="ca_target_pct_input",
+            help="Допустимый рост статьи затрат к предыдущему периоду. "
+                 "Превышение → жёлтый цвет. Например: 5% означает рост не более чем в 1,05 раза.",
+        )
+        ss.ca_risk_pct = c4.number_input(
+            "Рисковый порог (дополнительно), %",
+            min_value=0.0, max_value=100.0,
+            value=float(ss.ca_risk_pct), step=0.5, format="%.1f",
+            key="ca_risk_pct_input",
+            help="Превышение целевого индекса + этого порога → красный цвет. "
+                 "Например: целевой 5% + рисковый 10% = красный при росте >15%.",
+        )
+        st.caption(
+            f"Жёлтый: рост > {ss.ca_target_pct:.1f}%  ·  "
+            f"Красный: рост > {ss.ca_target_pct + ss.ca_risk_pct:.1f}%  ·  "
+            f"Зелёный: рост ≤ {ss.ca_target_pct:.1f}%"
+        )
 
     # ── Загрузка файлов ───────────────────────────────────────────────────────
     st.subheader("Файлы заявки")
@@ -1863,11 +2790,12 @@ def show_claim_analyzer():
         "Чтобы загрузить папку целиком: откройте папку в проводнике, "
         "нажмите Ctrl+A для выделения всех файлов, затем перетащите их сюда."
     )
+    _uploader_key = f"ca_uploader_{ss.get('ca_uploader_key', 0)}"
     uploaded = st.file_uploader(
         "Перетащите файлы или нажмите «Browse files»",
         type=["xlsx", "xls", "pdf", "docx", "doc"],
         accept_multiple_files=True,
-        key="ca_uploader",
+        key=_uploader_key,
     ) or []
 
     if uploaded:
@@ -1922,42 +2850,27 @@ def show_claim_analyzer():
             )
 
         st.divider()
-        c1, c2, c3 = st.columns([2, 1, 1])
-        ss.ca_summary_words = c1.select_slider(
-            "Объём резюме",
-            options=[500, 1000, 2000, 3000, 5000],
-            value=ss.ca_summary_words,
-            format_func=lambda x: f"{x} слов",
-            key="ca_words_slider",
-        )
 
-        # Блокируем кнопки если есть Excel но ни одна не помечена
+        # Блокируем если есть Excel но ни одна не помечена
         _block_run = bool(xlsx_files) and not has_calc
-        run_full  = c2.button(
-            "Полный анализ", type="primary",
-            use_container_width=True, key="ca_run_full",
-            disabled=_block_run,
-        )
-        run_risks = c3.button(
-            "Только риски",
-            use_container_width=True, key="ca_run_risks",
-            disabled=_block_run,
-        )
         if _block_run:
             st.error(
-                "Выберите хотя бы одну расчётную модель (галочка напротив Excel-файла), "
-                "чтобы запустить анализ."
+                "Выберите хотя бы одну расчётную модель (галочка напротив Excel-файла)."
             )
 
-        # ── Полный анализ ─────────────────────────────────────────────────────
-        if run_full:
-            pbar   = st.progress(0.0)
-            status = st.empty()
+        # ── Кнопка: разобрать расчётный файл ─────────────────────────────────
+        btn_parse = st.button(
+            "Разобрать расчётный файл",
+            type="primary",
+            use_container_width=True,
+            key="ca_btn_parse",
+            disabled=_block_run,
+        )
 
-            calc_context = ""
-            calc_names   = ss.get("ca_calc_files_checked", [])
-
-            # Кешируем байты файлов пока они доступны
+        # ── Шаг 1: парсинг расчётного файла ─────────────────────────────────
+        if btn_parse:
+            calc_names = ss.get("ca_calc_files_checked", [])
+            # Кешируем байты
             ss.ca_uploaded_bytes = {}
             ss.ca_uploaded_meta  = []
             for uf in uploaded:
@@ -1965,86 +2878,88 @@ def show_claim_analyzer():
                 ss.ca_uploaded_bytes[uf.name] = b
                 ss.ca_uploaded_meta.append({"name": uf.name, "size": len(b)})
 
-            # Парсим все отмеченные расчётные модели и объединяем контекст
-            for uf_name, uf_bytes in ss.ca_uploaded_bytes.items():
-                ext = os.path.splitext(uf_name.lower())[1]
-                if ext not in (".xlsx", ".xls"):
-                    continue
-                if calc_names and uf_name not in calc_names:
-                    continue
-                status.text(f"Парсю расчётный файл: {uf_name}...")
-                pbar.progress(0.05)
-                try:
-                    from core.calc_parser import parse_workbook, to_llm_context
-                    df_calc, meta_calc = parse_workbook(uf_bytes)
-                    if not df_calc.empty:
-                        calc_context += f"\n\n# {uf_name}\n" + to_llm_context(df_calc)
-                        st.info(
-                            f"{uf_name}: "
-                            f"{df_calc['article'].nunique()} статей · "
-                            f"формат: {meta_calc.get('format','?')} · "
-                            f"периоды: {sorted(df_calc['period'].unique().tolist())}"
-                        )
-                    else:
-                        st.warning(f"{uf_name}: статьи затрат не найдены (пустой файл или незаполненный шаблон)")
-                except Exception as e:
-                    st.warning(f"calc_parser [{uf_name}]: {e}")
-
-            ss.ca_calc_context = calc_context
-            pbar.progress(0.15)
-
-            full_text = ""
-            for uf_name, uf_bytes in ss.ca_uploaded_bytes.items():
-                if uf_name in calc_names:
-                    continue
-                status.text(f"Читаю {uf_name}...")
-                try:
+            calc_context = ""
+            with st.spinner("Парсю расчётный файл..."):
+                for uf_name, uf_bytes in ss.ca_uploaded_bytes.items():
+                    ext = os.path.splitext(uf_name.lower())[1]
+                    if ext not in (".xlsx", ".xls"):
+                        continue
+                    if calc_names and uf_name not in calc_names:
+                        continue
                     try:
-                        from streamlit_pages.doc_scanner import extract_text
-                        pages = extract_text(uf_bytes, uf_name)
-                        full_text += f"\n\n=== {uf_name} ===\n" + \
-                                     "\n".join(p["text"] for p in pages)
-                    except ImportError:
-                        full_text += f"\n\n=== {uf_name} ===\n" + \
-                                     uf_bytes.decode("utf-8", errors="ignore")
-                except Exception as e:
-                    st.warning(f"Ошибка чтения {uf_name}: {e}")
-            pbar.progress(0.25)
+                        from core.calc_parser import parse_workbook, to_llm_context
+                        df_calc, meta_calc = parse_workbook(uf_bytes)
+                        if not df_calc.empty:
+                            calc_context += f"\n\n# {uf_name}\n" + to_llm_context(df_calc)
+                            st.info(
+                                f"{uf_name}: "
+                                f"{df_calc['article'].nunique()} статей · "
+                                f"формат: {meta_calc.get('format','?')} · "
+                                f"периоды: {sorted(df_calc['period'].unique().tolist())}"
+                            )
+                        else:
+                            st.warning(f"{uf_name}: статьи затрат не найдены")
+                    except Exception as e:
+                        st.warning(f"calc_parser [{uf_name}]: {e}")
 
-            combined = ""
-            if calc_context:
-                combined += "=== РАСЧЁТНЫЙ ФАЙЛ ===\n" + calc_context + "\n\n"
-            if full_text.strip():
-                combined += "=== ДОКУМЕНТЫ ===\n" + full_text
-
-            if not combined.strip():
-                st.error("Не удалось извлечь данные.")
+            if not calc_context.strip():
+                st.error("Не удалось извлечь данные из расчётного файла.")
                 st.stop()
 
-            st.info(f"Подготовлено: **{len(combined.split()):,} слов**")
+            ss.ca_calc_context = calc_context
+            # Извлекаем все статьи (без фильтров — пользователь сам решит)
+            raw_articles = _extract_articles_from_context_unfiltered(calc_context)
+            ss.ca_parsed_articles  = raw_articles
+            ss.ca_articles_approved = False
+            st.rerun()
 
-            ss["_pbar_max"] = 0.25
+        # ── Шаг 2: экспандер с таблицей апрува ──────────────────────────────
+        if ss.ca_parsed_articles:
+            n_arts = len(ss.ca_parsed_articles)
+            n_sel  = sum(1 for a in ss.ca_parsed_articles if a["checked"])
+            _frozen = ss.ca_done  # после запуска анализа — только просмотр
 
-            def _pcb_sum(pct, msg):
-                val = min(0.25 + pct * 0.40, 0.65)
-                if val > ss.get("_pbar_max", 0):
-                    ss["_pbar_max"] = val
-                    pbar.progress(val)
-                status.text(msg)
+            exp_label = (
+                f"Статьи затрат: {n_sel} к анализу из {n_arts}"
+                + (" · анализ запущен" if _frozen else " · требует подтверждения" if not ss.ca_articles_approved else " · подтверждено")
+            )
+            with st.expander(exp_label, expanded=not ss.ca_articles_approved and not _frozen):
+                if _frozen:
+                    # Режим просмотра — только чтение
+                    _show_article_approval(readonly=True)
+                else:
+                    _show_article_approval(readonly=False)
 
-            summary = summarize_claim(combined, ss.ca_summary_words, _pcb_sum)
-            ss.ca_summary = summary
-            ss["_pbar_max"] = 0.65
-            pbar.progress(0.65)
+        # ── Шаг 3: кнопки запуска ────────────────────────────────────────────
+        run_full  = False
+        run_risks = False
+        if ss.ca_articles_approved and ss.ca_parsed_articles and not ss.ca_done:
+            c1, c2 = st.columns(2)
+            run_full  = c1.button("Полный анализ",  type="primary",
+                                  use_container_width=True, key="ca_run_full")
+            run_risks = c2.button("Только риски",
+                                  use_container_width=True, key="ca_run_risks")
+        elif ss.ca_done and ss.ca_parsed_articles:
+            # Показываем кнопку повторного анализа если нужно
+            if st.button("Перезапустить анализ", key="ca_rerun",
+                         use_container_width=True):
+                ss.ca_done              = False
+                ss.ca_risks             = ""
+                ss.ca_claim_summary     = ""
+                ss.ca_articles_approved = True  # список уже подтверждён
+                st.rerun()
 
-            def _pcb_risk(pct, msg):
-                val = min(0.65 + pct * 0.34, 0.99)
-                if val > ss.get("_pbar_max", 0):
-                    ss["_pbar_max"] = val
-                    pbar.progress(val)
-                status.text(msg)
+        if run_full:
+            pbar   = st.progress(0.0)
+            status = st.empty()
+            calc_context = ss.ca_calc_context
+            calc_names   = ss.get("ca_calc_files_checked", [])
 
-            # ── Шаг 2: суммаризация документальных файлов заявки ────────
+            if not calc_context.strip():
+                st.error("Не удалось извлечь данные из расчётного файла.")
+                st.stop()
+
+            # ── Суммаризация документов (первые 1500 симв каждого, батч 10) ──
             n_doc_files = sum(
                 1 for name in ss.ca_uploaded_bytes
                 if name not in calc_names
@@ -2053,11 +2968,11 @@ def show_claim_analyzer():
             )
             if n_doc_files > 0:
                 status.text(f'Суммаризация документов ({n_doc_files} файлов)...')
-                pbar.progress(0.60)
+                pbar.progress(0.20)
 
                 def _pcb_sum(frac, msg):
-                    val = 0.60 + frac * 0.06
-                    pbar.progress(min(val, 0.66))
+                    val = 0.20 + frac * 0.20
+                    pbar.progress(min(val, 0.40))
                     status.text(msg)
 
                 file_summaries = _build_file_summaries(
@@ -2066,29 +2981,81 @@ def show_claim_analyzer():
                     progress_cb=_pcb_sum,
                 )
                 ss["ca_file_summaries"] = file_summaries
-
                 if file_summaries:
                     names_preview = ', '.join(list(file_summaries.keys())[:3])
                     suffix = '...' if len(file_summaries) > 3 else ''
-                    st.info(
-                        f'Суммаризировано файлов: **{len(file_summaries)}** — '
-                        f'{names_preview}{suffix}'
-                    )
+                    st.info(f'Документов суммаризировано: **{len(file_summaries)}** — '
+                            f'{names_preview}{suffix}')
                 else:
                     st.caption('Документальные файлы не обработаны — анализ только по НПА.')
             else:
                 file_summaries = {}
                 ss["ca_file_summaries"] = {}
 
-            risks = analyze_risks(calc_context, summary, _pcb_risk,
-                                  spheres=ss.ca_spheres or None,
-                                  file_summaries=ss.get("ca_file_summaries", {}))
-            ss.ca_risks    = risks
-            ss.ca_done     = True
-            ss.ca_project_id = None  # сброс — анализ обновлён, нужно пересохранить
+            pbar.progress(0.40)
+            ss["_pbar_max"] = 0.40
 
-            _save_log(ss.ca_org, ss.ca_period, summary, risks)
+            def _pcb_risk(pct, msg):
+                val = min(0.40 + pct * 0.57, 0.97)
+                if val > ss.get("_pbar_max", 0):
+                    ss["_pbar_max"] = val
+                    pbar.progress(val)
+                status.text(msg)
+
+            risks = analyze_risks(
+                calc_context, "", _pcb_risk,
+                spheres=ss.ca_spheres or None,
+                file_summaries=ss.get("ca_file_summaries", {}),
+                target_pct=float(ss.get("ca_target_pct", 5.0)),
+                risk_pct=float(ss.get("ca_risk_pct", 10.0)),
+                approved_articles=ss.ca_parsed_articles or None,
+            )
+            ss.ca_risks = risks
+            ss.ca_done  = True
+            ss.ca_project_id = None
+
+            # ── Резюме заявки (первые 1000 симв каждого файла) ───────────────
+            status.text("Формирую резюме заявки...")
+            pbar.progress(0.97)
+            try:
+                risk_data = json.loads(risks)
+                art_list  = risk_data.get("articles", [])
+            except Exception:
+                art_list = []
+            ss.ca_claim_summary = _build_claim_summary_from_heads(
+                uploaded_bytes=ss.ca_uploaded_bytes,
+                calc_file_names=calc_names,
+                calc_context=calc_context,
+                article_results=art_list,
+                org=ss.ca_org,
+                period=ss.ca_period,
+            )
+
+            _save_log(ss.ca_org, ss.ca_period, ss.ca_claim_summary, risks)
             pbar.progress(1.0)
+
+            # ── Автосохранение в реестр ───────────────────────────────────────
+            status.text("Сохраняю в реестр...")
+            try:
+                from core.claim_registry import save_project
+                _files_data = [
+                    {"name": meta["name"],
+                     "bytes": ss.ca_uploaded_bytes.get(meta["name"], b"")}
+                    for meta in ss.ca_uploaded_meta
+                ]
+                _pid = save_project(
+                    org          = ss.ca_org,
+                    period       = ss.ca_period,
+                    files_data   = _files_data,
+                    calc_context = ss.ca_calc_context,
+                    summary      = ss.ca_claim_summary,
+                    risks        = risks,
+                    project_id   = None,
+                )
+                ss.ca_project_id = _pid
+            except Exception as _e:
+                print(f"[AUTOSAVE] Ошибка: {_e}")
+
             status.success("Анализ завершён!")
             st.rerun()
 
@@ -2165,13 +3132,57 @@ def show_claim_analyzer():
                     pbar.progress(val)
                 status.text(msg)
 
-            ss.ca_risks      = analyze_risks(
+            ss.ca_risks = analyze_risks(
                 ss.ca_calc_context, ss.ca_summary, _pcb_r,
                 spheres=ss.ca_spheres or None,
                 file_summaries=ss.get("ca_file_summaries", {}),
+                target_pct=float(ss.get("ca_target_pct", 5.0)),
+                risk_pct=float(ss.get("ca_risk_pct", 10.0)),
+                approved_articles=ss.ca_parsed_articles or None,
             )
             ss.ca_done       = True
             ss.ca_project_id = None
+            pbar.progress(0.97)
+
+            # Резюме если ещё нет
+            if not ss.get("ca_claim_summary"):
+                status.text("Формирую резюме заявки...")
+                try:
+                    risk_data = json.loads(ss.ca_risks)
+                    art_list  = risk_data.get("articles", [])
+                except Exception:
+                    art_list = []
+                ss.ca_claim_summary = _build_claim_summary_from_heads(
+                    uploaded_bytes=ss.ca_uploaded_bytes,
+                    calc_file_names=calc_names,
+                    calc_context=ss.ca_calc_context,
+                    article_results=art_list,
+                    org=ss.ca_org,
+                    period=ss.ca_period,
+                )
+
+            # Автосохранение в реестр
+            status.text("Сохраняю в реестр...")
+            try:
+                from core.claim_registry import save_project
+                _files_data = [
+                    {"name": meta["name"],
+                     "bytes": ss.ca_uploaded_bytes.get(meta["name"], b"")}
+                    for meta in ss.ca_uploaded_meta
+                ]
+                _pid = save_project(
+                    org          = ss.ca_org,
+                    period       = ss.ca_period,
+                    files_data   = _files_data,
+                    calc_context = ss.ca_calc_context,
+                    summary      = ss.ca_claim_summary,
+                    risks        = ss.ca_risks,
+                    project_id   = None,
+                )
+                ss.ca_project_id = _pid
+            except Exception as _e:
+                print(f"[AUTOSAVE] Ошибка: {_e}")
+
             pbar.progress(1.0)
             status.success("Риски обновлены!")
             st.rerun()
@@ -2220,68 +3231,32 @@ def show_claim_analyzer():
 
     st.divider()
     st.markdown("#### Результаты анализа")
-    tab_risks, tab_summary, tab_registry = st.tabs([
+    tab_risks, tab_registry = st.tabs([
         "Риски и комплектность",
-        "Резюме заявки",
         "Реестр заявок",
     ])
 
     # =========================================================================
-    # Вкладка 1: Риски
+    # Вкладка 1: Риски + Резюме
     # =========================================================================
     with tab_risks:
-        # Диагностика RAG (компактно)
         diag = _rag_diagnose()
         if diag:
             if "недоступен" in diag or "Не удалось" in diag:
                 st.error(diag)
             else:
                 st.caption(diag)
-        # Реестр суммаризированных файлов
-        file_sums = ss.get("ca_file_summaries", {})
-        if file_sums:
-            with st.expander(
-                f'Файлы заявки ({len(file_sums)} суммаризировано)',
-                expanded=False,
-            ):
-                for fname, fsum in file_sums.items():
-                    st.markdown(f"**{fname}**")
-                    st.caption(fsum[:200] if fsum else "—")
-                    st.divider()
 
         if ss.ca_risks:
-            _render_risks_tab(ss.ca_risks)
+            _render_risks_tab(ss.ca_risks, claim_summary=ss.get("ca_claim_summary", ""))
         else:
             st.info(
                 "Загрузите файлы и нажмите «Полный анализ» — "
-                "здесь появится постатейная оценка рисков с фильтрацией."
+                "здесь появится резюме заявки и постатейная оценка рисков."
             )
 
     # =========================================================================
-    # Вкладка 2: Резюме
-    # =========================================================================
-    with tab_summary:
-        st.subheader("Структурированное резюме заявки")
-        if ss.ca_calc_context:
-            with st.expander("Данные расчётного файла", expanded=False):
-                st.code(ss.ca_calc_context[:5000], language=None)
-                if len(ss.ca_calc_context) > 5000:
-                    st.caption(f"… ещё {len(ss.ca_calc_context)-5000} символов")
-        if ss.ca_summary:
-            st.caption(f"Объём: {len(ss.ca_summary.split()):,} слов")
-            st.markdown(ss.ca_summary)
-            st.download_button(
-                "Скачать резюме (.txt)",
-                data=ss.ca_summary.encode("utf-8"),
-                file_name=f"резюме_{ss.ca_org or 'заявка'}.txt",
-                mime="text/plain",
-                key="ca_dl_summary",
-            )
-        else:
-            st.info("Загрузите файлы и нажмите «Полный анализ».")
-
-    # =========================================================================
-    # Вкладка 3: Реестр
+    # Вкладка 2: Реестр
     # =========================================================================
     with tab_registry:
         _show_registry()
@@ -2448,7 +3423,14 @@ def _show_registry():
 
             with sub2:
                 if risks:
-                    st.markdown(risks)
+                    # Пробуем отрендерить через _render_risks_tab (JSON-формат)
+                    try:
+                        import json as _json
+                        _json.loads(risks)  # проверяем что это JSON
+                        _render_risks_tab(risks, show_summary=False, key_prefix=f"reg_{pid}")
+                    except Exception:
+                        # Старый формат — просто markdown
+                        st.markdown(risks)
                     st.download_button(
                         "Скачать риски (.txt)",
                         data=risks.encode("utf-8"),
