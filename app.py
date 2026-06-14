@@ -11,7 +11,6 @@ os.environ.setdefault("CHROMA_TELEMETRY", "False")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from config import TEST_FILES_DIR
 from core.feedback import submit_feedback, get_feedback, get_answer_stats
 from core import admin
 

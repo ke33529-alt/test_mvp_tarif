@@ -1,0 +1,97 @@
+# =============================================================================
+# РЕГУЛА.AI — docker-compose.yml
+# =============================================================================
+# Запуск:  docker compose up -d
+# Остановка: docker compose down
+# Логи:    docker compose logs -f regula
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Основное приложение — РЕГУЛА.AI (Streamlit)
+  # ---------------------------------------------------------------------------
+  regula:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: regula_ai
+    restart: unless-stopped          # автоматически перезапускается при падении
+
+    ports:
+      - "8501:8501"                  # порт на сервере : порт в контейнере
+
+    env_file:
+      - .env                         # все секреты и настройки из .env файла
+
+    volumes:
+      # Данные приложения — хранятся на сервере, не внутри контейнера
+      # Формат: /путь/на/сервере:/путь/в/контейнере
+      - ./data:/app/data                     # заявки, feedback, протоколы
+      - ./config:/app/config                 # промпты, настройки, сферы
+      - ./data/vector_db:/app/data/vector_db # ChromaDB векторная база
+
+      # Папка с исходными НПА документами для индексации
+      - ./data/raw:/app/data/raw
+
+      # Кэш моделей EasyOCR и sentence-transformers
+      # Чтобы не скачивать модели при каждом пересоздании контейнера
+      - model_cache:/root/.cache
+
+    environment:
+      - PYTHONUNBUFFERED=1           # логи выводятся сразу, без буферизации
+      - PYTHONDONTWRITEBYTECODE=1    # не создавать .pyc файлы
+
+    # Ограничения ресурсов (раскомментируйте и подберите под ваш сервер)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 8G
+    #       cpus: '4'
+
+    # Запускать только после Ollama (если Ollama тоже в compose)
+    # depends_on:
+    #   ollama:
+    #     condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Ollama — LLM сервис (Qwen3 и другие модели)
+  # Комментарий: если Ollama уже запущен на хост-машине напрямую,
+  # этот блок можно удалить и в .env указать OLLAMA_BASE_URL=http://host.docker.internal:11434
+  # ---------------------------------------------------------------------------
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: regula_ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_models:/root/.ollama   # модели сохраняются между перезапусками
+  #   # Для GPU (NVIDIA):
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: all
+  #   #           capabilities: [gpu]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+
+# -----------------------------------------------------------------------------
+# Именованные тома (Docker управляет ими сам)
+# -----------------------------------------------------------------------------
+volumes:
+  model_cache:     # кэш EasyOCR, sentence-transformers, HuggingFace
+  # ollama_models: # модели Ollama (раскомментировать если Ollama в compose)
