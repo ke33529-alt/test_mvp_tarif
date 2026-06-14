@@ -138,13 +138,30 @@ def _lm_call(system: str, user: str, max_tokens: int = 2000) -> str:
         from openai import OpenAI
         lm_url, model = _load_lm_config()
         client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=300.0)
-        resp = client.chat.completions.create(
+
+        # Qwen3 через LM Studio: отключаем thinking и KV-кэш между вызовами.
+        # cache_prompt=false критично при последовательных статьях —
+        # без него накопленный KV-кэш вытесняет модель в CPU-offload.
+        is_qwen3 = "qwen3" in model.lower()
+        extra_body: dict = {}
+        if is_qwen3:
+            extra_body = {
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "cache_prompt": False,
+            }
+
+        kwargs = dict(
             model=model,
             messages=[{"role": "system", "content": system},
                       {"role": "user",   "content": user}],
             max_tokens=max_tokens,
             temperature=0.2,
         )
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        resp = client.chat.completions.create(**kwargs)
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"[Ошибка LM: {e}]"
@@ -1005,23 +1022,49 @@ _FILE_SUMMARY_FINAL_TOKENS = 300   # токенов на ответ одиноч
 
 
 # Параметры батчевой суммаризации файлов
-_FILE_HEAD_CHARS  = 1_500   # символов с начала каждого файла
-_FILE_BATCH_SIZE  = 10      # файлов в одном LLM-вызове
+_FILE_HEAD_CHARS     = 1_500  # символов с начала каждого файла (OCR)
+_FILE_BATCH_SIZE     = 10     # не используется, оставлен для совместимости
+
+# ── Предохранители контекста (лимит LLM: 20 000 токенов) ──────────────────
+# Бюджет REDUCE-вызова резюме (~18 800 токенов на вход):
+#   calc_block    : 1 500 симв  (~  375 токенов)
+#   arts_combined : 6 групп × 1 000 симв = 6 000 симв  (~1 500 токенов)
+#   docs_block    : 100 файлов × 500 симв = 50 000 симв (~12 500 токенов)
+#   системный+инструкция+ответ: ~4 500 токенов
+#   Итого: ~18 875 токенов ✓
+#
+# MAP-вызов: 50 статей × 120 симв = 6 000 симв (~1 750 токенов) ✓
+_MAX_DOC_FILES       = 100   # максимум файлов для OCR-чтения заголовков
+_MAX_DOC_FOR_SUMMARY  = 100  # максимум файлов в блоке документов резюме
+_MAX_DOC_HEAD_CHARS   = 1_000 # символов из каждого файла (заголовок)
+_DOC_MAP_GROUP        = 10   # файлов в одном MAP-вызове документов
+                              # 10 × 1000 симв ≈ 2 500 токенов на вызов ✓
+                              # 100 файлов → 10 MAP → 10 блоков × ~800 симв ≈ 2 000 токенов в REDUCE ✓
+_MAX_ARTICLES        = 300   # максимум статей затрат в анализе
+_SUMMARY_MAP_GROUP   = 50    # статей в одном MAP-вызове
+_MAX_MAP_GROUPS      = 6     # ceil(300/50) — не более 6 групп
 
 
 def _extract_file_head(file_bytes: bytes, file_name: str,
                        max_chars: int = _FILE_HEAD_CHARS) -> str:
-    """Извлекает первые max_chars символов из файла (только первая страница)."""
+    """
+    Извлекает первые max_chars символов из файла.
+    OCR ограничен первыми 2 страницами (max_pages=2) —
+    весь документ не распознаётся, только заголовочная часть.
+    Текст обеих страниц склеивается перед обрезкой:
+    первая страница может быть титульным листом с минимумом текста.
+    """
     try:
         try:
             from streamlit_pages.doc_scanner import extract_text as _et_h
         except ImportError:
             from doc_scanner import extract_text as _et_h
-        pages = _et_h(file_bytes, file_name)
-        # Читаем только первую страницу — не запускаем OCR на всём документе
-        text = (pages[0]["text"] if pages else "").strip()
-        if not text and len(pages) > 1:
-            text = pages[1].get("text", "").strip()
+        pages = _et_h(file_bytes, file_name, max_pages=2)
+        # Склеиваем текст страниц 1 и 2
+        text = "\n".join(p.get("text", "") for p in pages).strip()
+        ocr_pages = sum(1 for p in pages if p.get("method") == "ocr")
+        if ocr_pages:
+            print(f"[ANALYSIS] {file_name[:30]}: OCR {ocr_pages} стр. из {len(pages)}")
     except Exception:
         text = file_bytes.decode("utf-8", errors="ignore").strip()
     head = text[:max_chars]
@@ -1113,55 +1156,36 @@ def _build_file_summaries(
     progress_cb=None,
 ) -> Dict[str, str]:
     """
-    Суммаризирует все документальные файлы заявки (не Excel).
-    Батч по _FILE_BATCH_SIZE файлов за один LLM-вызов.
-    Читает только первые _FILE_HEAD_CHARS символов каждого файла.
-    Возвращает {имя_файла: краткое_содержание}.
+    Читает заголовки документальных файлов заявки (первые _FILE_HEAD_CHARS символов).
+    Без LLM — возвращает {имя_файла: заголовок_текста}.
     """
     doc_files = [
         name for name in uploaded_bytes
         if name not in calc_file_names
         and os.path.splitext(name.lower())[1] in (".pdf", ".docx", ".doc", ".txt")
     ]
-    print(f"[ANALYSIS] Файлов для суммаризации: {len(doc_files)}")
+    if len(doc_files) > _MAX_DOC_FILES:
+        doc_files = doc_files[:_MAX_DOC_FILES]
+    print(f"[ANALYSIS] Файлов для чтения заголовков: {len(doc_files)}")
     if not doc_files:
         return {}
 
     _init_ocr_for_analysis()
 
-    # Шаг 1: извлекаем заголовки всех файлов
-    if progress_cb:
-        progress_cb(0.1, f"Читаю заголовки {len(doc_files)} файлов...")
-    file_heads: Dict[str, str] = {}
-    for file_name in doc_files:
+    heads: Dict[str, str] = {}
+    n = len(doc_files)
+    for i, file_name in enumerate(doc_files, 1):
+        short = os.path.splitext(file_name)[0][:40]
+        if progress_cb:
+            progress_cb(i / n, f"Читаю {short}...")
         head = _extract_file_head(uploaded_bytes[file_name], file_name)
         if head:
-            file_heads[file_name] = head
+            heads[file_name] = head
         else:
-            print(f"[ANALYSIS] Пустой текст: {file_name} — пропускаем")
+            print(f"[ANALYSIS] Пустой текст: {file_name}")
 
-    if not file_heads:
-        return {}
-
-    # Шаг 2: батчевая суммаризация — по _FILE_BATCH_SIZE файлов за вызов
-    summaries: Dict[str, str] = {}
-    items     = list(file_heads.items())
-    n_batches = -(-len(items) // _FILE_BATCH_SIZE)  # ceil
-
-    for b_idx in range(n_batches):
-        batch = dict(items[b_idx * _FILE_BATCH_SIZE : (b_idx + 1) * _FILE_BATCH_SIZE])
-        if progress_cb:
-            progress_cb(
-                0.2 + (b_idx + 1) / n_batches * 0.8,
-                f"Суммаризация батча {b_idx + 1}/{n_batches} "
-                f"({len(batch)} файлов)..."
-            )
-        batch_result = _summarize_file_batch(batch)
-        summaries.update(batch_result)
-
-    print(f"[ANALYSIS] Суммаризировано файлов: {len(summaries)} "
-          f"за {n_batches} батч(а/ей)")
-    return summaries
+    print(f"[ANALYSIS] Прочитано: {len(heads)}")
+    return heads
 
 
 def _match_files_to_article(
@@ -1172,7 +1196,11 @@ def _match_files_to_article(
     """
     Находит топ-k файлов релевантных статье затрат.
     Возвращает список {file_name, summary, _similarity}.
-    Уровень 1 — лексика, уровень 2 — эмбеддинги.
+
+    Трёхуровневая стратегия:
+    1. Лексика — быстрое точное совпадение ключевых слов (score=1.0)
+    2. Эмбеддинги — семантическое сходство для нелексических кандидатов
+    3. Реранкер DiTy — финальная сортировка кандидатов выше порога
     """
     if not file_summaries:
         return []
@@ -1187,12 +1215,14 @@ def _match_files_to_article(
         if len(w) > 3 and w not in stop_words
     ]
 
+    # Уровень 1: лексика
     scored: List[Dict] = []
     for fname, summary in file_summaries.items():
         text = (fname + " " + summary).lower()
         sim  = 1.0 if (keywords and any(kw in text for kw in keywords)) else 0.0
         scored.append({"file_name": fname, "summary": summary, "_similarity": sim})
 
+    # Уровень 2: эмбеддинги для нелексических кандидатов
     unscored = [d for d in scored if d["_similarity"] == 0.0]
     if unscored:
         try:
@@ -1215,8 +1245,40 @@ def _match_files_to_article(
         except Exception as e:
             print(f"[SEMANTIC] Ошибка: {e}")
 
+    # Кандидаты выше порога
     above = [d for d in scored if d["_similarity"] >= SIMILARITY_YELLOW]
     above.sort(key=lambda x: x["_similarity"], reverse=True)
+
+    # Уровень 3: реранкер DiTy — финальная сортировка
+    # Реранкер должен быть в памяти (загружен в RAG-фазе до LLM-фазы).
+    # Вызываем только если кандидатов > 1 и есть что переранжировать.
+    if len(above) > 1:
+        try:
+            from core.advisor import get_reranker
+            reranker = get_reranker()
+            if reranker is not None:
+                # Реранкер ожидает список dict с полем "doc"
+                candidates = [
+                    {"doc": f"{d['file_name']} {d['summary'][:300]}", **d}
+                    for d in above
+                ]
+                reranked = reranker.rerank(article_name, candidates, top_n=top_k)
+                # Восстанавливаем исходные поля по file_name
+                result = []
+                for r in reranked:
+                    orig = next(
+                        (d for d in above if d["file_name"] == r.get("file_name")),
+                        None,
+                    )
+                    if orig:
+                        result.append(orig)
+                if result:
+                    print(f"[RERANK_FILES] {article_name[:30]}: "
+                          f"{[r['file_name'][:20] for r in result]}")
+                    return result[:top_k]
+        except Exception as e:
+            print(f"[RERANK_FILES] Ошибка реранкера: {e}")
+
     return above[:top_k]
 
 
@@ -1260,6 +1322,7 @@ def _parse_article_result(text: str) -> Dict:
     if not result["basis"]:
         result["basis"] = text.strip()[:300]
     return result
+
 
 
 
@@ -1374,8 +1437,6 @@ def _get_growth_color(amounts_str: str, reg_year: int,
 # Резюме заявки на основе первых 1000 симв каждого файла
 # =============================================================================
 
-# Размер группы статей для одного MAP-вызова резюме
-_SUMMARY_MAP_GROUP = 50
 
 
 def _build_claim_summary_from_heads(
@@ -1386,15 +1447,17 @@ def _build_claim_summary_from_heads(
     org: str,
     period: str,
     progress_cb=None,
+    file_summaries: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Строит итоговое резюме заявки в стиле регулятора РФ.
 
+    Использует уже готовые file_summaries из _build_file_summaries
+    вместо повторного OCR-чтения файлов.
+
     MAP-REDUCE по статьям затрат:
       - Группы по _SUMMARY_MAP_GROUP статей → промежуточное резюме (MAP)
       - Все промежуточные резюме + документы + calc → финальное резюме (REDUCE)
-
-    Укладывается в 20 000 токенов контекста при любом числе статей.
     """
     prompts = load_prompts()
 
@@ -1407,30 +1470,73 @@ def _build_claim_summary_from_heads(
         )
     )
 
-    # ── Собираем заголовки документов (первые 1000 симв, макс 8 файлов) ────────
-    doc_heads = []
-    for fname, fbytes in uploaded_bytes.items():
-        if fname in calc_file_names:
-            continue
-        ext = os.path.splitext(fname.lower())[1]
-        if ext not in (".pdf", ".docx", ".doc", ".txt"):
-            continue
-        try:
+    # ── Блок документов: MAP по группам файлов ──────────────────────────────
+    _all_heads: Dict[str, str] = {}
+    if file_summaries:
+        _all_heads = {
+            fname: head[:_MAX_DOC_HEAD_CHARS]
+            for fname, head in list(file_summaries.items())[:_MAX_DOC_FOR_SUMMARY]
+            if head
+        }
+    else:
+        # Fallback: читаем первые 2 страницы если заголовков нет
+        for fname, fbytes in uploaded_bytes.items():
+            if fname in calc_file_names:
+                continue
+            if os.path.splitext(fname.lower())[1] not in (".pdf", ".docx", ".doc", ".txt"):
+                continue
             try:
-                from streamlit_pages.doc_scanner import extract_text as _et2
-            except ImportError:
-                from doc_scanner import extract_text as _et2
-            pages = _et2(fbytes, fname)
-            raw = "\n".join(p["text"] for p in pages).strip()
-        except Exception:
-            raw = fbytes.decode("utf-8", errors="ignore").strip()
-        head = raw[:1000].strip()
-        if head:
-            doc_heads.append(f"[{fname}]:\n{head}")
-        if len(doc_heads) >= 8:
-            break
+                try:
+                    from streamlit_pages.doc_scanner import extract_text as _et2
+                except ImportError:
+                    from doc_scanner import extract_text as _et2
+                pages = _et2(fbytes, fname, max_pages=2)
+                raw = "\n".join(p["text"] for p in pages).strip()
+            except Exception:
+                raw = fbytes.decode("utf-8", errors="ignore").strip()
+            head = raw[:_MAX_DOC_HEAD_CHARS].strip()
+            if head:
+                _all_heads[fname] = head
+            if len(_all_heads) >= _MAX_DOC_FOR_SUMMARY:
+                break
 
-    docs_block = "\n\n".join(doc_heads)[:3000] or "(документы не приложены)"
+    # MAP по документам — группы по _DOC_MAP_GROUP файлов
+    _doc_items  = list(_all_heads.items())
+    _doc_blocks: List[str] = []
+
+    if not _doc_items:
+        _doc_blocks = ["(документы не приложены)"]
+    elif len(_doc_items) <= _DOC_MAP_GROUP:
+        # Мало файлов — MAP не нужен
+        _doc_blocks = ["\n\n".join(f"[{fn}]:\n{h}" for fn, h in _doc_items)]
+    else:
+        # MAP: группируем файлы
+        _doc_groups = [
+            _doc_items[i: i + _DOC_MAP_GROUP]
+            for i in range(0, len(_doc_items), _DOC_MAP_GROUP)
+        ]
+        _n_dg = len(_doc_groups)
+        print(f"[SUMMARY] Документы MAP: {len(_doc_items)} файлов → {_n_dg} групп")
+        for _gi, _grp in enumerate(_doc_groups):
+            if progress_cb:
+                progress_cb(
+                    0.05 + _gi / _n_dg * 0.20,
+                    f"Резюме документов: группа {_gi+1}/{_n_dg}..."
+                )
+            _grp_text = "\n\n".join(f"[{fn}]:\n{h}" for fn, h in _grp)
+            _map_user = (
+                f"Группа {_gi+1}/{_n_dg} документов тарифной заявки "
+                f"({org or '—'}, {period or '—'}).\n\n"
+                "Кратко (2-4 предложения) опиши состав этих документов: "
+                "типы документов, стороны, предметы, суммы/даты если есть.\n\n"
+                f"ДОКУМЕНТЫ:\n{_grp_text}"
+            )
+            _blk = _lm_call(system, _map_user, max_tokens=200).strip()
+            if _blk:
+                _doc_blocks.append(f"=== Документы группа {_gi+1} ===\n{_blk}")
+            print(f"[SUMMARY] Документы MAP {_gi+1}/{_n_dg}: {len(_blk)} симв")
+
+    docs_block = "\n\n".join(_doc_blocks)[:4000]
     calc_block = calc_context[:1500] if calc_context else "(расчётный файл не загружен)"
 
     # ── MAP: группы по _SUMMARY_MAP_GROUP статей → промежуточные блоки ─────────
@@ -1456,6 +1562,10 @@ def _build_claim_summary_from_heads(
             art_items[i: i + _SUMMARY_MAP_GROUP]
             for i in range(0, len(art_items), _SUMMARY_MAP_GROUP)
         ]
+        if len(groups) > _MAX_MAP_GROUPS:
+            print(f"[SUMMARY] Групп {len(groups)} > лимита {_MAX_MAP_GROUPS}, берём топ по размеру")
+            # Берём первые N групп (начало расчётного файла обычно важнее)
+            groups = groups[:_MAX_MAP_GROUPS]
         n_groups = len(groups)
         print(f"[SUMMARY] MAP: {len(art_items)} статей → {n_groups} групп")
 
@@ -1480,7 +1590,7 @@ def _build_claim_summary_from_heads(
 
     # ── REDUCE: финальное резюме ─────────────────────────────────────────────
     if progress_cb:
-        progress_cb(0.75, "Формирую итоговое резюме заявки...")
+        progress_cb(0.30, "Формирую итоговое резюме заявки...")
 
     arts_combined = "\n\n".join(map_blocks)[:4000]
 
@@ -1962,6 +2072,10 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         articles = approved_articles
     else:
         articles = _extract_articles_from_context(calc_context) if calc_context else []
+    # Предохранитель: не более _MAX_ARTICLES статей
+    if len(articles) > _MAX_ARTICLES:
+        print(f"[ANALYSIS] Статей {len(articles)} > лимита {_MAX_ARTICLES}, берём первые {_MAX_ARTICLES}")
+        articles = articles[:_MAX_ARTICLES]
 
     # ── Fallback: нет статей из расчётного файла ─────────────────────────────
     if not articles:
@@ -2043,9 +2157,9 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
     def _flush_reranker():
         try:
-            from core.advisor import invalidate_reranker, invalidate_hybrid_retriever
+            from core.advisor import invalidate_reranker
             invalidate_reranker()
-            invalidate_hybrid_retriever()
+            # BM25 не сбрасываем — он в RAM, пересборка занимает ~40 сек
         except Exception:
             pass
         import gc; gc.collect()
@@ -2056,14 +2170,13 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         except Exception:
             pass
 
+    # Прогресс только в начале RAG-фазы — не вызываем внутри цикла
+    # чтобы избежать Streamlit rerun который перезагружает реранкер
+    if progress_cb:
+        progress_cb(P_RAG_START, f"RAG-поиск для {total} статей...")
+
     all_chunks: List[List[Dict]] = []
     for rag_done, art in enumerate(articles):
-        rag_frac = rag_done / total
-        if progress_cb:
-            progress_cb(
-                P_RAG_START + rag_frac * (P_RAG_END - P_RAG_START),
-                f"RAG {rag_done + 1}/{total}: {art['name'][:40]}..."
-            )
         chunks = _rag_search(_make_rag_query(art["name"]), top_k=10,
                              spheres=spheres or None)
         all_chunks.append(chunks)
@@ -2077,6 +2190,9 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
     # ── Финальная выгрузка реранкера перед LLM-фазой ─────────────────────────
     _flush_reranker()
+
+    if progress_cb:
+        progress_cb(P_RAG_END, f"RAG завершён. Запускаю LLM для {total} статей...")
 
     # ── Фаза 2: LLM для всех статей ──────────────────────────────────────────
     llm_done = 0
@@ -2123,13 +2239,25 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
             # ── LLM: динамика + рекомендация по обоснованию ───────────────────
             # Только названия файлов без содержимого — экономим токены
-            files_list = ", ".join(d['file_name'] for d in matched) if matched else "не найдены"
+            # Формируем блок файлов обоснования с фрагментом текста (первые 1000 симв)
+            # Это даёт LLM понять содержимое документа, а не только его имя
+            if matched:
+                files_lines = []
+                for d in matched:
+                    head = d.get("summary", "")[:1000].strip()
+                    if head:
+                        files_lines.append(f"[{d['file_name']}]\n{head}")
+                    else:
+                        files_lines.append(f"[{d['file_name']}]")
+                files_block = "\n\n".join(files_lines)
+            else:
+                files_block = "не найдены"
 
             prompt = (
                 f"Статья затрат тарифной заявки: {name}\n"
                 f"Значения: {amounts[:300]}\n"
                 f"Рост к предыдущему периоду: {growth_reason}\n\n"
-                f"Файлы обоснования в заявке: {files_list}\n\n"
+                f"Файлы обоснования в заявке:\n{files_block}\n\n"
                 f"НПА из базы знаний:\n{npa_context[:1500]}\n\n"
                 f"{npa_instr}\n\n"
                 "Ответ строго в формате (3 строки). БЕЗ эмодзи. БЕЗ лишнего текста.\n"
@@ -2464,8 +2592,15 @@ def _extract_articles_from_context_unfiltered(calc_context: str) -> List[Dict]:
         i += 1
 
     # Авто-отбор: снимаем галочки с агрегатов, справочных и нулевых
-    for a in articles:
-        a["checked"] = a["type"] == "cost"
+    n_cost = sum(1 for a in articles if a["type"] == "cost")
+    if n_cost > 0:
+        # Есть ненулевые статьи затрат — отмечаем только их
+        for a in articles:
+            a["checked"] = a["type"] == "cost"
+    else:
+        # Все нулевые — отмечаем все нулевые статьи чтобы пользователь видел список
+        for a in articles:
+            a["checked"] = a["type"] in ("cost", "zero")
 
     return articles
 
@@ -2676,6 +2811,15 @@ def _show_article_approval(readonly: bool = False):
 
 
 def show_claim_analyzer():
+    # Прогрев реранкера при первом открытии анализатора
+    if not st.session_state.get("_ca_reranker_preloaded"):
+        try:
+            from core.advisor import get_reranker
+            get_reranker()
+            st.session_state["_ca_reranker_preloaded"] = True
+        except Exception:
+            pass
+
     hdr_col, clear_col = st.columns([5, 1])
     hdr_col.header("Анализатор тарифных заявок")
     hdr_col.caption("Риски · Реестр заявок")
@@ -2911,9 +3055,38 @@ def show_claim_analyzer():
             raw_articles = _extract_articles_from_context_unfiltered(calc_context)
             ss.ca_parsed_articles  = raw_articles
             ss.ca_articles_approved = False
+
+            # Информируем пользователя о составе
+            n_all   = len(raw_articles)
+            n_cost  = sum(1 for a in raw_articles if a["type"] == "cost")
+            n_zero  = sum(1 for a in raw_articles if a["type"] == "zero")
+            n_other = n_all - n_cost - n_zero
+
+            if n_all == 0:
+                st.error("Статьи затрат не найдены. Возможно, файл является незаполненным шаблоном.")
+            elif n_cost == 0 and n_zero > 0:
+                st.warning(
+                    f"Найдено {n_all} строк, но все значения нулевые — файл может быть незаполненным шаблоном. "
+                    f"Вы можете вручную отметить нужные строки в таблице ниже (тип «Нулевые»)."
+                )
+            else:
+                st.success(
+                    f"Найдено строк: **{n_all}** — "
+                    f"статей затрат: **{n_cost}**, "
+                    f"нулевых: **{n_zero}**, "
+                    f"прочих: **{n_other}**. "
+                    f"Проверьте список и нажмите «Подтвердить»."
+                )
             st.rerun()
 
         # ── Шаг 2: экспандер с таблицей апрува ──────────────────────────────
+        # Если парсинг выполнен но ничего не нашли
+        if ss.ca_calc_context and not ss.ca_parsed_articles and not ss.ca_done:
+            st.error(
+                "Статьи затрат не найдены в расчётном файле. "
+                "Возможные причины: незаполненный шаблон, нераспознанный формат, "
+                "или все строки имеют нулевые значения."
+            )
         if ss.ca_parsed_articles:
             n_arts = len(ss.ca_parsed_articles)
             n_sel  = sum(1 for a in ss.ca_parsed_articles if a["checked"])
@@ -2959,7 +3132,7 @@ def show_claim_analyzer():
                 st.error("Не удалось извлечь данные из расчётного файла.")
                 st.stop()
 
-            # ── Суммаризация документов (первые 1500 симв каждого, батч 10) ──
+            # ── Чтение заголовков документов (первые 2 страницы каждого файла) ──
             n_doc_files = sum(
                 1 for name in ss.ca_uploaded_bytes
                 if name not in calc_names
@@ -2967,7 +3140,6 @@ def show_claim_analyzer():
                 in ('.pdf', '.docx', '.doc', '.txt')
             )
             if n_doc_files > 0:
-                status.text(f'Суммаризация документов ({n_doc_files} файлов)...')
                 pbar.progress(0.20)
 
                 def _pcb_sum(frac, msg):
@@ -3029,6 +3201,7 @@ def show_claim_analyzer():
                 article_results=art_list,
                 org=ss.ca_org,
                 period=ss.ca_period,
+                file_summaries=ss.get("ca_file_summaries", {}),
             )
 
             _save_log(ss.ca_org, ss.ca_period, ss.ca_claim_summary, risks)
@@ -3102,7 +3275,6 @@ def show_claim_analyzer():
                     in ('.pdf', '.docx', '.doc', '.txt')
                 )
                 if n_doc_files > 0:
-                    status.text(f'Суммаризация документов ({n_doc_files} файлов)...')
                     pbar.progress(0.12)
 
                     def _pcb_sum_r(frac, msg):
@@ -3119,7 +3291,7 @@ def show_claim_analyzer():
                     if file_summaries:
                         names_preview = ', '.join(list(file_summaries.keys())[:3])
                         suffix = '...' if len(file_summaries) > 3 else ''
-                        st.info(f'Суммаризировано: **{len(file_summaries)}** — {names_preview}{suffix}')
+                        st.info(f'Прочитано заголовков: **{len(file_summaries)}** — {names_preview}{suffix}')
                     else:
                         st.caption('Документы не обработаны — анализ только по НПА.')
 
@@ -3159,6 +3331,7 @@ def show_claim_analyzer():
                     article_results=art_list,
                     org=ss.ca_org,
                     period=ss.ca_period,
+                    file_summaries=ss.get("ca_file_summaries", {}),
                 )
 
             # Автосохранение в реестр

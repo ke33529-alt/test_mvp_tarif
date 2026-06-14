@@ -534,43 +534,65 @@ _reranker_lock = threading.Lock()
  
  
 class Reranker:
-    """CrossEncoder для ранжирования кандидатов. torch.compile убран — ломает predict."""
- 
+    """
+    CrossEncoder для ранжирования кандидатов.
+    Использует AutoModel/AutoTokenizer напрямую (без sentence-transformers CrossEncoder)
+    — это обходит несовместимость sentence-transformers >= 3.x с DiTy/cross-encoder-russian-msmarco.
+    """
+
     def __init__(self, model_name: str):
-        from sentence_transformers import CrossEncoder
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
         t0 = time.perf_counter()
-        self.model      = CrossEncoder(model_name, device=_DEVICE)
         self.model_name = model_name
+        self.tokenizer  = AutoTokenizer.from_pretrained(model_name)
+        self.model      = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.device     = torch.device(_DEVICE)
+        self.model.to(self.device)
+        self.model.eval()
         if _DEVICE == "cuda":
             try:
-                self.model.model = self.model.model.half()
+                self.model = self.model.half()
                 print(f"[RERANKER] FP16 включён")
             except Exception as e:
                 print(f"[RERANKER] FP16 недоступен: {e}")
+        # Прогрев
         try:
-            self.model.predict([("тест", "тест")], batch_size=1, show_progress_bar=False)
+            self._score_pairs([("тест", "тест")])
+            print(f"[RERANKER] Прогрев успешен")
         except Exception as _w:
-            print(f"[RERANKER] Прогрев пропущен: {type(_w).__name__}")
-        try:
-            _dev = next(self.model.model.parameters()).device
-        except Exception:
-            _dev = _DEVICE
-        print(f"[RERANKER] Загружен {model_name} на {_dev} за {time.perf_counter()-t0:.1f} сек")
- 
+            print(f"[RERANKER] Прогрев пропущен: {type(_w).__name__}: {_w}")
+        print(f"[RERANKER] Загружен {model_name} на {self.device} за {time.perf_counter()-t0:.1f} сек")
+
+    def _score_pairs(self, pairs: list) -> list:
+        """Возвращает список float-скоров для списка (query, doc) пар."""
+        import torch
+        features = self.tokenizer(
+            pairs,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        )
+        # Переносим тензоры на устройство
+        features = {k: v.to(self.device) for k, v in features.items()}
+        with torch.no_grad():
+            logits = self.model(**features).logits
+        scores = logits.squeeze(-1)
+        return scores.cpu().float().tolist()
+
     def rerank(self, query: str, candidates: list, top_n: int = 5) -> list:
         if not candidates:
             return candidates
         t0    = time.perf_counter()
         pairs = [(query, c["doc"]) for c in candidates]
         try:
-            scores = self.model.predict(pairs, batch_size=max(len(pairs), 32), show_progress_bar=False)
+            scores = self._score_pairs(pairs)
         except Exception as e:
+            import traceback
             print(f"[RERANKER] predict упал: {type(e).__name__}: {e} — без реранкинга")
+            print(f"[RERANKER] traceback: {traceback.format_exc()}")
             return candidates[:top_n]
-        try:
-            scores = list(scores.cpu().numpy() if hasattr(scores, "cpu") else scores)
-        except Exception:
-            scores = list(scores)
         for c, s in zip(candidates, scores):
             c["rerank_score"] = float(s)
         result = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:top_n]
@@ -583,8 +605,7 @@ class Reranker:
         except Exception:
             pass
         return result
- 
- 
+
 def get_reranker() -> Optional[Reranker]:
     """Синглтон Reranker с автовыбором модели."""
     existing = sys.modules.get(_RERANKER_KEY)

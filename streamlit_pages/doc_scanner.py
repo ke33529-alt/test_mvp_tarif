@@ -150,17 +150,21 @@ def _ocr_image(image) -> str:
 # =============================================================================
 # Извлечение текста по типу файла
 # =============================================================================
-def _extract_pdf(file_bytes: bytes, filename: str) -> List[Dict]:
+def _extract_pdf(file_bytes: bytes, filename: str,
+                 max_pages: int = 0) -> List[Dict]:
     """
     PDF → список страниц [{page, text, method}].
-    Сначала пробует извлечь текст напрямую (для текстовых PDF),
-    если страница пустая — применяет PaddleOCR.
+    max_pages=0 — читать все страницы (полный режим).
+    max_pages=N — читать только первые N страниц (режим заголовка).
     """
     pages = []
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         for i, page in enumerate(doc, 1):
+            if max_pages and i > max_pages:
+                break  # останавливаемся — остальные страницы не читаем
+
             # Попытка прямого извлечения текста
             text = page.get_text("text").strip()
             method = "direct"
@@ -193,7 +197,7 @@ def _extract_pdf(file_bytes: bytes, filename: str) -> List[Dict]:
     return pages
 
 
-def _extract_docx(file_bytes: bytes) -> List[Dict]:
+def _extract_docx(file_bytes: bytes, max_pages: int = 0) -> List[Dict]:
     """DOCX → список страниц (по 100 строк каждая)."""
     try:
         import docx
@@ -294,13 +298,18 @@ def _split_into_pages(text: str, method: str = "direct", lines_per_page: int = 8
                                   "word_count": len(text.split())}]
 
 
-def extract_text(file_bytes: bytes, filename: str) -> List[Dict]:
-    """Универсальный экстрактор — выбирает метод по расширению файла."""
+def extract_text(file_bytes: bytes, filename: str,
+                 max_pages: int = 0) -> List[Dict]:
+    """
+    Универсальный экстрактор — выбирает метод по расширению файла.
+    max_pages=0 — читать всё (полный режим).
+    max_pages=N — читать только первые N страниц (быстрый режим для заголовков).
+    """
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pdf":
-        return _extract_pdf(file_bytes, filename)
+        return _extract_pdf(file_bytes, filename, max_pages=max_pages)
     elif ext == ".docx":
-        return _extract_docx(file_bytes)
+        return _extract_docx(file_bytes, max_pages=max_pages)
     elif ext in (".doc",):
         return _extract_doc(file_bytes)
     elif ext in (".xlsx", ".xls"):
