@@ -421,10 +421,11 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
     system_prompt = prompts["predictor_classify_system"]
     user_template = prompts["predictor_classify_user"]
 
-    prompt = user_template.format(
-        article_name     = article_name,
-        justification_line = _justify_line,
-        chunk            = _chunk,
+    prompt = (
+        user_template
+        .replace("{article_name}",      article_name)
+        .replace("{justification_line}", _justify_line)
+        .replace("{chunk}",             _chunk)
     )
     raw = _lm_call(client, model, system_prompt, prompt, max_tokens=_max_tokens)
     # Парсим JSON

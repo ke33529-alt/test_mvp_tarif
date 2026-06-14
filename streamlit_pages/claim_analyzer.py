@@ -139,9 +139,6 @@ def _lm_call(system: str, user: str, max_tokens: int = 2000) -> str:
         lm_url, model = _load_lm_config()
         client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=300.0)
 
-        # Qwen3 через LM Studio: отключаем thinking и KV-кэш между вызовами.
-        # cache_prompt=false критично при последовательных статьях —
-        # без него накопленный KV-кэш вытесняет модель в CPU-offload.
         is_qwen3 = "qwen3" in model.lower()
         extra_body: dict = {}
         if is_qwen3:
@@ -165,7 +162,6 @@ def _lm_call(system: str, user: str, max_tokens: int = 2000) -> str:
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"[Ошибка LM: {e}]"
-
 
 def _lm_call_full(system: str, user: str,
                   max_tokens: int = 2000,
@@ -1048,11 +1044,8 @@ _MAX_MAP_GROUPS      = 6     # ceil(300/50) — не более 6 групп
 def _extract_file_head(file_bytes: bytes, file_name: str,
                        max_chars: int = _FILE_HEAD_CHARS) -> str:
     """
-    Извлекает первые max_chars символов из файла.
-    OCR ограничен первыми 2 страницами (max_pages=2) —
-    весь документ не распознаётся, только заголовочная часть.
-    Текст обеих страниц склеивается перед обрезкой:
-    первая страница может быть титульным листом с минимумом текста.
+    Извлекает первые max_chars символов. OCR ограничен 2 страницами.
+    Текст обеих страниц склеивается перед обрезкой.
     """
     try:
         try:
@@ -1060,7 +1053,6 @@ def _extract_file_head(file_bytes: bytes, file_name: str,
         except ImportError:
             from doc_scanner import extract_text as _et_h
         pages = _et_h(file_bytes, file_name, max_pages=2)
-        # Склеиваем текст страниц 1 и 2
         text = "\n".join(p.get("text", "") for p in pages).strip()
         ocr_pages = sum(1 for p in pages if p.get("method") == "ocr")
         if ocr_pages:
@@ -1188,19 +1180,42 @@ def _build_file_summaries(
     return heads
 
 
+def _precompute_file_vecs(file_summaries: Dict[str, str]) -> Dict[str, list]:
+    """
+    Вычисляет эмбеддинги всех файлов заявки ОДИН РАЗ перед LLM-фазой.
+    Без кэша при 100 статьях × 100 файлов = 10 000 encode-вызовов.
+    С кэшем = 1 батч.
+    """
+    if not file_summaries:
+        return {}
+    try:
+        from core.advisor import get_st_model
+        model = get_st_model()
+        if model is None:
+            return {}
+        fnames = list(file_summaries.keys())
+        texts  = [f"passage: {fn} {file_summaries[fn]}" for fn in fnames]
+        t0 = __import__("time").perf_counter()
+        vecs = model.encode(texts, normalize_embeddings=True,
+                            batch_size=32, show_progress_bar=False)
+        elapsed = __import__("time").perf_counter() - t0
+        cache = {fn: vec.tolist() for fn, vec in zip(fnames, vecs)}
+        print(f"[FILE_VECS] Предвычислено {len(cache)} векторов файлов за {elapsed:.2f}с")
+        return cache
+    except Exception as e:
+        print(f"[FILE_VECS] Ошибка: {e}")
+        return {}
+
+
 def _match_files_to_article(
     article_name: str,
     file_summaries: Dict[str, str],
     top_k: int = 3,
+    file_vecs_cache: Optional[Dict[str, list]] = None,
 ) -> List[Dict]:
     """
     Находит топ-k файлов релевантных статье затрат.
-    Возвращает список {file_name, summary, _similarity}.
-
-    Трёхуровневая стратегия:
-    1. Лексика — быстрое точное совпадение ключевых слов (score=1.0)
-    2. Эмбеддинги — семантическое сходство для нелексических кандидатов
-    3. Реранкер DiTy — финальная сортировка кандидатов выше порога
+    Трёхуровневая: лексика → эмбеддинги (кэш) → реранкер DiTy.
     """
     if not file_summaries:
         return []
@@ -1215,14 +1230,12 @@ def _match_files_to_article(
         if len(w) > 3 and w not in stop_words
     ]
 
-    # Уровень 1: лексика
     scored: List[Dict] = []
     for fname, summary in file_summaries.items():
         text = (fname + " " + summary).lower()
         sim  = 1.0 if (keywords and any(kw in text for kw in keywords)) else 0.0
         scored.append({"file_name": fname, "summary": summary, "_similarity": sim})
 
-    # Уровень 2: эмбеддинги для нелексических кандидатов
     unscored = [d for d in scored if d["_similarity"] == 0.0]
     if unscored:
         try:
@@ -1233,37 +1246,37 @@ def _match_files_to_article(
                     [f"query: {article_name}"],
                     normalize_embeddings=True,
                 )[0].tolist()
-                texts = [f"passage: {d['file_name']} {d['summary']}" for d in unscored]
-                vecs  = model.encode(texts, normalize_embeddings=True,
-                                     batch_size=32, show_progress_bar=False)
-                for doc, vec in zip(unscored, vecs):
-                    sim = _cosine_similarity(article_vec, vec.tolist())
+                for doc in unscored:
+                    fn = doc["file_name"]
+                    if file_vecs_cache and fn in file_vecs_cache:
+                        doc_vec = file_vecs_cache[fn]
+                    else:
+                        doc_vec = model.encode(
+                            [f"passage: {fn} {doc['summary']}"],
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                        )[0].tolist()
+                    sim = _cosine_similarity(article_vec, doc_vec)
                     doc["_similarity"] = round(sim, 3)
                     if sim >= SIMILARITY_YELLOW:
                         print(f"[SEMANTIC] {article_name[:25]} ↔ "
-                              f"{doc['file_name'][:25]} sim={sim:.3f}")
+                              f"{fn[:25]} sim={sim:.3f}")
         except Exception as e:
             print(f"[SEMANTIC] Ошибка: {e}")
 
-    # Кандидаты выше порога
     above = [d for d in scored if d["_similarity"] >= SIMILARITY_YELLOW]
     above.sort(key=lambda x: x["_similarity"], reverse=True)
 
-    # Уровень 3: реранкер DiTy — финальная сортировка
-    # Реранкер должен быть в памяти (загружен в RAG-фазе до LLM-фазы).
-    # Вызываем только если кандидатов > 1 и есть что переранжировать.
     if len(above) > 1:
         try:
             from core.advisor import get_reranker
             reranker = get_reranker()
             if reranker is not None:
-                # Реранкер ожидает список dict с полем "doc"
                 candidates = [
                     {"doc": f"{d['file_name']} {d['summary'][:300]}", **d}
                     for d in above
                 ]
                 reranked = reranker.rerank(article_name, candidates, top_n=top_k)
-                # Восстанавливаем исходные поля по file_name
                 result = []
                 for r in reranked:
                     orig = next(
@@ -2195,6 +2208,10 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         progress_cb(P_RAG_END, f"RAG завершён. Запускаю LLM для {total} статей...")
 
     # ── Фаза 2: LLM для всех статей ──────────────────────────────────────────
+    # Предвычисляем эмбеддинги файлов один раз для всей LLM-фазы
+    # Без кэша: N_статей × N_файлов encode-вызовов. С кэшем: 1 батч.
+    _file_vecs_cache = _precompute_file_vecs(file_summaries or {})
+
     llm_done = 0
     for (art, chunks) in zip(articles, all_chunks):
         name    = art["name"]
@@ -2219,7 +2236,7 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
             # ── Сопоставление с файлами заявки (только имена + первые 1000 симв) ──
             summaries = file_summaries or {}
-            matched   = _match_files_to_article(name, summaries, top_k=3)
+            matched   = _match_files_to_article(name, summaries, top_k=3, file_vecs_cache=_file_vecs_cache)
 
             # ── Детерминированный цвет по росту затрат ────────────────────────
             growth_color, growth_reason, base_val, reg_val = _get_growth_color(
@@ -2239,8 +2256,7 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
             # ── LLM: динамика + рекомендация по обоснованию ───────────────────
             # Только названия файлов без содержимого — экономим токены
-            # Формируем блок файлов обоснования с фрагментом текста (первые 1000 симв)
-            # Это даёт LLM понять содержимое документа, а не только его имя
+            # Формируем блок файлов обоснования
             if matched:
                 files_lines = []
                 for d in matched:
