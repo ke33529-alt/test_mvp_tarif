@@ -1,4 +1,3 @@
-# =============================================================================
 # core/settings.py
 # =============================================================================
 # Единое место для всех настроек и путей.
@@ -7,12 +6,16 @@
 #
 # Использование в любом модуле:
 #   from core.settings import settings
-#   url = settings.OLLAMA_BASE_URL
+#   path = settings.VECTOR_DB_PATH
 # =============================================================================
 
 from __future__ import annotations
 import os
 from pathlib import Path
+
+
+# Корень проекта — папка выше core/
+_BASE_DIR = Path(__file__).parent.parent.resolve()
 
 
 class Settings:
@@ -22,21 +25,45 @@ class Settings:
     """
 
     # -------------------------------------------------------------------------
-    # Корень проекта — определяем автоматически
+    # Корень проекта
     # -------------------------------------------------------------------------
-    BASE_DIR: Path = Path(__file__).parent.parent.resolve()
+    BASE_DIR: Path = _BASE_DIR
 
     # -------------------------------------------------------------------------
     # Пути к данным
-    # В Docker они приходят из .env и монтируются через volumes.
-    # Локально — дефолты относительно BASE_DIR.
     # -------------------------------------------------------------------------
-    DATA_DIR: Path      = Path(os.getenv("DATA_DIR",      str(BASE_DIR / "data")))
-    CONFIG_DIR: Path    = Path(os.getenv("CONFIG_DIR",    str(BASE_DIR / "config")))
-    RAW_DOCS_PATH: Path = Path(os.getenv("RAW_DOCS_PATH", str(BASE_DIR / "data" / "raw")))
-    LOGS_DIR: Path      = Path(os.getenv("LOGS_DIR",      str(BASE_DIR / "logs")))
+    DATA_DIR: Path      = Path(os.getenv("DATA_DIR",      str(_BASE_DIR / "data")))
+    CONFIG_DIR: Path    = Path(os.getenv("CONFIG_DIR",    str(_BASE_DIR / "config")))
+    RAW_DOCS_PATH: Path = Path(os.getenv("RAW_DOCS_PATH", str(_BASE_DIR / "data" / "raw")))
+    LOGS_DIR: Path      = Path(os.getenv("LOGS_DIR",      str(_BASE_DIR / "logs")))
+    VECTOR_DB_PATH: Path = Path(os.getenv("VECTOR_DB_PATH", str(_BASE_DIR / "data" / "vector_db")))
 
-    # Пути к конкретным данным
+    # -------------------------------------------------------------------------
+    # LLM
+    # -------------------------------------------------------------------------
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL: str    = os.getenv("OLLAMA_MODEL", "qwen3:9b")
+    LLM_TIMEOUT: int     = int(os.getenv("LLM_TIMEOUT", "300"))
+
+    # Алиас для совместимости с кодом использующим LM Studio
+    @property
+    def LM_STUDIO_URL(self) -> str:
+        return self.OLLAMA_BASE_URL
+
+    # -------------------------------------------------------------------------
+    # OCR
+    # -------------------------------------------------------------------------
+    EASYOCR_LANGUAGES: list = os.getenv("EASYOCR_LANGUAGES", "ru,en").split(",")
+    EASYOCR_GPU: bool       = os.getenv("EASYOCR_GPU", "false").lower() == "true"
+
+    # -------------------------------------------------------------------------
+    # Логирование
+    # -------------------------------------------------------------------------
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # -------------------------------------------------------------------------
+    # Пути — свойства (вычисляются из DATA_DIR)
+    # -------------------------------------------------------------------------
     @property
     def CLAIMS_DIR(self) -> Path:
         return self.DATA_DIR / "claims"
@@ -58,36 +85,6 @@ class Settings:
         return self.DATA_DIR / "protocol_bot"
 
     # -------------------------------------------------------------------------
-    # ChromaDB
-    # -------------------------------------------------------------------------
-    VECTOR_DB_PATH: Path = Path(os.getenv("VECTOR_DB_PATH", str(BASE_DIR / "data" / "vector_db")))
-    CHROMA_PERSIST_DIR: Path = Path(os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "data" / "vector_db")))
-
-    # -------------------------------------------------------------------------
-    # LLM — Ollama
-    # -------------------------------------------------------------------------
-    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str    = os.getenv("OLLAMA_MODEL", "qwen3:9b")
-    LLM_TIMEOUT: int     = int(os.getenv("LLM_TIMEOUT", "300"))
-
-    # Для обратной совместимости с кодом, использующим LM Studio URL
-    @property
-    def LM_STUDIO_URL(self) -> str:
-        """Алиас для OLLAMA_BASE_URL — упрощает миграцию с LM Studio."""
-        return self.OLLAMA_BASE_URL
-
-    # -------------------------------------------------------------------------
-    # OCR
-    # -------------------------------------------------------------------------
-    EASYOCR_LANGUAGES: list = os.getenv("EASYOCR_LANGUAGES", "ru,en").split(",")
-    EASYOCR_GPU: bool       = os.getenv("EASYOCR_GPU", "false").lower() == "true"
-
-    # -------------------------------------------------------------------------
-    # Логирование
-    # -------------------------------------------------------------------------
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-
-    # -------------------------------------------------------------------------
     # Конфигурационные файлы
     # -------------------------------------------------------------------------
     @property
@@ -102,11 +99,22 @@ class Settings:
     def PROTOCOL_META_FILE(self) -> Path:
         return self.CONFIG_DIR / "protocol_meta.json"
 
+    @property
+    def ADVISOR_CONFIG_FILE(self) -> Path:
+        return self.CONFIG_DIR / "advisor_config.json"
+
+    @property
+    def PREDICTOR_CONFIG_FILE(self) -> Path:
+        return self.CONFIG_DIR / "predictor_config.json"
+
+    @property
+    def SEARCH_SETTINGS_FILE(self) -> Path:
+        return self.CONFIG_DIR / "search_settings.json"
+
     # -------------------------------------------------------------------------
     # Создание необходимых директорий
     # -------------------------------------------------------------------------
     def ensure_dirs(self) -> None:
-        """Создаёт все нужные директории если они не существуют."""
         dirs = [
             self.DATA_DIR,
             self.CONFIG_DIR,
@@ -126,9 +134,9 @@ class Settings:
     def __repr__(self) -> str:
         return (
             f"Settings("
+            f"BASE={self.BASE_DIR}, "
             f"OLLAMA={self.OLLAMA_BASE_URL}, "
-            f"MODEL={self.OLLAMA_MODEL}, "
-            f"DATA={self.DATA_DIR}"
+            f"MODEL={self.OLLAMA_MODEL}"
             f")"
         )
 

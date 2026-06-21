@@ -38,6 +38,7 @@ from core.claim_analyzer_logic import (
     _build_claim_summary_from_heads,
     _extract_articles_from_context,
     _extract_articles_from_context_unfiltered,
+    _extract_articles_from_df,
     _classify_article,
     _has_nonzero_value,
     _rag_diagnose,
@@ -77,6 +78,180 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
             st.subheader("Резюме заявки")
             st.markdown(data["summary"])
             st.divider()
+
+    # ── Визуализация состава статей (matplotlib) ──────────────────────────────
+    _viz_rows = []
+    for _a in articles:
+        _rv = _a.get("reg_val")
+        if _rv is None:
+            _ts = _parse_amounts_timeseries(_a.get("amounts", ""))
+            _rv = _ts[-1][2] if _ts else 0
+        if _rv and float(_rv) > 0:
+            _viz_rows.append({
+                "name":  _a.get("name", "")[:45],
+                "value": round(float(_rv)),
+                "risk":  _a.get("risk", "gray"),
+                "sheet": _a.get("sheet", ""),
+            })
+    if _viz_rows:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import matplotlib.ticker as _mticker
+
+        # Фирменная палитра
+        _RISK_FACE = {
+            "red":    "#F5DDD6",
+            "yellow": "#F7ECCF",
+            "green":  "#DCEAE2",
+            "gray":   "#D6E0E4",
+        }
+        _RISK_EDGE = {
+            "red":    "#CF6B5A",
+            "yellow": "#E0B354",
+            "green":  "#5FA37E",
+            "gray":   "#2E6276",
+        }
+        _RISK_LBL  = {
+            "red":    "Высокий риск",
+            "yellow": "Средний риск",
+            "green":  "Без замечаний",
+            "gray":   "Не оценено",
+        }
+
+        def _wst(row, s, w, h, total):
+            a = s / total * w * h if total else 1
+            sc = a / s if s else 1
+            mx = max(d["value"] for d in row)
+            mn = min(d["value"] for d in row)
+            side = min(w, h)
+            try:
+                return max(side**2 * mx * sc / a**2, a**2 / (side**2 * mn * sc))
+            except ZeroDivisionError:
+                return float("inf")
+
+        def _sq(items, x, y, w, h, total, out):
+            if not items:
+                return
+            if len(items) == 1:
+                out.append((items[0], x, y, w, h))
+                return
+            row, rS = [items[0]], items[0]["value"]
+            for i in range(1, len(items)):
+                nr, ns = row + [items[i]], rS + items[i]["value"]
+                if _wst(row, rS, w, h, total) >= _wst(nr, ns, w, h, total):
+                    row, rS = nr, ns
+                else:
+                    break
+            rf, rest = rS / total, items[len(row):]
+            if w >= h:
+                rw, cy = w * rf, y
+                for d in row:
+                    ch = h * (d["value"] / rS)
+                    out.append((d, x, cy, rw, ch))
+                    cy += ch
+                _sq(rest, x + rw, y, w - rw, h, total - rS, out)
+            else:
+                rh, cx = h * rf, x
+                for d in row:
+                    cw = w * (d["value"] / rS)
+                    out.append((d, cx, y, cw, rh))
+                    cx += cw
+                _sq(rest, x, y + rh, w, h - rh, total - rS, out)
+
+        with st.expander("📊 Визуализация статей затрат", expanded=True):
+          _vtab1, _vtab2 = st.tabs(["Карта затрат", "Топ-20"])
+
+          with _vtab1:
+            _sorted = sorted(_viz_rows, key=lambda x: -x["value"])
+            _total  = sum(d["value"] for d in _sorted)
+            _rects  = []
+            _sq(_sorted, 0, 0, 1, 1, _total, _rects)
+
+            fig1, ax1 = plt.subplots(figsize=(14, 6))
+            ax1.set_xlim(0, 1)
+            ax1.set_ylim(0, 1)
+            ax1.axis("off")
+            fig1.patch.set_facecolor("#F8F9FA")
+            ax1.set_facecolor("#F8F9FA")
+
+            for (d, x, y, w, h) in _rects:
+                ax1.add_patch(mpatches.FancyBboxPatch(
+                    (x + 0.003, y + 0.003), w - 0.006, h - 0.006,
+                    boxstyle="round,pad=0.002",
+                    facecolor=_RISK_FACE[d["risk"]],
+                    edgecolor=_RISK_EDGE[d["risk"]],
+                    linewidth=1.2,
+                ))
+                if w > 0.06 and h > 0.04:
+                    fs = max(5, min(9, w * 52))
+                    lbl = d["name"] if w > 0.18 else d["name"][:16] + "…"
+                    ax1.text(x + w / 2, y + h / 2 + 0.013, lbl,
+                             ha="center", va="center", fontsize=fs,
+                             fontweight="bold",
+                             color=_RISK_EDGE[d["risk"]], clip_on=True)
+                    ax1.text(x + w / 2, y + h / 2 - 0.013,
+                             f"{d['value']:,.0f} тыс.",
+                             ha="center", va="center",
+                             fontsize=max(4, fs - 1.5),
+                             color="#555555")
+
+            _handles1 = [
+                mpatches.Patch(facecolor=_RISK_FACE[k],
+                               edgecolor=_RISK_EDGE[k], label=_RISK_LBL[k])
+                for k in ["red", "yellow", "green", "gray"]
+                if any(d["risk"] == k for d in _viz_rows)
+            ]
+            ax1.legend(handles=_handles1, loc="lower center",
+                       bbox_to_anchor=(0.5, -0.06), ncol=4,
+                       fontsize=8, framealpha=0.0)
+            plt.tight_layout(pad=0.3)
+            st.pyplot(fig1, use_container_width=True)
+            plt.close(fig1)
+
+          with _vtab2:
+            _top20 = sorted(_viz_rows, key=lambda x: -x["value"])[:20]
+            _rev   = list(reversed(_top20))
+            fig2, ax2 = plt.subplots(figsize=(14, max(5, len(_top20) * 0.44)))
+            fig2.patch.set_facecolor("#F8F9FA")
+            ax2.set_facecolor("#F8F9FA")
+            ax2.barh(
+                [d["name"] for d in _rev],
+                [d["value"] for d in _rev],
+                color=[_RISK_FACE[d["risk"]] for d in _rev],
+                edgecolor=[_RISK_EDGE[d["risk"]] for d in _rev],
+                linewidth=1.0,
+                height=0.65,
+            )
+            ax2.set_xlabel("тыс.руб.", color="#555555", fontsize=9)
+            ax2.xaxis.set_major_formatter(
+                _mticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+            )
+            ax2.spines[["top", "right", "left"]].set_visible(False)
+            ax2.spines["bottom"].set_color("#CCCCCC")
+            ax2.tick_params(axis="y", labelsize=8.5, colors="#333333")
+            ax2.tick_params(axis="x", colors="#888888", labelsize=8)
+            ax2.xaxis.set_tick_params(length=0)
+            for i, d in enumerate(_rev):
+                ax2.text(d["value"] * 1.008, i,
+                         f"{d['value']:,.0f}",
+                         va="center", fontsize=7.5,
+                         color=_RISK_EDGE[d["risk"]])
+            _handles2 = [
+                mpatches.Patch(facecolor=_RISK_FACE[k],
+                               edgecolor=_RISK_EDGE[k], label=_RISK_LBL[k])
+                for k in ["red", "yellow", "green", "gray"]
+                if any(d["risk"] == k for d in _top20)
+            ]
+            ax2.legend(handles=_handles2, fontsize=8,
+                       loc="lower right", framealpha=0.0)
+            plt.tight_layout(pad=0.5)
+            st.pyplot(fig2, use_container_width=True)
+            plt.close(fig2)
+
+        st.divider()
+
 
     # ── Сводная шапка ────────────────────────────────────────────────────────
     n_red    = stats.get("red", 0)
@@ -165,9 +340,6 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
                 if growth_reason:
                     st.caption(f"Индекс роста: {growth_reason}")
 
-                if dynamics:
-                    st.markdown(dynamics)
-
                 # График под текстом
                 if amounts:
                     ts = _parse_amounts_timeseries(amounts)
@@ -178,8 +350,9 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
                         if svg:
                             st.markdown(svg, unsafe_allow_html=True)
 
-                if basis:
-                    st.markdown(f"**Нормативное основание:** {basis}")
+                verdict = art.get("verdict") or basis
+                if verdict:
+                    st.markdown(f"**Вердикт:** {verdict}")
 
                 if rec:
                     st.info(f"**Что необходимо обосновать:** {rec}")
@@ -211,8 +384,8 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
             rv = a.get("reg_val")
             if bv is not None and rv is not None:
                 lines.append(f"База: {bv:,.0f} → Регул.год: {rv:,.0f} тыс.руб.")
-            if a.get("article_summary"):
-                lines.append(f"Динамика: {a['article_summary']}")
+            if a.get("verdict") or a.get("article_summary"):
+                lines.append(f"Вердикт: {a.get('verdict') or a.get('article_summary')}")
             if a.get("basis"):
                 lines.append(f"Основание: {a['basis']}")
             if a.get("recommendation"):
@@ -356,24 +529,18 @@ def _show_mr_settings():
 
 def _show_article_approval(readonly: bool = False):
     """
-    Отображает таблицу статей затрат с чекбоксами для апрува.
-    readonly=True: только просмотр, без изменений (после запуска анализа).
-    Сохраняет выбор в ss.ca_parsed_articles и выставляет ss.ca_articles_approved.
+    Таблица апрува статей затрат с фильтрацией по листам,
+    ручным добавлением, редактированием значений.
     """
+    import pandas as pd
     ss = st.session_state
     articles = ss.ca_parsed_articles
 
-    TYPE_LABEL = {
+    TYPE_OPT_LBLS = {
         "cost": "Статья затрат",
         "agg":  "Агрегат / итог",
         "ref":  "Справочно",
-        "zero": "Нулевые значения",
-    }
-    TYPE_COLOR = {
-        "cost": "success",
-        "agg":  "warning",
-        "ref":  "secondary",
-        "zero": "error",
+        "zero": "Нулевые",
     }
 
     n_total   = len(articles)
@@ -386,123 +553,193 @@ def _show_article_approval(readonly: bool = False):
         f"Исключено: **{n_total - n_checked}**"
     )
 
-    # ── Панель управления ────────────────────────────────────────────────────
-    if readonly:
-        tc1, tc2 = st.columns([2, 1])
-        search_q    = tc1.text_input("Поиск", placeholder="Фильтр по названию...",
-                                     key="ca_ap_search", label_visibility="collapsed")
-        type_filter = tc2.selectbox(
-            "Тип", ["Все", "Статья затрат", "Агрегат / итог", "Справочно", "Нулевые значения"],
-            key="ca_ap_type", label_visibility="collapsed",
-        )
-    else:
-        tc1, tc2, tc3, tc4, tc5, tc6 = st.columns([2, 1, 1, 1, 1, 1])
-        search_q = tc1.text_input("Поиск", placeholder="Фильтр по названию...",
-                                   key="ca_ap_search", label_visibility="collapsed")
-        type_filter = tc2.selectbox(
-            "Тип", ["Все", "Статья затрат", "Агрегат / итог", "Справочно", "Нулевые значения"],
-            key="ca_ap_type", label_visibility="collapsed",
-        )
-        def _reset_editor():
-            if "ca_ap_editor" in ss:
-                del ss["ca_ap_editor"]
+    # ── Фильтры ──────────────────────────────────────────────────────────
+    all_sheets = list(dict.fromkeys(a["sheet"] for a in articles if a.get("sheet")))
+    tech_sheets = {a["sheet"] for a in articles if a.get("tech_sheet")}
 
-        if tc3.button("Авто-отбор", key="ca_ap_auto", use_container_width=True,
-                      help="Оставить только статьи затрат с ненулевыми значениями"):
-            for a in articles:
-                a["checked"] = a["type"] == "cost"
-            ss.ca_parsed_articles = articles
-            _reset_editor()
-            st.rerun()
-        if tc4.button("Выбрать все", key="ca_ap_all", use_container_width=True):
-            for a in articles:
-                a["checked"] = True
-            ss.ca_parsed_articles = articles
-            _reset_editor()
-            st.rerun()
-        if tc5.button("Убрать все", key="ca_ap_none", use_container_width=True):
-            for a in articles:
-                a["checked"] = False
-            ss.ca_parsed_articles = articles
-            _reset_editor()
-            st.rerun()
-        if tc6.button("Инверсия", key="ca_ap_inv", use_container_width=True,
-                      help="Инвертировать выбор"):
-            for a in articles:
-                a["checked"] = not a["checked"]
-            ss.ca_parsed_articles = articles
-            _reset_editor()
-            st.rerun()
-
-    # ── Таблица ──────────────────────────────────────────────────────────────
-    TYPE_FILTER_MAP = {
-        "Все": None,
-        "Статья затрат":    "cost",
-        "Агрегат / итог":   "agg",
-        "Справочно":        "ref",
-        "Нулевые значения": "zero",
-    }
-    tf = TYPE_FILTER_MAP[type_filter]
-
-    visible = [
-        (i, a) for i, a in enumerate(articles)
-        if (not search_q or search_q.lower() in a["name"].lower())
-        and (tf is None or a["type"] == tf)
+    # Легенда листов: технические помечаем ⚠️
+    sheet_options = ["Все листы"] + [
+        (f"⚠️ {s}" if s in tech_sheets else s) for s in all_sheets
     ]
+    sheet_display_to_real = {}
+    for s in all_sheets:
+        label = f"⚠️ {s}" if s in tech_sheets else s
+        sheet_display_to_real[label] = s
 
-    st.caption(f"Показано: {len(visible)} из {n_total}")
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
+    search_q = f1.text_input("Поиск", placeholder="Фильтр по названию...",
+                              key="ca_ap_search", label_visibility="collapsed")
+    type_filter = f2.selectbox("Тип",
+        ["Все", "Статья затрат", "Агрегат / итог", "Справочно", "Нулевые"],
+        key="ca_ap_type", label_visibility="collapsed")
+    sheet_sel_lbl = f3.selectbox("Лист", sheet_options,
+        key="ca_ap_sheet", label_visibility="collapsed")
+    sheet_filter = None if sheet_sel_lbl == "Все листы" else sheet_display_to_real.get(sheet_sel_lbl)
+    # Фильтр «только выбранные» — toggle через session state
+    if "ca_ap_only_checked" not in ss:
+        ss["ca_ap_only_checked"] = False
+    f4.markdown("<div style='padding-top:4px'></div>", unsafe_allow_html=True)
+    only_checked = f4.checkbox("☑ Только выбранные", key="ca_ap_only_checked")
 
-    # ── Таблица через data_editor ────────────────────────────────────────────
-    import pandas as pd
+    # ── Кнопки действий ──────────────────────────────────────────────────
+    if not readonly:
+        def _reset_editor():
+            for k in ["ca_ap_editor", "ca_ap_add_name", "ca_ap_add_value",
+                      "ca_ap_add_unit", "ca_ap_add_year", "ca_ap_add_pf"]:
+                ss.pop(k, None)
 
-    TYPE_OPT_LBLS = {"cost": "Статья затрат", "agg": "Агрегат / итог",
-                     "ref": "Справочно", "zero": "Нулевые"}
+        # Вычисляем tf здесь чтобы передать в _in_filter
+        _TYPE_FILTER_MAP = {
+            "Все": None, "Статья затрат": "cost", "Агрегат / итог": "agg",
+            "Справочно": "ref", "Нулевые": "zero",
+        }
+        tf = _TYPE_FILTER_MAP.get(type_filter)
+        bc = st.columns(7)
+        if bc[0].button("Авто-отбор", key="ca_ap_auto", use_container_width=True,
+                        help="Только статьи затрат без технических листов"):
+            for a in articles:
+                a["checked"] = (a["type"] == "cost" and not a.get("tech_sheet"))
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
 
-    # Берём реальные годы из временного ряда для заголовков колонок
-    _sample_ts = None
-    for _a in articles:
-        _ts = _parse_amounts_timeseries(_a["amounts"])
-        if len(_ts) >= 2:
-            _sample_ts = _ts
-            break
-    _yr_prev = str(_sample_ts[-2][0]) if _sample_ts and len(_sample_ts) >= 2 else "Прошлый"
-    _yr_reg  = str(_sample_ts[-1][0]) if _sample_ts else "Регул. год"
+        if bc[1].button("Снять нулевые", key="ca_ap_unzero", use_container_width=True,
+                        help="Снять флаги со всех нулевых/справочных"):
+            for a in articles:
+                if a["type"] in ("zero", "ref", "agg"):
+                    a["checked"] = False
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
 
-    def _make_df(arts, filt_q, filt_type):
+        # Снь без значений — статьи с прочерком в регул. году
+        if bc[2].button("Снять без значений", key="ca_ap_unblank", use_container_width=True,
+                        help="Снять флаги со всех статей у которых нет ни одного ненулевого значения"):
+            for a in articles:
+                ts = _parse_amounts_timeseries(a["amounts"])
+                has_value = any(v != 0 for _, _, v in ts)
+                if not has_value:
+                    a["checked"] = False
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
+
+        if bc[3].button("Снять лист", key="ca_ap_unsheet", use_container_width=True,
+                        help="Снять флаги со всех статей выбранного листа",
+                        disabled=(sheet_filter is None)):
+            for a in articles:
+                if a.get("sheet") == sheet_filter:
+                    a["checked"] = False
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
+
+        # Вспомогательная функция: попадает ли статья в текущий фильтр
+        def _in_filter(a):
+            if search_q and search_q.lower() not in a["name"].lower():
+                return False
+            if tf and a["type"] != tf:
+                return False
+            if sheet_filter and a.get("sheet") != sheet_filter:
+                return False
+            return True
+
+        _filter_hint = (
+            f" (лист: {sheet_filter})" if sheet_filter else
+            f" (тип: {type_filter})" if type_filter != "Все" else
+            f" (поиск: {search_q})" if search_q else ""
+        )
+
+        if bc[4].button(f"✅ Выбрать{_filter_hint or ' все'}",
+                        key="ca_ap_all", use_container_width=True,
+                        help="Выбрать все статьи в текущей фильтрации"):
+            for a in articles:
+                if _in_filter(a):
+                    a["checked"] = True
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
+
+        if bc[5].button(f"☐ Убрать{_filter_hint or ' все'}",
+                        key="ca_ap_none", use_container_width=True,
+                        help="Убрать флаги со всех статей в текущей фильтрации"):
+            for a in articles:
+                if _in_filter(a):
+                    a["checked"] = False
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
+
+        if bc[6].button("Инверсия", key="ca_ap_inv", use_container_width=True,
+                        help="Инвертировать выбор в текущей фильтрации"):
+            for a in articles:
+                if _in_filter(a):
+                    a["checked"] = not a["checked"]
+            ss.ca_parsed_articles = articles; _reset_editor(); st.rerun()
+
+    # ── Таблица ──────────────────────────────────────────────────────────
+    TYPE_FILTER_MAP = {
+        "Все": None, "Статья затрат": "cost", "Агрегат / итог": "agg",
+        "Справочно": "ref", "Нулевые": "zero",
+    }
+    tf = TYPE_FILTER_MAP.get(type_filter)
+
+    # Годы для столбцов: из настроек если заданы, иначе — авто
+    _reg_yr_set = int(ss.get('ca_reg_year', 0)) if ss.get('ca_reg_year') else 0
+    _yr_range   = ss.get('ca_year_range')
+    if _reg_yr_set and _yr_range:
+        _yr_from, _yr_to = int(_yr_range[0]), int(_yr_range[1])
+        _year_cols = [str(y) for y in range(_yr_from, _yr_to + 1)]
+    else:
+        _sample_ts = None
+        for _a in articles:
+            _ts = _parse_amounts_timeseries(_a['amounts'])
+            if len(_ts) >= 2:
+                _sample_ts = _ts; break
+        if _sample_ts:
+            _year_cols = [str(t[0]) for t in _sample_ts[-4:]]
+        else:
+            _year_cols = ['Рег.год']
+
+    def _make_df(arts):
         rows = []
         for i, a in enumerate(arts):
-            if filt_q and filt_q.lower() not in a["name"].lower():
+            if search_q and search_q.lower() not in a['name'].lower():
                 continue
-            if filt_type and filt_type != "Все":
-                tm = {"Статья затрат": "cost", "Агрегат / итог": "agg",
-                      "Справочно": "ref", "Нулевые значения": "zero"}
-                if a["type"] != tm.get(filt_type):
-                    continue
-            ts = _parse_amounts_timeseries(a["amounts"])
-            v_prev = ts[-2][2] if len(ts) >= 2 else None
-            v_reg  = ts[-1][2] if ts else None
-            rows.append({
-                "_idx":       i,
-                "Включить":   a["checked"],
-                "Наименование": a["name"],
-                _yr_prev:     f"{v_prev:,.0f}" if v_prev is not None else "—",
-                _yr_reg:      f"{v_reg:,.0f}"  if v_reg  is not None else "—",
-                "Тип":        TYPE_OPT_LBLS.get(a["type"], a["type"]),
-            })
+            if only_checked and not a['checked']:
+                continue
+            if tf and a['type'] != tf:
+                continue
+            if sheet_filter and a.get('sheet') != sheet_filter:
+                continue
+            ts = _parse_amounts_timeseries(a['amounts'])
+            ts_by_yr = {str(t[0]): t[2] for t in ts}
+            sheet_lbl = a.get('sheet', '')
+            if a.get('tech_sheet'):
+                sheet_lbl = f'⚠️ {sheet_lbl}'
+            elif a.get('manual'):
+                sheet_lbl = '✏️ вручную'
+            row = {
+                '_idx':          i,
+                'Включить':    a['checked'],
+                'Наименование': a['name'],
+                'Лист':        sheet_lbl,
+                'Ед.изм.':     a.get('unit', ''),
+            }
+            for _yr in _year_cols:
+                _v = ts_by_yr.get(_yr)
+                row[_yr] = f'{_v:,.0f}' if _v is not None else '—'
+            row['Тип'] = TYPE_OPT_LBLS.get(a['type'], a['type'])
+            rows.append(row)
         return pd.DataFrame(rows)
 
-    df_show = _make_df(articles, search_q, type_filter)
+    # Сообщение об успешном добавлении (после rerun)
+    if ss.get("_ap_added_msg"):
+        st.success(f"✅ Добавлено: {ss['_ap_added_msg']}")
+        ss.pop("_ap_added_msg", None)
+
+    df_show = _make_df(articles)
     st.caption(f"Показано: {len(df_show)} из {n_total}")
 
+    edited = None
     if not readonly and not df_show.empty:
         edited = st.data_editor(
             df_show.drop(columns=["_idx"]),
             column_config={
-                "Включить": st.column_config.CheckboxColumn("Включить", width="small"),
+                "Включить":    st.column_config.CheckboxColumn("Включить", width="small"),
                 "Наименование": st.column_config.TextColumn("Наименование", width="large", disabled=True),
-                _yr_prev: st.column_config.TextColumn(_yr_prev, width="small", disabled=True),
-                _yr_reg:  st.column_config.TextColumn(_yr_reg,  width="small", disabled=True),
-                "Тип": st.column_config.SelectboxColumn(
+                "Лист":        st.column_config.TextColumn("Лист", width="medium", disabled=True),
+                "Ед.изм.":     st.column_config.TextColumn("Ед.изм.", width="small"),
+                **{yr: st.column_config.TextColumn(yr, width='small', disabled=True) for yr in _year_cols},
+                "Тип":         st.column_config.SelectboxColumn(
                     "Тип", width="medium",
                     options=list(TYPE_OPT_LBLS.values()),
                 ),
@@ -511,40 +748,81 @@ def _show_article_approval(readonly: bool = False):
             hide_index=True,
             key="ca_ap_editor",
         )
-        # Считаем сколько отмечено прямо из edited — без rerun
         n_sel_live = int(edited["Включить"].sum()) if edited is not None else 0
 
     elif readonly and not df_show.empty:
         st.dataframe(
             df_show.drop(columns=["_idx"]).rename(columns={"Включить": "✓"}),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
         )
         n_sel_live = sum(1 for a in articles if a["checked"])
     else:
         n_sel_live = 0
 
-    # ── Кнопка подтверждения ─────────────────────────────────────────────────
+    # ── Ручное добавление статьи (вне expander — иначе кнопка не работает) ──
+    if not readonly:
+        st.markdown("**➕ Добавить статью вручную**")
+        ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([3, 1, 1, 1, 1, 1])
+        add_name  = ac1.text_input("Наименование", key="ca_ap_add_name",
+                                   placeholder="Расходы на ремонт...")
+        add_year  = ac2.text_input("Год", key="ca_ap_add_year",
+                                   placeholder="2027")
+        add_pf    = ac3.selectbox("Тип", ["Принято", "Предложение", "Факт"],
+                                  key="ca_ap_add_pf")
+        add_value = ac4.text_input("Значение", key="ca_ap_add_value",
+                                   placeholder="12345.00")
+        if "ca_ap_add_unit" not in ss:
+            ss["ca_ap_add_unit"] = "тыс.руб."
+        add_unit = ac5.text_input("Ед.изм.", key="ca_ap_add_unit",
+                                  placeholder="тыс.руб.")
+        if ac6.button("Добавить", key="ca_ap_add_btn", type="primary",
+                      use_container_width=True):
+            if add_name.strip() and add_value.strip():
+                try:
+                    val  = float(add_value.replace(",", ".").replace(" ", ""))
+                    year = add_year.strip() or "2027"
+                    amounts = f"{year} ({add_pf}): {val:,.2f} {add_unit}"
+                    ss.ca_parsed_articles.append({
+                        "name":       add_name.strip(),
+                        "amounts":    amounts,
+                        "type":       "cost",
+                        "checked":    True,
+                        "sheet":      "вручную",
+                        "unit":       add_unit.strip(),
+                        "tech_sheet": False,
+                        "manual":     True,
+                    })
+                    for k in ["ca_ap_add_name", "ca_ap_add_value",
+                               "ca_ap_add_year", "ca_ap_editor"]:
+                        ss.pop(k, None)
+                    ss.pop("ca_ap_sheet", None)
+                    ss["_ap_added_msg"] = add_name.strip()
+                    st.rerun()
+                except ValueError:
+                    st.error("Некорректное значение — введите число")
+            else:
+                st.warning("Заполните наименование и значение")
+
+    # ── Подтверждение ────────────────────────────────────────────────────
     st.divider()
     ap_c1, ap_c2 = st.columns([3, 1])
-    ap_c1.caption(f"Отмечено к анализу: **{n_sel_live}** статей — нажмите «Подтвердить» чтобы продолжить")
+    ap_c1.caption(f"Отмечено к анализу: **{n_sel_live}** статей")
     if not readonly and ap_c2.button(
-        "Подтвердить и продолжить",
-        type="primary",
-        use_container_width=True,
-        key="ca_ap_confirm",
+        "Подтвердить и продолжить", type="primary",
+        use_container_width=True, key="ca_ap_confirm",
         disabled=(n_sel_live == 0),
     ):
-        # Читаем финальное состояние из data_editor и сохраняем
         _lbl_to_type = {v: k for k, v in TYPE_OPT_LBLS.items()}
         if edited is not None:
             for row_i, row in edited.iterrows():
                 orig_i = int(df_show.iloc[row_i]["_idx"])
                 articles[orig_i]["checked"] = bool(row["Включить"])
                 articles[orig_i]["type"]    = _lbl_to_type.get(row["Тип"], "cost")
+                # Сохраняем отредактированную единицу
+                articles[orig_i]["unit"] = str(row["Ед.изм."]).strip()
 
         approved = [a for a in articles if a["checked"]]
-        ss.ca_parsed_articles   = approved   # только отмеченные идут в анализ
+        ss.ca_parsed_articles   = approved
         ss.ca_articles_approved = True
         lines = []
         for a in approved:
@@ -553,8 +831,9 @@ def _show_article_approval(readonly: bool = False):
                 if part.strip():
                     lines.append(f"  {part.strip()}")
         ss.ca_calc_context = "\n".join(lines)
-        if "ca_ap_editor" in ss:
-            del ss["ca_ap_editor"]
+        for k in ["ca_ap_editor", "ca_ap_add_name", "ca_ap_add_value",
+                  "ca_ap_add_unit", "ca_ap_add_year"]:
+            ss.pop(k, None)
         st.rerun()
 
 
@@ -578,7 +857,7 @@ def show_claim_analyzer():
             "ca_summary", "ca_risks", "ca_calc_context", "ca_done",
             "ca_project_id", "ca_uploaded_meta", "ca_uploaded_bytes",
             "ca_file_summaries", "ca_claim_summary", "ca_calc_files_checked",
-            "ca_parsed_articles", "ca_articles_approved", "_pbar_max",
+            "ca_parsed_articles", "ca_articles_approved", "_pbar_max", "ca_df_calc",
         ]
         for _k in _CA_KEYS:
             st.session_state.pop(_k, None)
@@ -603,6 +882,7 @@ def show_claim_analyzer():
         ("ca_risk_pct",        10.0),    # дополнительный рисковый порог, %
         ("ca_claim_summary",   ""),      # итоговое резюме заявки
         ("ca_parsed_articles", []),      # статьи после парсинга до апрува
+        ("ca_df_calc", None),             # DataFrame кальк файла
         ("ca_articles_approved", False), # флаг: пользователь апрувил список
     ]:
         if k not in ss:
@@ -675,6 +955,25 @@ def show_claim_analyzer():
             f"Красный: рост > {ss.ca_target_pct + ss.ca_risk_pct:.1f}%  ·  "
             f"Зелёный: рост ≤ {ss.ca_target_pct:.1f}%"
         )
+        st.divider()
+        import re as _re2
+        _period_str = str(ss.get('ca_period', '') or '')
+        _yr_m = _re2.search(r'(\d{4})', _period_str)
+        _ry = int(_yr_m.group(1)) if _yr_m else 2027
+        ss['ca_reg_year'] = _ry
+        _yr_def = ss.get('ca_year_range')
+        if not _yr_def or abs(_yr_def[1] - _ry) > 10:
+            _yr_def = (_ry - 5, _ry)
+        ss.ca_year_range = st.slider(
+            'Диапазон лет анализа',
+            min_value=_ry - 10,
+            max_value=_ry + 10,
+            value=_yr_def,
+            key='ca_year_range_input',
+            help='Годы которые выводятся в таблице апрува и на графиках',
+        )
+        _yf, _yt = ss.ca_year_range
+        st.caption(f'Анализ за {_yf}–{_yt}  ·  рег. год: {_ry}')
 
     # ── Загрузка файлов ───────────────────────────────────────────────────────
     st.subheader("Файлы заявки")
@@ -784,6 +1083,12 @@ def show_claim_analyzer():
                         df_calc, meta_calc = parse_workbook(uf_bytes)
                         if not df_calc.empty:
                             calc_context += f"\n\n# {uf_name}\n" + to_llm_context(df_calc)
+                            # Сохраняем df для блока апрува
+                            if ss.get("ca_df_calc") is None:
+                                ss["ca_df_calc"] = df_calc
+                            else:
+                                import pandas as _pd
+                                ss["ca_df_calc"] = _pd.concat([ss["ca_df_calc"], df_calc], ignore_index=True)
                             st.info(
                                 f"{uf_name}: "
                                 f"{df_calc['article'].nunique()} статей · "
@@ -800,8 +1105,11 @@ def show_claim_analyzer():
                 st.stop()
 
             ss.ca_calc_context = calc_context
-            # Извлекаем все статьи (без фильтров — пользователь сам решит)
-            raw_articles = _extract_articles_from_context_unfiltered(calc_context)
+            # Строим список статей напрямую из df (с листами, ед. изм., тех. признаком)
+            raw_articles = _extract_articles_from_df(
+                ss.get("ca_df_calc")  # df уже сохранён в session state выше
+            ) if ss.get("ca_df_calc") is not None else \
+                _extract_articles_from_context_unfiltered(calc_context)
             ss.ca_parsed_articles  = raw_articles
             ss.ca_articles_approved = False
 

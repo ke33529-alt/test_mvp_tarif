@@ -99,6 +99,18 @@ DEFAULT_PROMPTS: Dict[str, str] = {
         "ДАННЫЕ РАСЧЁТНОГО ФАЙЛА:\n{calc_context}\n\n"
         "РЕЗЮМЕ ЗАЯВКИ:\n{summary}"
     ),
+    "claim_verdict_system": (
+        "Ты — эксперт-аудитор тарифных заявок в РФ. По названию статьи затрат, "
+        "её показателям и приведённым фрагментам НПА дай краткий вердикт: каким НПА "
+        "(закон/приказ + пункт) регулируется статья. Опирайся ТОЛЬКО на приведённые "
+        "фрагменты НПА. Если фрагментов нет — прямо скажи, что норма в базе не найдена, "
+        "и НЕ выдумывай ссылки. ЗАВЕРШАЮЩИМ предложением дай рекомендацию по "
+        "обоснованию статьи: какое документальное обоснование требуется "
+        "(договор/акт/расчёт/справка и т.п.). Формулируй нейтрально, чтобы "
+        "рекомендация подходила и для РСО (что приложить к заявке), и для РЭК "
+        "(что запросить и проверить). 3–6 предложений, деловой тон, только русский "
+        "язык, без эмодзи и воды."
+    ),
 }
 
 PROMPTS_FILE = os.path.join("config", "prompts.json")
@@ -117,6 +129,16 @@ def load_prompts() -> Dict[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # LM Studio с автопродолжением
 # ─────────────────────────────────────────────────────────────────────────────
+def _load_claim_analyzer_cfg():
+    import os as _o, json as _j
+    try:
+        with open(_o.path.join('config', 'claim_analyzer_config.json'),
+                  'r', encoding='utf-8') as _f:
+            return _j.load(_f)
+    except Exception:
+        return {}
+
+
 def _load_lm_config() -> Tuple[str, str]:
     cfg = {}
     path = os.path.join("config", "advisor_config.json")
@@ -506,21 +528,17 @@ _ARTICLE_QUERY_MAP = {
 
 def _make_rag_query(article_name: str) -> str:
     """
-    Формирует короткий поисковый запрос по названию статьи затрат.
-    Проверяет словарь _ARTICLE_QUERY_MAP, иначе использует само название.
-    Короткие запросы работают лучше в семантическом поиске.
+    Поисковый запрос для RAG = само название статьи затрат.
+    Раньше название подменялось обобщённой фразой из _ARTICLE_QUERY_MAP,
+    что уводило поиск от конкретики. Теперь ищем ровно по названию —
+    как Советчик ищет по сырому пользовательскому запросу.
     """
-    name_lower = article_name.lower()
-    for key, query in _ARTICLE_QUERY_MAP.items():
-        if key in name_lower:
-            return query
-    # Fallback: берём первые 5 слов названия статьи + "тариф"
-    words = article_name.split()[:5]
-    return " ".join(words) + " тариф обоснование"
+    return article_name.strip()
 
 
 def _rag_search(query: str, top_k: int = 10,
-                spheres: Optional[List[str]] = None) -> List[Dict]:
+                spheres: Optional[List[str]] = None,
+                doc_filter: Optional[List[str]] = None) -> List[Dict]:
     """
     Поиск по нормативной базе БЕЗ расширения соседями.
     debug_search_candidates явно не подтягивает соседей — возвращает
@@ -540,7 +558,9 @@ def _rag_search(query: str, top_k: int = 10,
         return []
 
     try:
-        res    = debug_search_candidates(query, top_k=top_k, spheres=spheres or None)
+        res    = debug_search_candidates(query, top_k=top_k,
+                                         spheres=spheres or None,
+                                         filenames=doc_filter or None)
         err    = res.get("error")
         if err:
             _rag_status["ok"]    = False
@@ -587,13 +607,13 @@ def _rag_diagnose() -> str:
     return f"RAG недоступен: {s['error']}"
 
 
-_CHUNK_MAX_CHARS = 600  # лимит на один чанк: 10 × 600 = 6000 симв в промпте
+_CHUNK_MAX_CHARS = 1200  # лимит на один чанк (raw чанк ~1750 симв)
 
 def _format_chunks_for_prompt(chunks: List[Dict], max_chars: int = 6500) -> str:
     """
     Форматирует чанки НПА для промпта.
     Поле "doc" — чистый текст без соседей.
-    Каждый чанк обрезается до _CHUNK_MAX_CHARS чтобы все 10 чанков влезли.
+    Каждый чанк обрезается до _CHUNK_MAX_CHARS, общий объём ограничен max_chars.
     """
     if not chunks:
         return "Релевантные нормы НПА не найдены в базе знаний."
@@ -1887,7 +1907,9 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                        парсинг calc_context не выполняется).
     """
     CHUNK_LIMIT_PER_ARTICLE = 8000
-    MAX_TOKENS_PER_ARTICLE  = 300
+    MAX_TOKENS_PER_ARTICLE  = 500  # краткий вердикт ~500 ток., как в Советчике
+    NPA_CHUNKS_TO_LLM       = 20     # сколько топ-чанков подаём в промпт LLM
+    NPA_PROMPT_CHARS        = 24000  # 20 × 1200 = 24000 симв ≈ ~12000 ток. в худшем случае
 
     prompts  = load_prompts()
     # Используем уже одобренный список если передан, иначе парсим контекст
@@ -1965,6 +1987,32 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     except Exception:
         pass
 
+    # Маппинг sphere_id → ключевое слово для _sphere_match
+    _SPHERE_ID_KW = {
+        'heat':  'Тепло',
+        'water': 'Водо',
+        'power': 'Электр',
+        'gas':   'Газ',
+        'waste': 'ТКО',
+        'trans': 'Транспорт',
+        'other': 'Иные',
+    }
+    def _resolve_sph(raw):
+        return [_SPHERE_ID_KW.get(s, s) for s in (raw or [])]
+
+    _adm_cfg  = _load_claim_analyzer_cfg()
+    _adm_docs = _adm_cfg.get('rag_docs', []) or None
+    if not spheres:
+        _sp = _adm_cfg.get('rag_spheres', [])
+        if _sp:
+            spheres = _resolve_sph(_sp)
+            print(f'[RAG_CLAIM] Сферы из кнф: {spheres}')
+    elif spheres:
+        spheres = _resolve_sph(spheres)
+        print(f'[RAG_CLAIM] Сферы резолв.: {spheres}')
+    if _adm_docs:
+        print(f'[RAG_CLAIM] doc_filter: {len(_adm_docs)} ф.')
+
     # Прогрев RAG / инициализация реранкера
     if progress_cb:
         sphere_label = f" · сферы: {', '.join(spheres)}" if spheres else " · все сферы"
@@ -2000,8 +2048,9 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
 
     all_chunks: List[List[Dict]] = []
     for rag_done, art in enumerate(articles):
-        chunks = _rag_search(_make_rag_query(art["name"]), top_k=10,
-                             spheres=spheres or None)
+        chunks = _rag_search(_make_rag_query(art["name"]), top_k=20,
+                             spheres=spheres or None,
+                             doc_filter=_adm_docs)
         all_chunks.append(chunks)
         if not chunks:
             rag_available = False
@@ -2033,91 +2082,67 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
                 f"LLM {llm_done + 1}/{total}: {name[:40]}..."
             )
 
-            # ── Фильтр: пропускаем тарифные показатели ───────────────────
-            if _should_skip_article(name):
-                print(f"[SKIP] Пропускаем тарифный показатель: {name[:50]}")
-                llm_done += 1
-                continue
-
-            npa_context = _format_chunks_for_prompt(
-                chunks, max_chars=CHUNK_LIMIT_PER_ARTICLE
-            )
-            has_npa = bool(chunks)
-
-            # ── Сопоставление с файлами заявки (только имена + первые 1000 симв) ──
-            summaries = file_summaries or {}
-            matched   = _match_files_to_article(name, summaries, top_k=3, file_vecs_cache=_file_vecs_cache)
-
-            # ── Детерминированный цвет по росту затрат ────────────────────────
-            growth_color, growth_reason, base_val, reg_val = _get_growth_color(
-                amounts, _reg_year, target_pct, risk_pct
-            )
-            EMOJI_MAP = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
-            final_risk       = growth_color
-            final_risk_emoji = EMOJI_MAP[growth_color]
-
-            # ── НПА инструкция ────────────────────────────────────────────────
-            npa_instr = (
-                "Используй ТОЛЬКО нормы НПА приведённые выше. Укажи документ и пункт."
-                if has_npa else
-                "НПА в базе не найдены. НЕ придумывай ссылки. "
-                "В РЕКОМЕНДАЦИИ опиши какой документ нужен исходя из здравого смысла."
-            )
-
-            # ── LLM: динамика + рекомендация по обоснованию ───────────────────
-            # Только названия файлов без содержимого — экономим токены
-            # Формируем блок файлов обоснования
-            if matched:
-                files_lines = []
-                for d in matched:
-                    head = d.get("summary", "")[:1000].strip()
-                    if head:
-                        files_lines.append(f"[{d['file_name']}]\n{head}")
-                    else:
-                        files_lines.append(f"[{d['file_name']}]")
-                files_block = "\n\n".join(files_lines)
-            else:
-                files_block = "не найдены"
-
-            prompt = (
-                f"Статья затрат тарифной заявки: {name}\n"
-                f"Значения: {amounts[:300]}\n"
-                f"Рост к предыдущему периоду: {growth_reason}\n\n"
-                f"Файлы обоснования в заявке:\n{files_block}\n\n"
-                f"НПА из базы знаний:\n{npa_context[:1500]}\n\n"
-                f"{npa_instr}\n\n"
-                "Ответ строго в формате (3 строки). БЕЗ эмодзи. БЕЗ лишнего текста.\n"
-                "ДИНАМИКА: что происходит с этой статьёй в динамике (1-2 предложения)\n"
-                "ОСНОВАНИЕ: закон/приказ/пункт НПА, который регулирует данную статью затрат\n"
-                "РЕКОМЕНДАЦИЯ: конкретный тип документа который РСО должна приложить к заявке "
-                "(договор/акт/расчёт/справка — без ссылок на НПА, только вид документа)"
-            )
-
-            art_result = _lm_call(
-                prompts["claim_risks_system"],
-                prompt,
-                max_tokens=MAX_TOKENS_PER_ARTICLE,
-            )
-
-            # Парсим ответ модели
-            parsed = _parse_article_result_v2(art_result)
-
-            article_results.append({
-                "name":             name,
-                "amounts":          amounts,
-                "risk":             final_risk,
-                "risk_emoji":       final_risk_emoji,
-                "growth_reason":    growth_reason,
-                "base_val":         base_val,
-                "reg_val":          reg_val,
-                "article_summary":  parsed["dynamics"],
-                "basis":            parsed["basis"],
-                "recommendation":   parsed["recommendation"],
-                "raw":              art_result,
-                "has_npa":          has_npa,
-                "matched_files":    matched,
-            })
+        # ── Фильтр: пропускаем тарифные показатели ───────────────────
+        if _should_skip_article(name):
+            print(f"[SKIP] Пропускаем тарифный показатель: {name[:50]}")
             llm_done += 1
+            continue
+
+        # Топ-N реранкованных чанков → в промпт. Остальное отбрасываем как шум.
+        llm_chunks = chunks[:NPA_CHUNKS_TO_LLM]
+        npa_context = _format_chunks_for_prompt(
+            llm_chunks, max_chars=NPA_PROMPT_CHARS
+        )
+        has_npa = bool(chunks)
+
+        # ── Сопоставление с файлами заявки (только имена + первые 1000 симв) ──
+        summaries = file_summaries or {}
+        matched   = _match_files_to_article(name, summaries, top_k=3, file_vecs_cache=_file_vecs_cache)
+
+        # ── Детерминированный цвет по росту затрат ────────────────────────
+        growth_color, growth_reason, base_val, reg_val = _get_growth_color(
+            amounts, _reg_year, target_pct, risk_pct
+        )
+        EMOJI_MAP = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
+        final_risk       = growth_color
+        final_risk_emoji = EMOJI_MAP[growth_color]
+
+        # ── LLM: краткий вердикт по статье на основе НПА (как в Советчике) ──
+        verdict_user = (
+            f"Статья затрат: {name}\n"
+            f"Значения: {amounts}\n"
+            f"Динамика к предыдущему периоду: {growth_reason}\n\n"
+            f"Фрагменты НПА (опорные пункты):\n"
+            f"{npa_context if has_npa else 'не найдены'}\n\n"
+            "Дай краткий вердикт по статье на основе фрагментов НПА выше."
+        )
+
+        art_result = _lm_call(
+            prompts.get("claim_verdict_system", DEFAULT_PROMPTS["claim_verdict_system"]),
+            verdict_user,
+            max_tokens=MAX_TOKENS_PER_ARTICLE,
+        )
+
+        verdict = _strip_leading_emoji(art_result.strip())
+
+        article_results.append({
+            "name":             name,
+            "amounts":          amounts,
+            "risk":             final_risk,
+            "risk_emoji":       final_risk_emoji,
+            "growth_reason":    growth_reason,
+            "base_val":         base_val,
+            "reg_val":          reg_val,
+            "verdict":          verdict,
+            # Совместимость со старыми потребителями (итоговый отчёт/экспорт)
+            "article_summary":  verdict,
+            "basis":            "",
+            "recommendation":   "",
+            "raw":              art_result,
+            "has_npa":          has_npa,
+            "matched_files":    matched,
+        })
+        llm_done += 1
 
     if progress_cb:
         progress_cb(0.88, f"Агрегирую {total} статей...")
@@ -2205,6 +2230,83 @@ def _classify_article(name: str, amounts: str) -> str:
     if not _has_nonzero_value(amounts):
         return "zero"
     return "cost"
+
+
+
+# Технические паттерны листов
+_TECH_SHEET_PATTERNS = re.compile(
+    r'^(К_ФАС|Р_ФАС|БТр_|БПр_|ТМ\d|Столбцы|Экон\.|Индексы|Справочники|'
+    r'Перечень|Амортизация_ФАС|Реестр потребит)',
+    re.I,
+)
+
+
+def _is_tech_sheet(sheet_name: str, df_sheet) -> bool:
+    """True если лист технический: паттерн имени ИЛИ >80% статей без единицы."""
+    if _TECH_SHEET_PATTERNS.match(sheet_name.strip()):
+        return True
+    if df_sheet is not None and len(df_sheet) > 0:
+        no_unit = (df_sheet["unit"].astype(str).str.strip() == "").sum()
+        if no_unit / len(df_sheet) > 0.8:
+            return True
+    return False
+
+
+def _extract_articles_from_df(df) -> List[Dict]:
+    """
+    Строит список статей для апрува напрямую из DataFrame calc_parser.
+    Поля: name, amounts, type, checked, sheet, unit, tech_sheet, manual.
+    """
+    if df is None or df.empty:
+        return []
+
+    articles: List[Dict] = []
+    seen_key: dict = {}
+
+    for sheet_name, sdf in df.groupby("sheet", sort=False):
+        is_tech = _is_tech_sheet(sheet_name, sdf)
+
+        for article_name, adf in sdf.groupby("article", sort=False):
+            adf = adf.sort_values("period")
+            parts = []
+            for _, row in adf.iterrows():
+                period = str(row["period"]) if row["period"] else "—"
+                pf     = f" ({row['pf']})" if row["pf"] else ""
+                val    = row["value"]
+                unit   = str(row["unit"]) if row["unit"] else "тыс.руб."
+                parts.append(f"{period}{pf}: {val:,.2f} {unit}")
+            amounts = " | ".join(parts)
+
+            units = adf["unit"].astype(str).str.strip()
+            units = units[units != ""]
+            unit_str = units.mode().iloc[0] if len(units) > 0 else ""
+
+            art_type = _classify_article(article_name, amounts)
+
+            key = (sheet_name, article_name)
+            if key not in seen_key:
+                seen_key[key] = len(articles)
+                articles.append({
+                    "name":       article_name,
+                    "amounts":    amounts,
+                    "type":       art_type,
+                    "checked":    art_type == "cost",
+                    "sheet":      sheet_name,
+                    "unit":       unit_str,
+                    "tech_sheet": is_tech,
+                    "manual":     False,
+                })
+
+    # Авто-отбор: cost-статьи с нетехнических листов
+    n_cost = sum(1 for a in articles if a["type"] == "cost" and not a["tech_sheet"])
+    if n_cost > 0:
+        for a in articles:
+            a["checked"] = (a["type"] == "cost" and not a["tech_sheet"])
+    else:
+        for a in articles:
+            a["checked"] = a["type"] in ("cost", "zero")
+
+    return articles
 
 
 def _extract_articles_from_context_unfiltered(calc_context: str) -> List[Dict]:

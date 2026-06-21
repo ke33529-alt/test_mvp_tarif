@@ -32,12 +32,14 @@ _REGISTRY_DIR    = _BASE_DIR
 _MAX_PER_FILE    = 1000
 _CHROMA_DIR      = os.path.join("data", "vector_db")
 _PROTOCOLS_COLLECTION = "protocols"
+_EXPERTISE_COLLECTION = "expertise_docs"
 
 _LARGE_DOC_THRESHOLD = 12_000
 _CHUNK_SIZE          = 6_000
 _CHUNK_OVERLAP       = 300
 
 _DEFAULT_TOP_K = 30
+_RAG_CONTEXT_CHAR_BUDGET = 35_000  # суммарный лимит символов по всем найденным чанкам перед классификацией
 
 _REGISTRY_LOCK = threading.Lock()
 
@@ -47,9 +49,9 @@ _REGISTRY_LOCK = threading.Lock()
 # =============================================================================
 _PRED_CFG_FILE = os.path.join("config", "predictor_config.json")
 _PRED_CFG_DEFAULTS = {
-    "chunk_chars_to_llm":  800,
+    "chunk_chars_to_llm":  1500,
     "justification_chars": 200,
-    "classify_max_tokens": 100,
+    "classify_max_tokens": 350,
     "default_top_k":       30,
     "disable_thinking":    True,
 }
@@ -68,16 +70,90 @@ def load_predictor_config() -> dict:
 
 _PROMPTS_FILE = os.path.join("config", "prompts.json")
 _PRED_PROMPT_DEFAULTS = {
-    "predictor_classify_system": "Тарифный эксперт РФ. JSON только.",
+    "predictor_classify_system": (
+        "Ты — тарифный эксперт РФ. Тебе нужно определить, ПОДТВЕРЖДАЕТ или "
+        "ОПРОВЕРГАЕТ найденный прецедент МЕТОДОЛОГИЮ/ПРИНЦИП пользователя — "
+        "а не тему статьи затрат и не числовой результат (снижено/повышено). "
+        "Сравнивай ИМЕННО ПОДХОД: каким способом регулятор определяет "
+        "значение. Совпадение ОБЩЕЙ ТЕМЫ подхода (например, оба случая "
+        "касаются 'срока полезного использования' или 'выбора варианта из "
+        "диапазона') ещё не значит совпадение позиции — если регулятор и "
+        "пользователь выбирают ПРОТИВОПОЛОЖНЫЕ варианты внутри этой темы "
+        "(например, один настаивает на максимальном значении, другой — на "
+        "минимальном; один — на фактических данных, другой — на нормативе), "
+        "это ПРОТИВОРЕЧИЕ (negative), а не совпадение. Числовой результат "
+        "(сумма выросла или снизилась) сам по себе не определяет "
+        "positive/negative — важно, выбрал ли регулятор ТОТ ЖЕ вариант "
+        "решения, что и пользователь, или ПРОТИВОПОЛОЖНЫЙ.\n\n"
+        "КРИТИЧЕСКИ ВАЖНО: в материалах ДВА РАЗНЫХ ИСТОЧНИКА текста — "
+        "позиция ТЕКУЩЕГО пользователя (помечена '=== ПОЗИЦИЯ ТЕКУЩЕГО "
+        "ПОЛЬЗОВАТЕЛЯ ===') и решение регулятора по ДРУГОЙ организации из "
+        "прецедента (помечено '=== РЕШЕНИЕ ИЗ ПРЕЦЕДЕНТА ==='). Внутри "
+        "блока прецедента может быть фраза 'заявлено предприятием X тыс. "
+        "руб.' — это позиция ДРУГОЙ организации из прецедента, а НЕ "
+        "текущего пользователя. Не путай их.\n\n"
+        "ФОРМАТ ОТВЕТА — СТРОГО ВАЖНО: ты должен выдать ТОЛЬКО готовый "
+        "финальный результат сравнения, БЕЗ цепочки рассуждений, БЕЗ "
+        "цитирования инструкции, БЕЗ слов 'перечитаем', 'однако', 'но "
+        "инструкция гласит', БЕЗ промежуточных вопросов самому себе "
+        "(например 'значит decision должен быть X?'). Сравнение "
+        "методологии должно происходить у тебя ДО генерации ответа, "
+        "а не внутри текста поля reason. Поле reason — это ИТОГ "
+        "сравнения в одном утвердительном предложении (до 120 символов), "
+        "а не процесс рассуждения. decision должен точно соответствовать "
+        "этому итоговому reason. Отвечай только JSON, без какого-либо "
+        "текста до или после него."
+    ),
     "predictor_classify_user": (
-        "Статья: {article_name}\n"
+        "СТАТЬЯ ЗАТРАТ: {article_name}\n"
         "{justification_line}"
-        "\nФрагмент:\n{chunk}\n\n"
-        "Решение регулятора по статье: positive/negative/neutral?\n"
-        "positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
-        'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
+        "\n"
+        "НАЙДЕННЫЙ ПРЕЦЕДЕНТ:\n{chunk}\n\n"
+        "ЗАДАЧА: определи, КАКОЙ ИМЕННО ВАРИАНТ/ПОДХОД выбрал регулятор в "
+        "блоке '=== РЕШЕНИЕ ИЗ ПРЕЦЕДЕНТА ===' (не саму цифру и не итог "
+        "'больше/меньше', а суть решения — например 'применил максимальный "
+        "срок', 'применил минимальный срок', 'учёл фактические расходы', "
+        "'применил норматив вместо факта') и сравни этот ВЫБОР с тем, что "
+        "заявляет пользователь в блоке '=== ПОЗИЦИЯ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ "
+        "==='.\n\n"
+        "Определи decision:\n"
+        "- positive — регулятор выбрал ТОТ ЖЕ вариант/подход, что заявляет "
+        "пользователь (например, оба настаивают на максимальном сроке, оба "
+        "— на минимальном, оба — на учёте фактических расходов, оба — на "
+        "применении норматива). Засчитывай как positive, ДАЖЕ ЕСЛИ в "
+        "прецеденте этот выбор привёл к снижению суммы у той организации — "
+        "важно совпадение выбранного варианта, а не итоговое движение "
+        "цифры\n"
+        "- negative — регулятор выбрал ДРУГОЙ или ПРОТИВОПОЛОЖНЫЙ вариант "
+        "внутри той же темы (например, пользователь настаивает на "
+        "минимальном сроке, а регулятор в прецеденте применяет максимальный "
+        "— это противоположные значения одного и того же параметра, не "
+        "совпадение; или пользователь просит фактические расходы, а "
+        "регулятор применяет норматив)\n"
+        "- neutral — в прецеденте нет решения по этой статье, ИЛИ "
+        "невозможно определить выбранный вариант регулятора из фрагмента, "
+        "ИЛИ тема прецедента не связана по существу с тем, что заявляет "
+        "пользователь\n\n"
+        "ВАЖНО: 'максимальный' и 'минимальный' (как и 'факт' и 'норматив', "
+        "'включить' и 'исключить') — это ПРОТИВОПОЛОЖНЫЕ варианты одной "
+        "темы. Если ОБА (и регулятор, и пользователь) выбрали ОДИНАКОВЫЙ "
+        "вариант (например, оба — 'норматив', оба — 'максимальный срок') — "
+        "это ВСЕГДА positive, без исключений и без дополнительных "
+        "рассуждений. Не путай тематическое совпадение (оба текста "
+        "говорят о 'сроке полезного использования') с совпадением позиции "
+        "(выбран ли тот же конкретный вариант) — но если конкретный "
+        "вариант СОВПАЛ, сомнений быть не должно. Не путай 'заявлено "
+        "предприятием' внутри блока ПРЕЦЕДЕНТА (это другая организация) с "
+        "позицией ТЕКУЩЕГО пользователя. Конкретные числа (года, проценты, "
+        "суммы) сравнивать не нужно — сравнивай только то, какой "
+        "вариант/подход выбран.\n\n"
+        "Ответь СРАЗУ готовым JSON без рассуждений, без вопросов самому "
+        "себе, без цитирования этой инструкции в ответе:\n"
+        'JSON: {{"decision":"positive|negative|neutral","quote":"цитата, какой вариант выбрал регулятор, до 120 симв.","reason":"краткий итоговый вывод одним предложением: совпадают варианты или нет, до 120 симв."}}'
     ),
 }
+
+
 
 
 def load_predictor_prompts() -> dict:
@@ -303,101 +379,501 @@ def extract_file_text(file_bytes: bytes, filename: str) -> str:
 
 
 # =============================================================================
-# ChromaDB — поиск по коллекции протоколов
+# ChromaDB — поиск по коллекциям протоколов / экспертных заключений
 # =============================================================================
-def _get_chroma_collection():
+def _get_chroma_collection(collection_name: str):
     """
-    Возвращает коллекцию протоколов из ChromaDB.
+    Возвращает коллекцию ChromaDB по имени (protocols | expertise_docs).
     Использует ту же E5EmbeddingFunction что и indexer.py —
     без этого query-векторы несовместимы с индексированными passage-векторами.
     """
     try:
-        from core.indexer import get_embedding_function, _get_chroma_client
+        from core.indexer import _get_chroma_client
         client = _get_chroma_client()
-        ef = get_embedding_function()
+
+        # expertise_docs создаётся через core/expertise_chunker.py, который
+        # оборачивает embedding function в совместимую с разными версиями
+        # ChromaDB обёртку (см. get_chroma_embedding_function). Для protocols
+        # используем embedding function как раньше, напрямую из indexer.py.
+        if collection_name == _EXPERTISE_COLLECTION:
+            from core.expertise_chunker import get_chroma_embedding_function
+            ef = get_chroma_embedding_function()
+        else:
+            from core.indexer import get_embedding_function
+            ef = get_embedding_function()
+
         try:
-            return client.get_collection(
-                name=_PROTOCOLS_COLLECTION,
-                embedding_function=ef,
-            )
+            return client.get_collection(name=collection_name, embedding_function=ef)
         except Exception:
             return None
     except Exception as e:
-        print(f"[PREDICTOR] Ошибка подключения к ChromaDB: {e}")
+        print(f"[PREDICTOR] Ошибка подключения к ChromaDB ({collection_name}): {e}")
         return None
+
+
+def _build_where_clause(filters: Optional[Dict]) -> dict:
+    """
+    Собирает ChromaDB `where`-выражение из словаря фильтров.
+    Поддерживаемые ключи: spheres, regions, years, methods — каждый список
+    строк (без эмодзи), $in для нескольких значений, $eq для одного.
+    """
+    if not filters:
+        return {}
+
+    clauses = []
+
+    def _add_clause(field: str, values_key: str, legacy_key: str = None):
+        values = filters.get(values_key, filters.get(legacy_key, []) if legacy_key else [])
+        if isinstance(values, str) and values:
+            values = [values]
+        if values:
+            if len(values) == 1:
+                clauses.append({field: {"$eq": values[0]}})
+            else:
+                clauses.append({field: {"$in": values}})
+
+    _add_clause("sphere", "spheres")
+    _add_clause("region", "regions", "region")
+    _add_clause("year", "years")
+    _add_clause("method", "methods")
+
+    if len(clauses) == 1:
+        return clauses[0]
+    elif len(clauses) > 1:
+        return {"$and": clauses}
+    return {}
+
+
+def search_documents(query: str, top_k: int = _DEFAULT_TOP_K,
+                      filters: Optional[Dict] = None,
+                      sources: Optional[List[str]] = None) -> List[Dict]:
+    """
+    Векторный поиск по одной или нескольким коллекциям (protocols,
+    expertise_docs). `sources` — список из {"protocols", "expertise"};
+    по умолчанию — только expertise.
+
+    ВАЖНО: при поиске и в protocols, и в expertise одновременно, фильтры
+    year/method применяются ТОЛЬКО к expertise_docs — коллекция protocols
+    исторически индексировалась без этих полей в metadata (старые чанки их
+    не содержат), поэтому year/method-фильтр на ней просто не будет давать
+    результатов. Если в фильтрах заданы years/methods, а источник включает
+    protocols, year/method для protocols-части запроса не передаются.
+    """
+    if sources is None:
+        sources = ["expertise"]
+
+    where = _build_where_clause(filters)
+    has_year_or_method = bool(filters and (filters.get("years") or filters.get("methods")))
+
+    all_chunks: List[Dict] = []
+
+    if "expertise" in sources:
+        collection = _get_chroma_collection(_EXPERTISE_COLLECTION)
+        if collection is not None:
+            try:
+                kwargs = dict(query_texts=[query], n_results=top_k,
+                              include=["documents", "metadatas", "distances"])
+                if where:
+                    kwargs["where"] = where
+                results = collection.query(**kwargs)
+                docs      = results.get("documents", [[]])[0]
+                metas     = results.get("metadatas",  [[]])[0]
+                distances = results.get("distances",  [[]])[0]
+                for doc, meta, dist in zip(docs, metas, distances):
+                    all_chunks.append({
+                        "text":          doc,
+                        "file":          meta.get("filename", ""),
+                        "date":          meta.get("protocol_date", ""),
+                        "sphere":        meta.get("sphere", ""),
+                        "region":        meta.get("region", ""),
+                        "year":          meta.get("year", ""),
+                        "method":        meta.get("method", ""),
+                        "organization":  meta.get("organization", ""),
+                        "section":       meta.get("section", ""),
+                        "source":        "expertise",
+                        "distance":      dist,
+                    })
+            except Exception as e:
+                print(f"[PREDICTOR] Ошибка поиска в expertise_docs: {e}")
+
+    if "protocols" in sources:
+        # При комбинированном поиске year/method не применяются к protocols
+        # (исторические данные без этих полей в metadata) — собираем
+        # отдельный where без year/method для этой коллекции.
+        protocols_filters = dict(filters or {})
+        protocols_filters.pop("years", None)
+        protocols_filters.pop("methods", None)
+        protocols_where = _build_where_clause(protocols_filters)
+
+        collection = _get_chroma_collection(_PROTOCOLS_COLLECTION)
+        if collection is not None:
+            try:
+                kwargs = dict(query_texts=[query], n_results=top_k,
+                              include=["documents", "metadatas", "distances"])
+                if protocols_where:
+                    kwargs["where"] = protocols_where
+                results = collection.query(**kwargs)
+                docs      = results.get("documents", [[]])[0]
+                metas     = results.get("metadatas",  [[]])[0]
+                distances = results.get("distances",  [[]])[0]
+                for doc, meta, dist in zip(docs, metas, distances):
+                    all_chunks.append({
+                        "text":         doc,
+                        "file":         meta.get("file", ""),
+                        "date":         meta.get("date", ""),
+                        "sphere":       meta.get("sphere", ""),
+                        "region":       meta.get("region", ""),
+                        "year":         "",   # отсутствует в исторических metadata
+                        "method":       "",   # отсутствует в исторических metadata
+                        "organization": meta.get("organization", ""),
+                        "section":      "",
+                        "source":       "protocols",
+                        "distance":     dist,
+                    })
+            except Exception as e:
+                print(f"[PREDICTOR] Ошибка поиска в protocols: {e}")
+
+    # Сортируем общий пул по близости (меньше distance = релевантнее) и
+    # обрезаем до top_k — иначе при двух источниках результатов будет до 2×top_k.
+    all_chunks.sort(key=lambda c: c.get("distance", 1.0))
+    return all_chunks[:top_k]
 
 
 def search_protocols(query: str, top_k: int = _DEFAULT_TOP_K,
                      filters: Optional[Dict] = None) -> List[Dict]:
     """
-    Векторный поиск по коллекции протоколов.
-    Возвращает список чанков с текстом и метаданными.
+    DEPRECATED: оставлена для обратной совместимости с любым внешним кодом,
+    который мог импортировать именно эту функцию. Эквивалентна
+    search_documents(..., sources=["expertise"]).
     """
-    collection = _get_chroma_collection()
+    return search_documents(query, top_k=top_k, filters=filters, sources=["expertise"])
+
+
+# =============================================================================
+# Гибридный поиск (BM25 + векторный + CrossEncoder reranking) для expertise_docs
+#
+# Переиспользует инфраструктуру core/advisor.py (HybridRetriever, Reranker) —
+# тот же подход, что и в Советчике для НПА — вместо чистого векторного
+# cosine-similarity поиска, который на коротких запросах (название статьи
+# затрат) даёт заметно более слабые результаты.
+#
+# ВАЖНО: создаётся ОТДЕЛЬНЫЙ синглтон HybridRetriever для expertise_docs —
+# не путать с тем, что использует Советчик для tariff_docs (НПА). Coллекция
+# передаётся в конструктор HybridRetriever явно.
+# =============================================================================
+_EXPERTISE_HYBRID_RETRIEVER_KEY = "__regula_ai_expertise_hybrid_retriever__"
+
+
+def _get_expertise_hybrid_retriever():
+    """
+    Синглтон HybridRetriever для коллекции expertise_docs. Использует
+    класс HybridRetriever из core/advisor.py напрямую (тот же BM25 + RRF
+    fusion алгоритм), но со своим кэшем и своей коллекцией — изолирован
+    от ретривера НПА.
+    """
+    import sys
+    try:
+        from core.advisor import HybridRetriever, BM25_AVAILABLE
+    except Exception as e:
+        print(f"[PREDICTOR] core.advisor недоступен для гибридного поиска: {e}")
+        return None
+
+    if not BM25_AVAILABLE:
+        return None
+
+    collection = _get_chroma_collection(_EXPERTISE_COLLECTION)
     if collection is None:
+        return None
+
+    try:
+        current_count = collection.count()
+    except Exception:
+        current_count = -1
+
+    existing = sys.modules.get(_EXPERTISE_HYBRID_RETRIEVER_KEY)
+    if existing is not None and getattr(existing, "_collection_count", -1) == current_count:
+        return existing
+
+    try:
+        retriever = HybridRetriever(collection)
+        retriever._collection_count = current_count
+        sys.modules[_EXPERTISE_HYBRID_RETRIEVER_KEY] = retriever
+        return retriever
+    except Exception as e:
+        print(f"[PREDICTOR] Не удалось построить HybridRetriever для expertise_docs: {e}")
+        return None
+
+
+def invalidate_expertise_hybrid_retriever():
+    """Сбрасывает BM25-индекс expertise_docs — вызывать после переиндексации."""
+    import sys
+    sys.modules.pop(_EXPERTISE_HYBRID_RETRIEVER_KEY, None)
+
+
+def _filter_candidates_by_where(candidates: List[Dict], filters: Optional[Dict]) -> List[Dict]:
+    """
+    HybridRetriever.search() не поддерживает ChromaDB `where` напрямую
+    (BM25-часть ищет по всем чанкам в памяти), поэтому фильтрацию по
+    sphere/region/year/method применяем после получения кандидатов —
+    на полном пуле документов это недорого (тысячи, не миллионы записей).
+    """
+    if not filters:
+        return candidates
+
+    def _matches(meta: dict) -> bool:
+        for key, field in [("spheres", "sphere"), ("regions", "region"),
+                            ("years", "year"), ("methods", "method")]:
+            values = filters.get(key)
+            if values and meta.get(field) not in values:
+                return False
+        return True
+
+    return [c for c in candidates if _matches(c.get("meta", {}))]
+
+
+def search_documents_hybrid(
+    query: str,
+    article_name: str = "",
+    top_k: int = _DEFAULT_TOP_K,
+    filters: Optional[Dict] = None,
+    retrieval_pool: int = 60,
+) -> List[Dict]:
+    """
+    Гибридный поиск по expertise_docs: BM25 + векторный (RRF fusion) →
+    CrossEncoder reranking относительно `article_name` (или `query`, если
+    article_name не передан) → top_k финальных результатов.
+
+    `retrieval_pool` — сколько кандидатов берёт HybridRetriever ДО
+    реранкинга (с запасом, т.к. фильтры sphere/region/year/method и
+    последующий реранкинг могут уменьшить пул).
+
+    При недоступности BM25/reranker — мягкий fallback на обычный
+    векторный поиск (search_documents).
+    """
+    retriever = _get_expertise_hybrid_retriever()
+    if retriever is None:
+        print("[PREDICTOR] Гибридный поиск недоступен, fallback на векторный поиск.")
+        return search_documents(query, top_k=top_k, filters=filters, sources=["expertise"])
+
+    candidates = retriever.search(query, top_k=retrieval_pool)
+    candidates = _filter_candidates_by_where(candidates, filters)
+
+    if not candidates:
         return []
 
     try:
-        where = {}
-        if filters:
-            clauses = []
+        from core.advisor import get_reranker
+        reranker = get_reranker()
+    except Exception:
+        reranker = None
 
-            # spheres — список строк без эмодзи, поддерживает $in для нескольких сфер
-            _spheres = filters.get("spheres", [])
-            if isinstance(_spheres, str) and _spheres:   # legacy: одна строка
-                _spheres = [_spheres]
-            if _spheres:
-                if len(_spheres) == 1:
-                    clauses.append({"sphere": {"$eq": _spheres[0]}})
-                else:
-                    clauses.append({"sphere": {"$in": _spheres}})
+    rerank_query = article_name.strip() if article_name and article_name.strip() else query
 
-            # regions — список регионов, $in для нескольких, $eq для одного
-            _regions = filters.get("regions", filters.get("region", []))
-            if isinstance(_regions, str) and _regions:
-                _regions = [_regions]
-            if _regions:
-                if len(_regions) == 1:
-                    clauses.append({"region": {"$eq": _regions[0]}})
-                else:
-                    clauses.append({"region": {"$in": _regions}})
+    if reranker is not None:
+        reranked = reranker.rerank(rerank_query, candidates, top_n=top_k)
+    else:
+        # Без реранкера — берём по RRF-score (уже отсортированы HybridRetriever.search)
+        reranked = candidates[:top_k]
 
-            if len(clauses) == 1:
-                where = clauses[0]
-            elif len(clauses) > 1:
-                where = {"$and": clauses}
+    results: List[Dict] = []
+    for c in reranked:
+        meta = c.get("meta", {})
+        results.append({
+            "text":          c.get("doc", ""),
+            "file":          meta.get("filename", ""),
+            "date":          meta.get("protocol_date", ""),
+            "sphere":        meta.get("sphere", ""),
+            "region":        meta.get("region", ""),
+            "year":          meta.get("year", ""),
+            "method":        meta.get("method", ""),
+            "organization":  meta.get("organization", ""),
+            "section":       meta.get("section", ""),
+            "tag":           meta.get("tag", ""),
+            "source":        "expertise",
+            "rerank_score":  c.get("rerank_score"),
+            "distance":      1.0 - (c.get("rerank_score") or 0) if c.get("rerank_score") is not None else c.get("score", 1.0),
+        })
+    return results
 
-        kwargs = dict(query_texts=[query], n_results=top_k, include=["documents", "metadatas", "distances"])
-        if where:
-            kwargs["where"] = where
 
-        results = collection.query(**kwargs)
+def _truncate_chunks_by_char_budget(
+    chunks: List[Dict], budget: int = _RAG_CONTEXT_CHAR_BUDGET,
+) -> Tuple[List[Dict], int]:
+    """
+    Обрезает список чанков (уже отсортированных по релевантности) так,
+    чтобы суммарная длина их текста не превышала `budget` символов.
+    Берём чанки по порядку, пока сумма не превысит лимит — остальные
+    отбрасываем целиком (не дробим текст внутри чанка).
 
-        chunks = []
-        docs      = results.get("documents", [[]])[0]
-        metas     = results.get("metadatas",  [[]])[0]
-        distances = results.get("distances",  [[]])[0]
+    Защищает от случаев, когда большое top_k (например 30) с длинными
+    чанками создаёт огромный совокупный контекст для последовательной
+    LLM-классификации — это и замедляет генерацию (особенно при
+    включённом Unified KV Cache в LM Studio, который накапливает
+    контекст между последовательными вызовами).
 
-        for doc, meta, dist in zip(docs, metas, distances):
-            chunks.append({
-                "text":         doc,
-                "file":         meta.get("file", ""),
-                "date":         meta.get("date", ""),
-                "sphere":       meta.get("sphere", ""),
-                "region":       meta.get("region", ""),
-                "organization": meta.get("organization", ""),
-                "distance":     dist,
-            })
-        return chunks
-
-    except Exception as e:
-        print(f"[PREDICTOR] Ошибка поиска: {e}")
-        return []
+    Возвращает (обрезанный_список, отброшено_чанков).
+    """
+    kept: List[Dict] = []
+    total_chars = 0
+    for chunk in chunks:
+        chunk_len = len(chunk.get("text", "") or "")
+        if kept and total_chars + chunk_len > budget:
+            break
+        kept.append(chunk)
+        total_chars += chunk_len
+    dropped = len(chunks) - len(kept)
+    return kept, dropped
 
 
 # =============================================================================
 # Классификация чанка через LLM
 # =============================================================================
+
+_DECISION_FIELDS_RE = re.compile(
+    r'(?:[*•]\s*)?\*{0,2}Заявлено(?:\s+предприятием)?\*{0,2}\s*:?\s*\*{0,2}\s*(?P<claimed>[^\n\r]+)|'
+    r'(?:[*•]\s*)?\*{0,2}Принято(?:\s+экспертами)?\*{0,2}\s*:?\s*\*{0,2}\s*(?P<accepted>[^\n\r]+)|'
+    r'(?:[*•]\s*)?\*{0,2}Корректировка\*{0,2}\s*(?:\+/-)?\s*:?\s*\*{0,2}\s*(?P<adjustment>[^\n\r]+)|'
+    r'(?:[*•]\s*)?\*{0,2}ОБОСНОВАНИЕ\*{0,2}\s*:?\s*\*{0,2}\s*(?P<rationale>[^\n\r]+)',
+    re.IGNORECASE,
+)
+
+
+def extract_decision_fields(chunk_text: str) -> Dict[str, str]:
+    """
+    Извлекает структурированные поля "Заявлено / Принято / Корректировка /
+    ОБОСНОВАНИЕ" из текста чанка (формат экспертных заключений). Эти поля
+    содержат ГОТОВОЕ решение регулятора по статье — не нужно угадывать
+    тон текста, решение уже есть в цифрах.
+
+    Формат варьируется между документами (с markdown-bold, со
+    звёздочками/буллетами, с разбивкой по годам), поэтому используется
+    гибкая регулярка без строгой привязки к одной форме записи. Если
+    поля не найдены — возвращает пустой словарь (не пытаемся "придумать"
+    структуру там, где её нет в тексте).
+    """
+    found: Dict[str, str] = {}
+    for m in _DECISION_FIELDS_RE.finditer(chunk_text):
+        for key in ("claimed", "accepted", "adjustment", "rationale"):
+            val = m.group(key)
+            if val and key not in found:
+                val = val.strip().rstrip(".,;").strip("*").strip()
+                found[key] = val
+    return found
+
+
+# Маркеры явного согласия/несогласия в тексте reason — используются для
+# программной проверки согласованности с decision (модель иногда пишет
+# текстом верный вывод "совпадение позиции", но ставит decision=negative
+# по инерции — это противоречие, и оно перебивает decision модели,
+# поскольку текстовый вывод reason надёжнее одного отдельного поля).
+_REASON_AGREE_RE = re.compile(
+    r'совпадени[ея]\s+(позици|подход|вариант|метод)|'
+    r'(тот\s+же|такой\s+же|один\s+и\s+тот\s+же)\s+(вариант|подход|принцип|срок|метод)|'
+    r'совпадает\s+с\s+позицией|регулятор\s+(также|тоже)\s+(выбрал|применил|использовал)',
+    re.IGNORECASE,
+)
+_REASON_DISAGREE_RE = re.compile(
+    r'противоречи[ея]|не\s+совпадает|противоположн|расхожд|'
+    r'(другой|иной)\s+(вариант|подход|принцип)|'
+    r'регулятор\s+(не\s+согласен|отклонил|отказал)',
+    re.IGNORECASE,
+)
+
+
+def _reconcile_decision_with_reason(decision: str, reason: str) -> tuple[str, bool]:
+    """
+    Программная проверка согласованности decision с текстом reason.
+    Модель иногда формулирует в reason явный и корректный вывод
+    ("это совпадение позиции"), но всё равно выставляет противоречащий
+    decision (например negative). Полагаться на то, что модель сама себя
+    проверит в один проход, ненадёжно — поэтому здесь явный пост-фактум
+    разбор reason по маркерам согласия/несогласия.
+
+    При обнаруженном противоречии текстовый вывод reason считается более
+    надёжным сигналом (модель его явно сформулировала словами) и
+    перебивает decision. Возвращает (итоговый_decision, был_ли_исправлен).
+    """
+    agree   = bool(_REASON_AGREE_RE.search(reason))
+    disagree = bool(_REASON_DISAGREE_RE.search(reason))
+
+    # Однозначный сигнал согласия в reason, а decision говорит об обратном
+    if agree and not disagree and decision == "negative":
+        return "positive", True
+    # Однозначный сигнал несогласия в reason, а decision говорит о позитиве
+    if disagree and not agree and decision == "positive":
+        return "negative", True
+
+    return decision, False
+
+
+def _verify_regulator_choice_vs_user_position(
+    quote: str, justification: str, client, model: str,
+) -> tuple[bool, str]:
+    """
+    ВТОРОЙ ЭТАП проверки (отдельный, узкий LLM-вызов) — ПЕРЕРАБОТАННАЯ ВЕРСИЯ.
+
+    Прежняя версия сравнивала quote с reason первого этапа — но reason сам
+    может быть сформулирован размыто/двусмысленно ("совпадает с позицией
+    пользователя о фактических потерях в контексте применения
+    нормативного подхода" — формально не повторяет противоречащее слово
+    напрямую, поэтому узкая текстовая сверка quote↔reason такое
+    пропускает).
+
+    Новая версия убирает reason как посредника: верификатор САМ читает
+    quote (что реально выбрал регулятор) и justification (позицию
+    текущего пользователя), и САМ определяет совпадение или
+    противоречие — независимо от того, как это сформулировал первый
+    этап. Это устраняет риск унаследовать путаную формулировку.
+
+    Возвращает (is_consistent, verification_note).
+    Если проверка сама не удалась технически — возвращает (True, "") —
+    не блокирует результат первого этапа при сбое самой проверки.
+    """
+    if not quote or not justification:
+        return True, ""
+
+    system_prompt = (
+        "Ты определяешь, какой конкретный вариант/подход выбран в двух "
+        "текстах, и совпадают ли эти варианты. Отвечай только JSON, без "
+        "рассуждений."
+    )
+    user_prompt = (
+        f"ТЕКСТ 1 (решение регулятора, цитата из документа): {quote}\n"
+        f"ТЕКСТ 2 (позиция пользователя): {justification}\n\n"
+        f"Шаг 1: определи, какой конкретный вариант/подход выбран в "
+        f"ТЕКСТЕ 1 (например 'норматив', 'фактические показатели', "
+        f"'максимальный срок', 'минимальный срок' — конкретное значение, "
+        f"а не общая тема).\n"
+        f"Шаг 2: определи, какой конкретный вариант/подход заявлен в "
+        f"ТЕКСТЕ 2.\n"
+        f"Шаг 3: сравни — это ОДИН И ТОТ ЖЕ вариант, или ПРОТИВОПОЛОЖНЫЕ "
+        f"варианты внутри одной темы (например 'норматив' и "
+        f"'фактические показатели' — противоположны; 'максимальный' и "
+        f"'минимальный' — противоположны)?\n\n"
+        'JSON: {{"same_choice": true|false, "regulator_choice": "вариант из ТЕКСТА 1, до 40 симв.", "user_choice": "вариант из ТЕКСТА 2, до 40 симв."}}'
+    )
+
+    print(f"[VERIFY] Независимая проверка: quote='{quote[:60]}...' justification='{justification[:60]}...'", flush=True)
+    try:
+        raw = _lm_call(client, model, system_prompt, user_prompt, max_tokens=150)
+        if raw.startswith("[Ошибка LM:"):
+            print(f"[VERIFY] LM-вызов завершился ошибкой: {raw}", flush=True)
+            return True, ""
+        clean = re.sub(r'```json|```', '', raw).strip()
+        data = json.loads(clean)
+        same_choice = data.get("same_choice")
+        if same_choice is None:
+            # Модель не дала однозначный ответ — не блокируем
+            return True, ""
+        reg_choice = data.get("regulator_choice", "")
+        user_choice = data.get("user_choice", "")
+        note = f"регулятор: «{reg_choice}», пользователь: «{user_choice}»"
+        print(f"[VERIFY] Независимый результат: same_choice={same_choice} ({note})", flush=True)
+        return bool(same_choice), note
+    except Exception as e:
+        print(f"[VERIFY] Сбой независимой проверки (raw='{raw if 'raw' in dir() else '?'}'): {e}", flush=True)
+        return True, ""
+
 
 def classify_chunk(chunk_text: str, article_name: str, justification_summary: str,
                    client, model: str) -> Dict:
@@ -415,8 +891,44 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
     _max_tokens    = int(cfg["classify_max_tokens"])
 
     _chunk   = chunk_text[:_chunk_chars]
+
+    # Извлекаем структурированное решение (Заявлено/Принято/Корректировка/
+    # ОБОСНОВАНИЕ), если оно присутствует, и явно подсвечиваем его перед
+    # текстом чанка — чтобы модель опиралась на цифры решения, а не
+    # угадывала тональность по формулировкам.
+    #
+    # ВАЖНО: и "Заявлено предприятием" из decision_fields (то, что просила
+    # ДРУГАЯ организация в прецеденте), и "Обоснование решения" из
+    # decision_fields (причина регулятора по ТОЙ организации) — это текст
+    # из найденного прецедента, не имеющий отношения к текущему
+    # пользователю. Чтобы модель не путала это с позицией ТЕКУЩЕГО
+    # пользователя (justification_line), оборачиваем оба источника в явные
+    # блочные метки.
+    decision_fields = extract_decision_fields(_chunk)
+    if decision_fields:
+        _hint_lines = ["[Структурированное решение по статье из ПРЕЦЕДЕНТА (другая организация, не текущий пользователь):]"]
+        if "claimed" in decision_fields:
+            _hint_lines.append(f"В прецеденте заявлено той организацией: {decision_fields['claimed']}")
+        if "accepted" in decision_fields:
+            _hint_lines.append(f"В прецеденте принято экспертами/регулятором: {decision_fields['accepted']}")
+        if "adjustment" in decision_fields:
+            _hint_lines.append(f"Корректировка в прецеденте: {decision_fields['adjustment']}")
+        if "rationale" in decision_fields:
+            _hint_lines.append(f"Причина решения регулятора в прецеденте: {decision_fields['rationale']}")
+        _chunk = "\n".join(_hint_lines) + "\n\n" + _chunk
+
     _justify = justification_summary[:_justify_chars] if justification_summary and _justify_chars > 0 else ""
-    _justify_line = f"Обоснование: {_justify}\n" if _justify else ""
+    _justify_line = (
+        f"=== ПОЗИЦИЯ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (то, что он обосновывает сейчас) ===\n"
+        f"{_justify}\n"
+        f"=== КОНЕЦ ПОЗИЦИИ ПОЛЬЗОВАТЕЛЯ ===\n"
+    ) if _justify else ""
+
+    _chunk = (
+        f"=== РЕШЕНИЕ ИЗ ПРЕЦЕДЕНТА (другая организация, другой случай) ===\n"
+        f"{_chunk}\n"
+        f"=== КОНЕЦ РЕШЕНИЯ ИЗ ПРЕЦЕДЕНТА ==="
+    )
 
     system_prompt = prompts["predictor_classify_system"]
     user_template = prompts["predictor_classify_user"]
@@ -436,10 +948,33 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
         decision = data.get("decision", "neutral")
         if decision not in ("positive", "negative", "neutral"):
             decision = "neutral"
+        reason = data.get("reason", "")
+        quote  = data.get("quote", chunk_text[:150])
+        decision, _was_fixed = _reconcile_decision_with_reason(decision, reason)
+
+        # ВТОРОЙ ЭТАП: НЕЗАВИСИМАЯ проверка quote vs justification_summary
+        # (позиция пользователя), без посредника reason. Если регулятор в
+        # цитате выбрал вариант, противоположный позиции пользователя —
+        # понижаем результат до neutral с пометкой на проверку эксперта,
+        # не пытаясь угадать "правильный" decision программно.
+        needs_expert_review = False
+        if decision != "neutral":
+            print(f"[VERIFY] Запуск второго этапа для decision={decision}", flush=True)
+            is_consistent, verify_note = _verify_regulator_choice_vs_user_position(
+                quote, justification_summary, client, model,
+            )
+            if not is_consistent:
+                print(f"[VERIFY] ⚠️ Противоречие найдено, понижаем decision {decision} → neutral", flush=True)
+                decision = "neutral"
+                needs_expert_review = True
+                reason = f"Требует проверки эксперта: позиции не совпадают ({verify_note})"
+
         return {
             "decision": decision,
-            "quote":    data.get("quote", chunk_text[:150]),
-            "reason":   data.get("reason", ""),
+            "quote":    quote,
+            "reason":   reason,
+            "decision_fields": decision_fields,
+            "needs_expert_review": needs_expert_review,
         }
     except Exception:
         # Fallback: пробуем угадать по ключевым словам
@@ -450,7 +985,9 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
             decision = "negative"
         else:
             decision = "neutral"
-        return {"decision": decision, "quote": chunk_text[:150], "reason": raw[:100]}
+        decision, _was_fixed = _reconcile_decision_with_reason(decision, raw)
+        return {"decision": decision, "quote": chunk_text[:150], "reason": raw[:100],
+                "decision_fields": decision_fields}
 
 
 # =============================================================================
@@ -494,9 +1031,15 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
             "date":         best_chunk.get("date", ""),
             "sphere":       best_chunk.get("sphere", ""),
             "region":       best_chunk.get("region", ""),
+            "year":         best_chunk.get("year", ""),
+            "method":       best_chunk.get("method", ""),
             "organization": best_chunk.get("organization", ""),
+            "section":      best_chunk.get("section", ""),
+            "source":       best_chunk.get("source", ""),
             "quote":        best_chunk.get("quote", ""),
             "reason":       best_chunk.get("reason", ""),
+            "decision_fields": best_chunk.get("decision_fields", {}),
+            "needs_expert_review": best_chunk.get("needs_expert_review", False),
             "chunks_total": len(chunks),
             "chunks_decision": dict(counter),
         }
@@ -514,30 +1057,37 @@ def run_prediction(
     justification_text: str,
     top_k: int = None,
     filters: Optional[Dict] = None,
+    sources: Optional[List[str]] = None,
     _progress_cb=None,
 ) -> Optional[Dict]:
     """
     Запускает полный цикл прогноза. Возвращает dict с результатами или None при ошибке.
+    `sources` — список из {"protocols", "expertise"}; по умолчанию ["expertise"].
     """
     if not article_name.strip():
         return None
+
+    if sources is None:
+        sources = ["expertise"]
 
     # Читаем top_k из конфига если не передан явно
     if top_k is None:
         top_k = int(load_predictor_config().get("default_top_k", _DEFAULT_TOP_K))
 
-    # 1. Расширяем запрос
+    # 1. Формируем поисковый запрос.
+    # ИСПРАВЛЕНО: раньше при длинном обосновании (>500 симв.) article_name
+    # полностью выбрасывался из запроса, заменяясь только синонимами от
+    # expand_query — поиск уходил в сторону от реальной статьи затрат.
+    # Теперь article_name участвует в запросе всегда; для длинного
+    # обоснования берём только начальный фрагмент (для контекста), не весь
+    # текст целиком — он и так дальше используется отдельно при
+    # классификации каждого чанка (justification_summary).
     if _progress_cb:
-        _progress_cb(0.05, "Расширение поискового запроса…")
-    try:
-        from core.query_expander import expand_query
-        query_variants = expand_query(article_name)
-        # Добавляем обоснование в запрос если оно короткое
-        if justification_text and len(justification_text) <= 500:
-            search_query = f"{article_name} {justification_text}"
-        else:
-            search_query = " ".join(query_variants[:3])
-    except Exception:
+        _progress_cb(0.05, "Формирование поискового запроса…")
+    _JUSTIFICATION_QUERY_CHARS = 400
+    if justification_text:
+        search_query = f"{article_name} {justification_text[:_JUSTIFICATION_QUERY_CHARS]}"
+    else:
         search_query = article_name
 
     # 2. Сжимаем обоснование если длинное
@@ -550,10 +1100,24 @@ def run_prediction(
             _progress_cb=lambda p, m: _progress_cb(0.1 + p * 0.2, m) if _progress_cb else None,
         )
 
-    # 3. Поиск по ChromaDB
+    # 3. Поиск
+    # Для expertise — гибридный поиск (BM25 + векторный + CrossEncoder
+    # reranking относительно article_name), та же инфраструктура, что и в
+    # Советчике (core/advisor.py). Заметно точнее на коротких запросах
+    # (название статьи затрат), чем чистый векторный cosine similarity.
+    # Для protocols (или их комбинации с expertise) — оставляем обычный
+    # векторный поиск через search_documents, т.к. protocols пока не имеет
+    # отдельного BM25-индекса.
     if _progress_cb:
-        _progress_cb(0.32, f"Поиск по протоколам (top-{top_k})…")
-    chunks = search_protocols(search_query, top_k=top_k, filters=filters)
+        _src_label = " + ".join(sources)
+        _progress_cb(0.32, f"Поиск по базе ({_src_label}, top-{top_k})…")
+
+    if sources == ["expertise"]:
+        chunks = search_documents_hybrid(
+            search_query, article_name=article_name, top_k=top_k, filters=filters,
+        )
+    else:
+        chunks = search_documents(search_query, top_k=top_k, filters=filters, sources=sources)
 
     if not chunks:
         return {
@@ -561,8 +1125,20 @@ def run_prediction(
             "query":      search_query,
             "chunks":     [],
             "aggregated": {"positive": [], "negative": [], "neutral": [], "total_files": 0},
-            "error":      "Протоколы не найдены. Проверьте, загружена ли коллекция в Админке.",
+            "error":      "Документы не найдены. Проверьте, загружена ли коллекция в Админке, и не слишком ли узкие фильтры.",
         }
+
+    # 3.5. Обрезаем по общему бюджету символов — защита от слишком
+    # длинной последовательной классификации (особенно при включённом
+    # Unified KV Cache в LM Studio, который накапливает контекст между
+    # вызовами и резко замедляет генерацию на больших top_k).
+    chunks, dropped_count = _truncate_chunks_by_char_budget(chunks, _RAG_CONTEXT_CHAR_BUDGET)
+    if dropped_count and _progress_cb:
+        _progress_cb(
+            0.35,
+            f"Контекст обрезан до {_RAG_CONTEXT_CHAR_BUDGET:,} симв. "
+            f"(отброшено {dropped_count} наименее релевантных фрагментов)…".replace(",", " "),
+        )
 
     # 4. Классификация чанков через LLM
     if _progress_cb:
@@ -595,10 +1171,12 @@ def run_prediction(
         "query":                search_query,
         "justification_summary": justification_summary,
         "chunks_raw":           len(chunks),
+        "chunks_dropped_budget": dropped_count,
         "aggregated":           aggregated,
         "timestamp":            datetime.now().isoformat(),
         "top_k":                top_k,
         "filters":              filters or {},
+        "sources":              sources,
     }
 
 
@@ -613,6 +1191,59 @@ def _badge(label: str, count: int, color: str) -> str:
     )
 
 
+_NEGATIVE_WEIGHT = 1.5  # negative весит сильнее positive — принцип осторожности
+_HIGH_CONFIDENCE_THRESHOLD = 5  # содержательных источников (positive+negative) для "высокой" уверенности
+
+
+def compute_approval_score(n_positive: int, n_negative: int, n_neutral: int) -> Dict:
+    """
+    Взвешенная агрегирующая оценка вероятности одобрения статьи затрат.
+
+    Методология:
+    - Учитываются только содержательные источники (positive + negative);
+      neutral в сам процент не входит — они ничего не говорят по существу
+      о позиции регулятора в отношении конкретной заявленной логики.
+    - negative весит в _NEGATIVE_WEIGHT раз сильнее positive (принцип
+      осторожности: ошибочно успокоить заявителя дороже, чем ошибочно
+      насторожить — отказ в тарифной заявке создаёт больше риска для
+      бизнеса, чем избыточная осторожность).
+    - Если содержательных источников нет вообще (все найденные —
+      neutral) — возвращается 50% с явной пометкой "низкая уверенность":
+      это означает, что регуляторы, по всей видимости, ещё не
+      сталкивались именно с такой комбинацией статьи и обоснования,
+      а не что у организации есть основания на одобрение или отказ.
+    - Уверенность (confidence) считается по числу содержательных
+      источников: >= _HIGH_CONFIDENCE_THRESHOLD — высокая, 1..4 —
+      средняя, 0 — низкая.
+    """
+    weighted_pos = n_positive
+    weighted_neg = n_negative * _NEGATIVE_WEIGHT
+    total_weighted = weighted_pos + weighted_neg
+    n_substantive = n_positive + n_negative
+
+    if total_weighted <= 0:
+        approval_pct = 50.0
+    else:
+        approval_pct = (weighted_pos / total_weighted) * 100
+
+    if n_substantive >= _HIGH_CONFIDENCE_THRESHOLD:
+        confidence = "high"
+    elif n_substantive >= 1:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "approval_pct": round(approval_pct, 1),
+        "confidence": confidence,
+        "n_substantive": n_substantive,
+        "n_positive": n_positive,
+        "n_negative": n_negative,
+        "n_neutral": n_neutral,
+        "all_neutral": n_substantive == 0 and n_neutral > 0,
+    }
+
+
 def _source_card(record: Dict, idx: int, decision: str) -> None:
     """Отображает одну карточку-источник в свёрнутом виде (как в советчике)."""
     color_map = {"positive": "#2e7a50", "negative": "#b33a3a", "neutral": "#888"}
@@ -623,8 +1254,43 @@ def _source_card(record: Dict, idx: int, decision: str) -> None:
         header += f"  ·  {record['date']}"
     if record.get("organization"):
         header += f"  ·  {record['organization']}"
+    if record.get("source"):
+        _src_badge = "экспертное" if record["source"] == "expertise" else "протокол"
+        header += f"  ·  {_src_badge}"
 
     with st.expander(header, expanded=False):
+        # Скачивание и просмотр исходного txt-файла источника
+        _fname = record.get("file", "")
+        _doc_type = "expertise" if record.get("source") == "expertise" else "protocol"
+        _src_fpath = os.path.join("data", "raw", f"{_doc_type}_docs", _fname)
+        if _fname and os.path.exists(_src_fpath):
+            try:
+                with open(_src_fpath, "rb") as _f:
+                    _file_bytes = _f.read()
+                _file_text = _file_bytes.decode("utf-8", errors="replace")
+
+                src_col1, src_col2 = st.columns(2)
+                with src_col1:
+                    st.download_button(
+                        "Скачать исходный файл",
+                        data=_file_bytes,
+                        file_name=_fname,
+                        mime="text/plain",
+                        key=f"dl_{decision}_{idx}_{_fname}",
+                        use_container_width=True,
+                    )
+                with src_col2:
+                    if st.button(
+                        "Просмотреть",
+                        key=f"preview_{decision}_{idx}_{_fname}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["_preview_file"] = {"name": _fname, "text": _file_text}
+                        st.rerun()
+            except Exception:
+                pass
+            st.markdown("")
+
         # Цитата
         quote = record.get("quote", "")
         if quote:
@@ -636,15 +1302,60 @@ def _source_card(record: Dict, idx: int, decision: str) -> None:
                 f"{quote}</div>",
                 unsafe_allow_html=True,
             )
-        # Причина
+        # Причина (от LLM-классификатора — почему отнесён к за/против/нейтрально)
         if record.get("reason"):
-            st.caption(f"Обоснование: {record['reason']}")
+            st.caption(f"Оценка системы: {record['reason']}")
+
+        # ── Ручной выбор эксперта для спорных neutral-источников ───────────
+        # Только для тех, что понижены автоматической проверкой
+        # согласованности (needs_expert_review=True) — не для всех neutral,
+        # большинство которых нейтральны по делу (нет решения в прецеденте).
+        if decision == "neutral" and record.get("needs_expert_review"):
+            _fkey = record.get("file", "")
+            _current_override = st.session_state.get("pred_expert_overrides", {}).get(_fkey)
+
+            st.caption("Модель не смогла однозначно определить позицию — выберите вручную:")
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                if st.button(
+                    "Это «за»", key=f"override_pos_{idx}_{_fkey}",
+                    type="primary" if _current_override == "positive" else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.setdefault("pred_expert_overrides", {})[_fkey] = "positive"
+                    st.rerun()
+            with ec2:
+                if st.button(
+                    "Это «против»", key=f"override_neg_{idx}_{_fkey}",
+                    type="primary" if _current_override == "negative" else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.setdefault("pred_expert_overrides", {})[_fkey] = "negative"
+                    st.rerun()
+            with ec3:
+                if _current_override and st.button(
+                    "Сбросить", key=f"override_reset_{idx}_{_fkey}",
+                    use_container_width=True,
+                ):
+                    st.session_state.get("pred_expert_overrides", {}).pop(_fkey, None)
+                    st.rerun()
+
+            if _current_override:
+                _override_label = "за" if _current_override == "positive" else "против"
+                st.caption(f"✓ Учтено вручную как «{_override_label}»")
+
         # Метаданные
         meta_parts = []
         if record.get("sphere"):
             meta_parts.append(f"Сфера: {record['sphere']}")
         if record.get("region"):
             meta_parts.append(f"Регион: {record['region']}")
+        if record.get("year"):
+            meta_parts.append(f"Год: {record['year']}")
+        if record.get("method"):
+            meta_parts.append(f"Метод: {record['method']}")
+        if record.get("section"):
+            meta_parts.append(f"Раздел: {record['section']}")
         chunks_info = record.get("chunks_decision", {})
         if chunks_info:
             parts_str = " / ".join(
@@ -752,7 +1463,34 @@ def show_predictor():
 # =============================================================================
 # Вкладка «Прогноз»
 # =============================================================================
+def _show_file_preview_dialog():
+    """
+    Показывает содержимое исходного txt-файла во всплывающем окне, если
+    пользователь нажал «Просмотреть» на одной из карточек источников.
+    """
+    preview = st.session_state.get("_preview_file")
+    if not preview:
+        return
+
+    @st.dialog(preview["name"], width="large")
+    def _dialog():
+        st.text_area(
+            "Содержимое файла",
+            value=preview["text"],
+            height=500,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+        if st.button("Закрыть", use_container_width=True):
+            st.session_state.pop("_preview_file", None)
+            st.rerun()
+
+    _dialog()
+
+
 def _show_predict_tab():
+    _show_file_preview_dialog()
+
     # ── Шаг 1: Статья затрат ─────────────────────────────────────────────────
     st.subheader("1. Статья затрат")
     article_name = st.text_input(
@@ -842,8 +1580,63 @@ def _show_predict_tab():
                 st.caption(f"Объём: {len(scan_text):,} символов · {selected_doc.get('word_count', 0):,} слов")
                 justification_text = scan_text
 
-    # ── Шаг 3: Фильтры ───────────────────────────────────────────────────────
-    st.subheader("3. Фильтры (опционально)")
+    # ── Шаг 3: Источник поиска ───────────────────────────────────────────────
+    st.subheader("3. Источник поиска")
+    _SOURCE_OPTIONS = {
+        "Только экспертные заключения": ["expertise"],
+        "Только протоколы":             ["protocols"],
+        "Оба источника":                ["expertise", "protocols"],
+    }
+    source_label = st.radio(
+        "Где искать аналогичные случаи",
+        list(_SOURCE_OPTIONS.keys()),
+        index=0,  # по умолчанию — только экспертные
+        horizontal=True,
+        key="pred_source_radio",
+        help=(
+            "Экспертные заключения — новая база с полным набором атрибутов "
+            "(регион, сфера, год, метод). Протоколы — старая коллекция; "
+            "фильтры по году и методу регулирования к ней не применяются, "
+            "так как эти поля отсутствуют в её метаданных."
+        ),
+    )
+    selected_sources = _SOURCE_OPTIONS[source_label]
+    if selected_sources == ["protocols"]:
+        st.caption(
+            "В коллекции протоколов нет полей «год» и «метод регулирования» — "
+            "соответствующие фильтры ниже будут проигнорированы для этого источника."
+        )
+    elif "protocols" in selected_sources:
+        st.caption(
+            "Фильтры «год» и «метод» при комбинированном поиске применяются "
+            "только к экспертным заключениям — у протоколов этих полей нет."
+        )
+
+    # ── Шаг 4: Фильтры ───────────────────────────────────────────────────────
+    st.subheader("4. Фильтры (опционально)")
+
+    def _collect_available_years() -> List[str]:
+        """
+        Год регулирования — не фиксированный справочник (бывают значения
+        вида "2025-2029"), поэтому собираем реально встречающиеся значения
+        из реестра документов (data/documents_registry.json), а не из
+        захардкоженного списка как со сферами/регионами.
+        """
+        try:
+            registry_path = os.path.join("data", "documents_registry.json")
+            if not os.path.exists(registry_path):
+                return []
+            with open(registry_path, "r", encoding="utf-8") as f:
+                reg = json.load(f)
+            years = {
+                entry.get("year") for entry in reg.values()
+                if entry.get("year") and "не_определён" not in entry.get("year", "")
+            }
+            return sorted(years)
+        except Exception:
+            return []
+
+    _PRED_YEARS = _collect_available_years()
 
     _PRED_SPHERES = [
         "🔥 Теплоснабжение",
@@ -929,12 +1722,43 @@ def _show_predict_tab():
         default=[],
         key="pred_filter_regions",
         placeholder="Все регионы — фильтр не применяется",
-        help="Ограничивает поиск протоколами выбранных регионов.",
+        help="Ограничивает поиск документами выбранных регионов.",
     )
     if filter_regions:
         st.caption(f"Фильтр: **{'  ·  '.join(filter_regions)}**")
 
-    # ── Шаг 4: Настройки поиска ───────────────────────────────────────────────
+    _PRED_METHODS = [
+        "Индексация",
+        "ЭОЗ",
+        "RAB",
+        "Метод экономически обоснованных расходов",
+    ]
+
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        filter_years = st.multiselect(
+            "Год регулирования",
+            options=_PRED_YEARS,
+            default=[],
+            key="pred_filter_years",
+            placeholder="Все годы — фильтр не применяется",
+            help="Ограничивает поиск документами с указанным годом регулирования.",
+        )
+        if filter_years:
+            st.caption(f"Фильтр: **{'  ·  '.join(filter_years)}**")
+    with fcol2:
+        filter_methods = st.multiselect(
+            "Метод регулирования",
+            options=_PRED_METHODS,
+            default=[],
+            key="pred_filter_methods",
+            placeholder="Все методы — фильтр не применяется",
+            help="Ограничивает поиск документами с указанным методом регулирования.",
+        )
+        if filter_methods:
+            st.caption(f"Фильтр: **{'  ·  '.join(filter_methods)}**")
+
+    # ── Шаг 5: Настройки поиска ───────────────────────────────────────────────
     with st.expander("Настройки поиска", expanded=False):
         top_k = st.slider(
             "Количество источников (top-K)",
@@ -962,14 +1786,18 @@ def _show_predict_tab():
             # Сохраняем параметры для запуска
             st.session_state.pred_result  = None
             st.session_state.pred_running = True
+            st.session_state.pred_expert_overrides = {}  # сброс ручных правок предыдущего прогноза
             st.session_state._pred_params = {
                 "article":       article_name,
                 "justification": justification_text,
                 "top_k":         top_k,
+                "sources":       selected_sources,
                 "filters": {
                     k: v for k, v in {
                         "spheres":  filter_spheres,   # список без эмодзи
                         "regions":  filter_regions,   # список регионов
+                        "years":    filter_years,     # список годов
+                        "methods":  filter_methods,   # список методов
                     }.items() if v
                 },
             }
@@ -978,7 +1806,7 @@ def _show_predict_tab():
     # ── Запуск прогноза ───────────────────────────────────────────────────────
     if st.session_state.get("pred_running") and st.session_state.get("_pred_params"):
         params = st.session_state._pred_params
-        st.warning("⚠️ Идёт анализ протоколов — не переключайте раздел и не закрывайте вкладку")
+        st.warning("Идёт анализ протоколов — не переключайте раздел и не закрывайте вкладку")
         progress_bar  = st.progress(0.0, text="Запуск…")
         status_text   = st.empty()
 
@@ -986,12 +1814,13 @@ def _show_predict_tab():
             progress_bar.progress(min(pct, 0.99), text=msg)
             status_text.caption(msg)
 
-        with st.spinner("Анализирую протоколы регулятора…"):
+        with st.spinner("Анализирую протоколы и экспертные заключения…"):
             result = run_prediction(
                 article_name      = params["article"],
                 justification_text= params["justification"],
                 top_k             = params["top_k"],
                 filters           = params["filters"],
+                sources           = params.get("sources", ["expertise"]),
                 _progress_cb      = _progress,
             )
 
@@ -1033,10 +1862,30 @@ def _show_predict_tab():
         return
 
     agg  = result["aggregated"]
-    pos  = agg.get("positive", [])
-    neg  = agg.get("negative", [])
-    neu  = agg.get("neutral",  [])
+    pos  = list(agg.get("positive", []))
+    neg  = list(agg.get("negative", []))
+    neu  = list(agg.get("neutral",  []))
     total = agg.get("total_files", 0)
+
+    # ── Применяем ручные правки эксперта по спорным neutral-источникам ──────
+    # Хранится отдельно от result, чтобы не модифицировать исходные данные
+    # прогноза — override применяется только к отображению/подсчёту.
+    if "pred_expert_overrides" not in st.session_state:
+        st.session_state["pred_expert_overrides"] = {}
+    _overrides = st.session_state["pred_expert_overrides"]
+
+    if _overrides:
+        _still_neutral = []
+        for rec in neu:
+            _key = rec.get("file", "")
+            _override = _overrides.get(_key)
+            if _override == "positive":
+                pos.append(rec)
+            elif _override == "negative":
+                neg.append(rec)
+            else:
+                _still_neutral.append(rec)
+        neu = _still_neutral
 
     st.divider()
     st.subheader("Результаты")
@@ -1050,18 +1899,74 @@ def _show_predict_tab():
         f"Уникальных источников: {total} · Фрагментов в поиске: {result.get('chunks_raw', 0)}</span>",
         unsafe_allow_html=True,
     )
+    if result.get("chunks_dropped_budget"):
+        st.caption(
+            f"Контекст ограничен бюджетом {_RAG_CONTEXT_CHAR_BUDGET:,} символов — "
+            f"{result['chunks_dropped_budget']} наименее релевантных фрагментов "
+            f"не учитывались в анализе.".replace(",", " ")
+        )
     st.markdown("")
 
-    # Процентный вывод
-    if total > 0:
-        pct_pos = round(len(pos) / total * 100)
-        pct_neg = round(len(neg) / total * 100)
-        pct_neu = round(len(neu) / total * 100)
-        st.progress(len(pos) / total)
-        st.caption(
-            f"По аналогичным случаям в протоколах: "
-            f"одобрено — {pct_pos}%, отклонено — {pct_neg}%, нейтрально — {pct_neu}%"
+    # ── Итоговая взвешенная оценка ──────────────────────────────────────────
+    score = compute_approval_score(len(pos), len(neg), len(neu))
+
+    _conf_label = {"high": "Высокая", "medium": "Средняя", "low": "Низкая"}[score["confidence"]]
+    _conf_color = {"high": "#2e7a50", "medium": "#b8860b", "low": "#888"}[score["confidence"]]
+
+    if score["all_neutral"]:
+        st.info(
+            "Все найденные источники нейтральны — ни один не содержит явного "
+            "решения регулятора по схожей логике обоснования. Это говорит не "
+            "о шансах на одобрение или отказ, а о том, что РЭКи, вероятно, "
+            "ещё не сталкивались именно с такой комбинацией статьи затрат и "
+            "обоснования. Показан нейтральный результат 50% с низкой "
+            "уверенностью."
         )
+
+    sc1, sc2 = st.columns([2, 1])
+    with sc1:
+        st.markdown(
+            f"<div style='font-size:2.2rem;font-weight:700;color:#1a1a1a'>"
+            f"{score['approval_pct']:.0f}% <span style='font-size:1rem;font-weight:400;color:#666'>"
+            f"вероятность одобрения</span></div>",
+            unsafe_allow_html=True,
+        )
+    with sc2:
+        st.markdown(
+            f"<div style='text-align:right'>"
+            f"<span style='display:inline-block;padding:4px 14px;border-radius:14px;"
+            f"background:{_conf_color};color:#fff;font-weight:600;font-size:0.85rem'>"
+            f"Уверенность: {_conf_label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.progress(score["approval_pct"] / 100)
+
+    with st.expander("Как считается эта оценка"):
+        st.markdown(
+            f"""
+**Методология расчёта:**
+
+1. Учитываются только содержательные источники — **{score['n_positive']} «за»** и
+   **{score['n_negative']} «против»**. Нейтральные источники ({score['n_neutral']})
+   в сам процент не входят: они не содержат решения регулятора по той же
+   логике, что заявляет пользователь, и не должны размывать оценку.
+2. «Против» весит сильнее «за» — в **{_NEGATIVE_WEIGHT}×**. Это сознательный
+   перекос в сторону осторожности: ошибочно успокоить заявителя в случае
+   риска отказа дороже, чем ошибочно насторожить при реальных шансах на
+   одобрение.
+3. Формула: `за / (за + против × {_NEGATIVE_WEIGHT}) × 100%`.
+4. Если содержательных источников нет вообще (все найденные — нейтральны),
+   показывается 50% с пометкой «низкая уверенность» — это не означает
+   нейтральный шанс, а означает отсутствие данных по такой комбинации
+   статьи и обоснования.
+5. **Уверенность** оценки зависит от числа содержательных источников:
+   {_HIGH_CONFIDENCE_THRESHOLD}+ — высокая, 1–{_HIGH_CONFIDENCE_THRESHOLD - 1} — средняя,
+   0 — низкая.
+            """
+        )
+
+    st.markdown("")
 
     st.divider()
 

@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import re
 from datetime import datetime
 import traceback
 
@@ -237,11 +238,156 @@ def load_chunking_settings() -> dict:
             pass
     return {}
 
+# =============================================================================
+# Чанкер для структурированных протоколов (формат Protocol Processor с ###)
+# ──────────────────────────────────────────────────────────────────────────
+# Контракт с app.py / _TARIFF_SECTIONS: пересказ протокола размечен
+# markdown-заголовками двух видов:
+#   ### <N> <НАЗВАНИЕ ЗАГЛАВНЫМИ>                         — раздел (1-12)
+#   ### <N>.<M> "<Название статьи из документа>" [tag: x] — статья затрат
+# Один заголовок = один чанк (заголовок + текст до следующего заголовка).
+# Если меняешь формат маркеров в app.py — обнови regex здесь синхронно.
+# =============================================================================
+
+_RE_PROTOCOL_SECTION = re.compile(r'^### (\d+) ([А-ЯЁ][^\n]*)$', re.MULTILINE)
+_RE_PROTOCOL_ARTICLE = re.compile(
+    r'^### (\d+)\.(\d+) "([^"]+)"(?:\s*\[tag:\s*([a-zа-яё_]*)\])?\s*$',
+    re.MULTILINE,
+)
+
+
+def extract_pereskaz(full_text: str) -> str:
+    """
+    Вырезает из TXT-файла протокола только блок «ПОДРОБНЫЙ ПЕРЕСКАЗ»,
+    отбрасывая шапку «РЕКВИЗИТЫ ДОКУМЕНТА» и хвост «РАСПОЗНАННЫЙ ТЕКСТ
+    (OCR)». OCR сознательно не индексируется — см. обсуждение архитектуры
+    Прогнозиста: пересказ плотнее и информативнее сырого текста.
+    Если маркеры не найдены (нестандартный/старый файл) — возвращает текст
+    как есть, чтобы вызывающий код мог решить, что делать дальше.
+    """
+    start_marker = "ПОДРОБНЫЙ ПЕРЕСКАЗ"
+    end_marker = "РАСПОЗНАННЫЙ ТЕКСТ"
+    i_start = full_text.find(start_marker)
+    if i_start == -1:
+        return full_text
+    body_start = full_text.find("\n", i_start) + 1
+    body_start = full_text.find("\n", body_start) + 1  # пропускаем строку '---...'
+    i_end = full_text.find(end_marker)
+    if i_end == -1:
+        return full_text[body_start:].strip()
+    return full_text[body_start:i_end].strip()
+
+
+def _parse_protocol_pereskaz(text: str) -> list:
+    """
+    Парсит пересказ протокола (формат с маркерами ###) на смысловые блоки.
+
+    Возвращает список словарей в порядке появления в тексте:
+      {
+        "kind":         "section" | "article",
+        "section_num":  "5",                              # раздел 1-12
+        "article_num":  "5.2" | None,                      # для статей
+        "article_name": "Расходы на электроэнергию" | None, # из документа
+        "tag":          "электроэнергия" | None,            # справочный тег
+        "heading":      "### 5.2 \"...\" [tag: ...]",
+        "text":         "<заголовок>\n<тело до следующего ###>",
+      }
+    Пустой список — маркеры ### не найдены (старый формат или не протокол);
+    вызывающий код должен сделать fallback на другой режим чанкования.
+    """
+    headers = []
+    for m in _RE_PROTOCOL_ARTICLE.finditer(text):
+        headers.append({
+            "start":         m.start(),
+            "kind":          "article",
+            "section_num":   m.group(1),
+            "article_num":   f"{m.group(1)}.{m.group(2)}",
+            "article_name":  m.group(3).strip(),
+            "tag":           (m.group(4) or "").strip() or None,
+            "heading_line":  m.group(0).strip(),
+        })
+    for m in _RE_PROTOCOL_SECTION.finditer(text):
+        headers.append({
+            "start":         m.start(),
+            "kind":          "section",
+            "section_num":   m.group(1),
+            "article_num":   None,
+            "article_name":  None,
+            "tag":           None,
+            "heading_line":  m.group(0).strip(),
+        })
+    headers.sort(key=lambda h: h["start"])
+
+    blocks = []
+    for i, h in enumerate(headers):
+        block_start = h["start"]
+        block_end = headers[i + 1]["start"] if i + 1 < len(headers) else len(text)
+        block_text = text[block_start:block_end].strip()
+        blocks.append({
+            "kind":         h["kind"],
+            "section_num":  h["section_num"],
+            "article_num":  h["article_num"],
+            "article_name": h["article_name"],
+            "tag":          h["tag"],
+            "heading":      h["heading_line"],
+            "text":         block_text,
+        })
+    return blocks
+
+
+def chunk_protocol_articles(full_text: str, base_metadata: dict, settings: dict) -> list:
+    """
+    Режим чанкования 'protocol_articles' — один чанк на один раздел/статью
+    структурированного пересказа протокола (см. _parse_protocol_pereskaz).
+
+    base_metadata — словарь, который будет скопирован в metadata каждого
+    чанка с добавлением section/article_num/article_name/tag.
+    min_chunk_length из settings отфильтровывает вырожденные блоки.
+
+    Возвращает [] если в тексте нет маркеров ### — вызывающий код
+    (apply_chunking) должен в этом случае сделать fallback на 'structural'.
+    """
+    min_len = settings.get("min_chunk_length", 30)
+    pereskaz = extract_pereskaz(full_text)
+    blocks = _parse_protocol_pereskaz(pereskaz)
+
+    chunks = []
+    for b in blocks:
+        if len(b["text"]) < min_len:
+            continue
+        meta = dict(base_metadata)
+        meta.update({
+            "section":       b["section_num"],
+            "article_num":   b["article_num"] or "",
+            "article_name":  b["article_name"] or "",
+            "tag":           b["tag"] or "",
+            "block_kind":    b["kind"],
+        })
+        chunks.append({"text": b["text"], "metadata": meta})
+    return chunks
+
+
 def apply_chunking(text: str, base_metadata: dict, settings: dict, chunker) -> list:
     """Разбивает текст на чанки согласно настройкам режима"""
     mode = settings.get("chunking_mode", "structural")
     overlap = settings.get("chunk_overlap", 0)
     min_len = settings.get("min_chunk_length", 50)
+
+    # ── Режим -1: статьи структурированного протокола (формат ###) ──────────
+    # Используется только для коллекции protocols (Прогнозист решений).
+    # Один чанк = один раздел (1-12) или одна статья затрат (5.N/6.N/7.N).
+    # Если в тексте нет маркеров ### (старый формат файла, файл ещё не
+    # переобработан новым Protocol Processor) — мягкий fallback на
+    # 'structural', чтобы индексация не падала и не давала пустой результат.
+    if mode == "protocol_articles":
+        chunks = chunk_protocol_articles(text, base_metadata, settings)
+        if chunks:
+            if len(chunks) > MAX_CHUNKS_PER_FILE:
+                chunks = chunks[:MAX_CHUNKS_PER_FILE]
+            return chunks
+        print("[WARN] protocol_articles: маркеры ### не найдены, "
+              "fallback на structural")
+        mode = "structural"
 
     # ── Режим 0: юридический чанкер по пунктам НПА ──────────────────────────
     if mode == "legal" and chunker:
@@ -547,6 +693,8 @@ def index_file_to_collection(
           "region":       "Тамбовская область",
           "organization": "ООО «ТеплоСеть»",
           "date":         "2024-11-15",
+          "method":       "Индексация",   # метод тарифного регулирования
+          "year":         "2024",
       }
 
     Для коллекции «tariff_docs» (советчик) вызов эквивалентен index_file().
@@ -626,6 +774,16 @@ def index_file_to_collection(
                 "region":       _extra.get("region", ""),
                 "organization": _extra.get("organization", ""),
                 "date":         _extra.get("date", ""),
+                "method":       _extra.get("method", ""),
+                "year":         _extra.get("year", ""),
+                # Поля статьи затрат — заполняются только режимом
+                # 'protocol_articles' (см. chunk_protocol_articles),
+                # для остальных режимов будут пустыми строками.
+                "section":       chunk['metadata'].get('section', ''),
+                "article_num":   chunk['metadata'].get('article_num', ''),
+                "article_name":  chunk['metadata'].get('article_name', ''),
+                "tag":           chunk['metadata'].get('tag', ''),
+                "block_kind":    chunk['metadata'].get('block_kind', ''),
             }
             metadatas.append(chunk_meta)
 

@@ -19,7 +19,7 @@
     "doc_year": "(\\d{4})"
   },
   "chunking_settings": {
-    "chunking_mode": "fixed",
+    "chunking_mode": "legal",
     "separator": "&&",
     "fixed_chunk_length": 550,
     "min_chunk_length": 51,

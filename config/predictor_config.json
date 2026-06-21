@@ -1,7 +1,7 @@
 {
-  "chunk_chars_to_llm": 600,
+  "chunk_chars_to_llm": 1500,
   "justification_chars": 150,
-  "classify_max_tokens": 100,
+  "classify_max_tokens": 350,
   "default_top_k": 20,
   "disable_thinking": true
 }
