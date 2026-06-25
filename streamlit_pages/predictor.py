@@ -1259,7 +1259,7 @@ def _source_card(record: Dict, idx: int, decision: str) -> None:
         header += f"  ·  {_src_badge}"
 
     with st.expander(header, expanded=False):
-        # Скачивание и просмотр исходного txt-файла источника
+        # Просмотр исходного txt-файла источника (скачивание — внутри диалога)
         _fname = record.get("file", "")
         _doc_type = "expertise" if record.get("source") == "expertise" else "protocol"
         _src_fpath = os.path.join("data", "raw", f"{_doc_type}_docs", _fname)
@@ -1269,24 +1269,14 @@ def _source_card(record: Dict, idx: int, decision: str) -> None:
                     _file_bytes = _f.read()
                 _file_text = _file_bytes.decode("utf-8", errors="replace")
 
-                src_col1, src_col2 = st.columns(2)
-                with src_col1:
-                    st.download_button(
-                        "Скачать исходный файл",
-                        data=_file_bytes,
-                        file_name=_fname,
-                        mime="text/plain",
-                        key=f"dl_{decision}_{idx}_{_fname}",
-                        use_container_width=True,
-                    )
-                with src_col2:
-                    if st.button(
-                        "Просмотреть",
-                        key=f"preview_{decision}_{idx}_{_fname}",
-                        use_container_width=True,
-                    ):
-                        st.session_state["_preview_file"] = {"name": _fname, "text": _file_text}
-                        st.rerun()
+                if st.button(
+                    "Просмотреть",
+                    key=f"preview_{decision}_{idx}_{_fname}",
+                ):
+                    st.session_state["_preview_file"] = {
+                        "name": _fname, "text": _file_text, "bytes": _file_bytes,
+                    }
+                    st.rerun()
             except Exception:
                 pass
             st.markdown("")
@@ -1467,6 +1457,14 @@ def _show_file_preview_dialog():
     """
     Показывает содержимое исходного txt-файла во всплывающем окне, если
     пользователь нажал «Просмотреть» на одной из карточек источников.
+
+    Поиск реализован как самодостаточный HTML/JS-компонент (через
+    st.components.v1.html): JS сам подсвечивает совпадения и прокручивает
+    к активному при нажатии «Далее»/«Назад» — это единственный способ
+    физически проскроллить к найденному фрагменту, чистый Streamlit
+    скроллом управлять не может. Сам текст экранируется от HTML-инъекций
+    перед вставкой (документы пользовательские, могут случайно содержать
+    символы вроде "<").
     """
     preview = st.session_state.get("_preview_file")
     if not preview:
@@ -1474,16 +1472,134 @@ def _show_file_preview_dialog():
 
     @st.dialog(preview["name"], width="large")
     def _dialog():
-        st.text_area(
-            "Содержимое файла",
-            value=preview["text"],
-            height=500,
-            disabled=True,
-            label_visibility="collapsed",
-        )
-        if st.button("Закрыть", use_container_width=True):
-            st.session_state.pop("_preview_file", None)
-            st.rerun()
+        import html as _html
+        import streamlit.components.v1 as components
+
+        full_text = preview["text"]
+        escaped_text = _html.escape(full_text)
+        text_for_js = json.dumps(escaped_text.replace("\n", "<br>"))
+
+        html_block = f"""
+        <div style="font-family: -apple-system, sans-serif;">
+          <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+            <input id="pv-search" type="text" placeholder="Поиск по тексту…"
+                   style="flex:1; padding:8px 10px; border:1px solid #ccc;
+                          border-radius:6px; font-size:0.9rem;" />
+            <button id="pv-prev" style="padding:8px 12px; border:1px solid #ccc;
+                    border-radius:6px; background:#f5f5f5; cursor:pointer;">‹ Назад</button>
+            <button id="pv-next" style="padding:8px 12px; border:1px solid #ccc;
+                    border-radius:6px; background:#f5f5f5; cursor:pointer;">Далее ›</button>
+          </div>
+          <div id="pv-count" style="color:#666; font-size:0.82rem; margin-bottom:6px;"></div>
+          <div id="pv-content" style="height:460px; overflow-y:auto; padding:12px;
+               border:1px solid #ddd; border-radius:6px; font-family:monospace;
+               font-size:0.85rem; white-space:pre-wrap; line-height:1.5;"></div>
+        </div>
+        <script>
+          const rawHtml = {text_for_js};
+          const contentEl = document.getElementById('pv-content');
+          const searchEl = document.getElementById('pv-search');
+          const countEl = document.getElementById('pv-count');
+          const prevBtn = document.getElementById('pv-prev');
+          const nextBtn = document.getElementById('pv-next');
+
+          contentEl.innerHTML = rawHtml;
+          let matches = [];
+          let activeIndex = -1;
+
+          function escapeRegExp(s) {{
+            return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+          }}
+
+          function runSearch() {{
+            const query = searchEl.value.trim();
+            contentEl.innerHTML = rawHtml;
+            matches = [];
+            activeIndex = -1;
+
+            if (!query) {{
+              countEl.textContent = '';
+              return;
+            }}
+
+            const re = new RegExp(escapeRegExp(query), 'gi');
+            const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT, null);
+            const textNodes = [];
+            let node;
+            while (node = walker.nextNode()) {{ textNodes.push(node); }}
+
+            textNodes.forEach(function(textNode) {{
+              const text = textNode.nodeValue;
+              let lastIndex = 0;
+              let m;
+              re.lastIndex = 0;
+              const frag = document.createDocumentFragment();
+              let found = false;
+              while ((m = re.exec(text)) !== null) {{
+                found = true;
+                frag.appendChild(document.createTextNode(text.slice(lastIndex, m.index)));
+                const mark = document.createElement('mark');
+                mark.style.background = '#fff3a0';
+                mark.textContent = m[0];
+                frag.appendChild(mark);
+                matches.push(mark);
+                lastIndex = m.index + m[0].length;
+                if (m.index === re.lastIndex) re.lastIndex++;
+              }}
+              if (found) {{
+                frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+                textNode.parentNode.replaceChild(frag, textNode);
+              }}
+            }});
+
+            countEl.textContent = matches.length
+              ? ('Найдено совпадений: ' + matches.length)
+              : 'Совпадений не найдено';
+
+            if (matches.length) {{
+              activeIndex = 0;
+              highlightActive();
+            }}
+          }}
+
+          function highlightActive() {{
+            matches.forEach(function(m, i) {{
+              m.style.background = (i === activeIndex) ? '#ffa500' : '#fff3a0';
+            }});
+            if (matches[activeIndex]) {{
+              matches[activeIndex].scrollIntoView({{ block: 'center', behavior: 'smooth' }});
+              countEl.textContent = 'Совпадение ' + (activeIndex + 1) + ' из ' + matches.length;
+            }}
+          }}
+
+          searchEl.addEventListener('input', runSearch);
+          nextBtn.addEventListener('click', function() {{
+            if (!matches.length) return;
+            activeIndex = (activeIndex + 1) % matches.length;
+            highlightActive();
+          }});
+          prevBtn.addEventListener('click', function() {{
+            if (!matches.length) return;
+            activeIndex = (activeIndex - 1 + matches.length) % matches.length;
+            highlightActive();
+          }});
+        </script>
+        """
+        components.html(html_block, height=560, scrolling=False)
+
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            st.download_button(
+                "Скачать",
+                data=preview.get("bytes", full_text.encode("utf-8")),
+                file_name=preview["name"],
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with dc2:
+            if st.button("Закрыть", use_container_width=True):
+                st.session_state.pop("_preview_file", None)
+                st.rerun()
 
     _dialog()
 

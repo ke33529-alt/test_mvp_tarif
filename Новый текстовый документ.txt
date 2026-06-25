@@ -83,3 +83,8 @@ git commit -m "fix: анализатор новая логика"
 
 # 3. Отправить изменения на GitHub
 git push origin main
+
+
+
+
+python -m streamlit run app.py
