@@ -60,6 +60,32 @@ def load_summary_file(original_path: str) -> str:
             return f.read()
     return ""
 
+def _focus_path(original_path: str) -> str:
+    """Путь к txt-файлу фокуса рядом с оригиналом."""
+    if not original_path:
+        return ""
+    base = os.path.splitext(original_path)[0]
+    return base + "_фокус.txt"
+
+def save_focus_file(original_path: str, focus: str):
+    """Сохраняет фокус внимания рядом с оригиналом. Удаляет файл если фокус пуст."""
+    path = _focus_path(original_path)
+    if not path:
+        return
+    if focus and focus.strip():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(focus.strip())
+    elif os.path.exists(path):
+        os.remove(path)
+
+def load_focus_file(original_path: str) -> str:
+    """Читает фокус из txt, возвращает пустую строку если нет."""
+    path = _focus_path(original_path)
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
+
 def load_db() -> Dict:
     _ensure_dir()
     if os.path.exists(_DB_PATH):
@@ -125,13 +151,24 @@ def _ocr_image(image) -> str:
     """
     Распознаёт текст из PIL Image.
     Стратегия: EasyOCR → Tesseract → пустая строка.
+
+    _easyocr_lock здесь сериализует сам вызов readtext() — раньше
+    блокировка была только вокруг создания Reader() в _init_ocr(),
+    но не вокруг инференса. При одновременном использовании Сканера
+    несколькими пользователями это означало, что параллельные запросы
+    могли одновременно обращаться к одному и тому же объекту Reader
+    без всякой сериализации — вероятная причина нестабильности и тихих
+    сбоев без явных исключений под нагрузкой нескольких пользователей.
+    Модель остаётся резидентной в VRAM постоянно после первой загрузки —
+    выгрузка намеренно не делается.
     """
     # EasyOCR
     if _EASYOCR_AVAILABLE and _easyocr_reader is not None:
         try:
             import numpy as np
             img_array = np.array(image.convert("RGB"))
-            result = _easyocr_reader.readtext(img_array, detail=0, paragraph=True)
+            with _easyocr_lock:
+                result = _easyocr_reader.readtext(img_array, detail=0, paragraph=True)
             return "\n".join(result)
         except Exception as e:
             print(f"[OCR] EasyOCR ошибка: {e}")
@@ -437,11 +474,20 @@ def search_documents(db: Dict, query: str,
 # =============================================================================
 
 # Порог (символов): документы длиннее этого значения обрабатываются чанками
-_LARGE_DOC_THRESHOLD = 12_000
-# Размер одного чанка (символов) — ~1500 токенов, комфортно для 8B модели
-_CHUNK_SIZE          = 6_000
+_LARGE_DOC_THRESHOLD = 8_000
+# Размер одного чанка (символов) — ~1600 токенов, вписывается в 23552 n_ctx
+_CHUNK_SIZE          = 4_000
+# Жёсткий потолок чанка перед отправкой в LLM (страховка от переполнения)
+_CHUNK_HARD_LIMIT    = 4_500
 # Перекрытие между чанками — модель не теряет контекст на стыке частей
-_CHUNK_OVERLAP       = 300
+_CHUNK_OVERLAP       = 200
+# Жёсткий лимит на входной текст (символов) — защита от зависания на огромных файлах
+_MAX_TEXT_CHARS      = 2_000_000
+# При > этого числа чанков REDUCE становится двухуровневым
+# 60 × 310 токенов/резюме = 18 600 токенов — уже тесно в 23 552 n_ctx
+_REDUCE_L2_THRESHOLD = 60
+# Размер группы для промежуточного REDUCE-1 (токенов: 20 × 310 = 6 200)
+_REDUCE_GROUP_SIZE   = 20
 
 
 def _safe_print(msg: str):
@@ -476,6 +522,71 @@ def _load_lm_config() -> tuple:
     lm_url = config.get("lm_studio_url", "http://127.0.0.1:1234/v1")
     model  = config.get("default_model", "qwen/qwen3.5-9b")
     return lm_url, model
+
+
+def _load_lm_full_config() -> dict:
+    """Возвращает полный конфиг advisor_config.json (нужен для нативного Ollama API)."""
+    config_path = os.path.join("config", "advisor_config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _is_ollama_backend(cfg: dict) -> bool:
+    return cfg.get("llm_backend", "ollama") == "ollama"
+
+
+def _ollama_native_base_url(lm_url: str) -> str:
+    """Базовый URL Ollama БЕЗ суффикса /v1 — для нативного /api/chat."""
+    url = (lm_url or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def _ollama_chat_native(lm_url: str, model: str, system: str, user: str,
+                        max_tokens: int, cfg: dict, timeout: float = 180.0) -> dict:
+    """
+    Нестриминговый вызов нативного Ollama /api/chat с think:false.
+
+    ВАЖНО: параметр "think": false здесь — единственный надёжный способ
+    отключить режим рассуждения Qwen3.5. Передача этого через extra_body
+    в OpenAI-совместимый /v1/chat/completions (как было раньше) ненадёжна —
+    см. github.com/ollama/ollama/issues/14809 и core/advisor.py. Именно из-за
+    этого суммаризация документов не работала: модель уходила в незакрытый
+    <think>-блок и весь max_tokens тратился на рассуждения, а не на пересказ.
+    """
+    import requests
+    url = _ollama_native_base_url(lm_url) + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature":    0.3,
+            "num_predict":    max_tokens,
+            "num_ctx":        cfg.get("num_ctx", 20000),
+            "top_p":          cfg.get("top_p", 0.9),
+            "top_k":          cfg.get("top_k", 40),
+            "repeat_penalty": cfg.get("repeat_penalty", 1.1),
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data.get("message") or {}
+    return {
+        "content": msg.get("content", ""),
+        "done_reason": data.get("done_reason", "stop"),
+    }
 
 
 def _split_text_chunks(text: str, chunk_size: int = _CHUNK_SIZE,
@@ -521,25 +632,47 @@ def _split_text_chunks(text: str, chunk_size: int = _CHUNK_SIZE,
     return chunks
 
 
-def _lm_call(client, model: str, system: str, user: str, max_tokens: int) -> str:
-    """Один вызов LM Studio; возвращает текст ответа или строку с ошибкой."""
+def _lm_call(client, model: str, system: str, user: str, max_tokens: int,
+            lm_url: str = None, cfg: dict = None) -> str:
+    """
+    Один вызов LLM; возвращает текст ответа или строку с ошибкой.
+
+    Для Ollama (llm_backend="ollama" в config/advisor_config.json, по умолчанию)
+    используется нативный /api/chat с think:false — единственный надёжный способ
+    отключить режим «размышления» Qwen3.5. Старый подход через extra_body/
+    chat_template_kwargs на OpenAI-совместимом /v1/chat/completions не отключал
+    thinking надёжно (issue ollama/ollama#14809) — модель уходила в незакрытый
+    <think>-блок, съедая весь max_tokens, и пересказ обрывался до вывода текста.
+    OpenAI-клиент остаётся как fallback, если когда-нибудь вернётесь на LM Studio
+    ("llm_backend": "lm_studio" в конфиге).
+    """
+    cfg = cfg or {}
+    use_native = _is_ollama_backend(cfg) and bool(lm_url)
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
+        if use_native:
+            result = _ollama_chat_native(lm_url, model, system, user, max_tokens, cfg)
+            raw = (result.get("content") or "").strip()
+        else:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user + " /no_think"},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3,
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "cache_prompt": False,
+                },
+            )
+            raw = (resp.choices[0].message.content or "").strip()
         return _strip_thinking(raw)
     except Exception as e:
         return f"[Ошибка LM: {e}]"
 
 
-def summarize_document(text: str, length: str = "средний", model: str = None, _progress_cb=None) -> str:
+def summarize_document(text: str, length: str = "средний", model: str = None, _progress_cb=None, focus: str = "") -> str:
     """
     Пересказывает текст через LM Studio.
 
@@ -551,15 +684,17 @@ def summarize_document(text: str, length: str = "средний", model: str = N
     """
     # length может быть строкой-ключом ИЛИ числом слов (int/str с цифрой)
     # Строковые ключи → фиксированные пресеты
+    # max_tokens = целевой объём × 1.5 (1 рус.слово ≈ 1.5 токена) + 15% запас
+    # Thinking-режим отключён в _lm_call → все токены идут на полезный вывод
     _PRESETS = {
-        "1 страница":  (500,  "примерно на 1 страницу (~250 слов). Только самое главное"),
-        "2 страницы":  (1000, "примерно на 2 страницы (~500 слов). Ключевые факты и детали"),
-        "5 страниц":   (2500, "примерно на 5 страниц (~1250 слов). Подробно, все важные пункты"),
-        "10 страниц":  (5000, "примерно на 10 страниц (~2500 слов). Максимально подробно"),
+        "1 страница":  (450,  "примерно на 1 страницу (~250 слов). Только самое главное"),
+        "2 страницы":  (900,  "примерно на 2 страницы (~500 слов). Ключевые факты и детали"),
+        "5 страниц":   (2200, "примерно на 5 страниц (~1250 слов). Подробно, все важные пункты"),
+        "10 страниц":  (4500, "примерно на 10 страниц (~2500 слов). Максимально подробно"),
         # Обратная совместимость со старыми ключами
-        "краткий":     (400,  "кратко, в 3-5 предложениях, только главное"),
-        "средний":     (1000, "в 1-2 абзацах с ключевыми деталями (~500 слов)"),
-        "подробный":   (2500, "подробно, с перечислением всех важных пунктов (~1000 слов)"),
+        "краткий":     (350,  "кратко, в 3-5 предложениях, только главное"),
+        "средний":     (900,  "в 1-2 абзацах с ключевыми деталями (~500 слов)"),
+        "подробный":   (2200, "подробно, с перечислением всех важных пунктов (~1000 слов)"),
     }
     # Числовой режим: length == "NNN слов" или int
     _word_target = None
@@ -569,29 +704,46 @@ def summarize_document(text: str, length: str = "средний", model: str = N
         pass
 
     if _word_target:
-        # ~1.5 токена на слово для русского текста
-        max_tokens  = int(_word_target * 1.7)
+        # ~1.5 токена на слово для русского текста + 10% запас
+        # Thinking отключён → все токены идут на полезный вывод
+        max_tokens  = int(_word_target * 1.65)
         instruction = f"ровно примерно {_word_target} слов. Следи за объёмом"
     else:
         max_tokens, instruction = _PRESETS.get(length, _PRESETS["2 страницы"])
 
 
+    # Жёсткий лимит: обрезаем текст и сообщаем об усечении
+    if len(text) > _MAX_TEXT_CHARS:
+        _safe_print(
+            f"[SUMMARIZE] текст усечён: {len(text):,} → {_MAX_TEXT_CHARS:,} симв "
+            f"(~{len(text)//_MAX_TEXT_CHARS+1}x превышение лимита)"
+        )
+        text = text[:_MAX_TEXT_CHARS]
+
     try:
         from openai import OpenAI
         lm_url, default_model = _load_lm_config()
-        model  = model or default_model
-        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=180.0)
+        model    = model or default_model
+        _lm_cfg  = _load_lm_full_config()   # для нативного Ollama API (num_ctx, llm_backend и т.д.)
+        # timeout=600: для пресета «10 страниц» (5000 токенов) при скорости
+        # ~30 токенов/сек нужно ~167 сек только на вывод; 600 с запасом
+        client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=600.0)
 
         system_msg = "Ты помощник для анализа документов. Отвечаешь кратко и по делу на русском языке."
 
         # ── Короткий документ: один запрос ───────────────────────────────
         if len(text) <= _LARGE_DOC_THRESHOLD:
+            _focus_clause = (
+                f"\nОбрати особое внимание на следующее: {focus.strip()}\n"
+                if focus and focus.strip() else ""
+            )
             prompt = (
                 f"Перескажи содержание документа {instruction}. "
-                f"Отвечай на русском языке, без лишних вступлений.\n\n"
-                f"ДОКУМЕНТ:\n{text}"
+                f"Отвечай на русском языке, без лишних вступлений.\n"
+                f"{_focus_clause}"
+                f"\nДОКУМЕНТ:\n{text}"
             )
-            result = _lm_call(client, model, system_msg, prompt, max_tokens)
+            result = _lm_call(client, model, system_msg, prompt, max_tokens, lm_url=lm_url, cfg=_lm_cfg)
             return result
 
         # ── Большой документ: Map-Reduce ─────────────────────────────────
@@ -622,14 +774,21 @@ def summarize_document(text: str, length: str = "средний", model: str = N
                 _pct = (i - 1) / (total + 1)
                 _progress_cb(_pct, f"MAP — часть {i} / {total} | прошло: {elapsed_fmt} | {eta_str}")
 
+            _focus_map = (
+                f"Особо обращай внимание на: {focus.strip()}\n"
+                if focus and focus.strip() else ""
+            )
+            # Жёсткий обрезатель: страховка от переполнения n_ctx
+            _chunk_safe = chunk[:_CHUNK_HARD_LIMIT]
             map_prompt = (
                 f"Это часть {i} из {total} одного документа.\n"
                 f"Сделай краткое резюме этой части (3-5 пунктов), "
                 f"сохрани все факты, цифры, даты, названия.\n"
+                f"{_focus_map}"
                 f"Отвечай на русском, без вступлений.\n\n"
-                f"ЧАСТЬ ДОКУМЕНТА:\n{chunk}"
+                f"ЧАСТЬ ДОКУМЕНТА:\n{_chunk_safe}"
             )
-            mini = _lm_call(client, model, system_msg, map_prompt, 400)
+            mini = _lm_call(client, model, system_msg, map_prompt, 300, lm_url=lm_url, cfg=_lm_cfg)
 
             chunk_done = time.perf_counter()
             chunk_times.append(chunk_done - t_chunk)
@@ -641,23 +800,84 @@ def summarize_document(text: str, length: str = "средний", model: str = N
             mini_summaries.append(f"=== Часть {i}/{total} ===\n{mini}")
             _safe_print(f"[MAP] chunk {i}/{total} done ({len(mini)} chars, {chunk_times[-1]:.1f}s)")
 
-        # REDUCE: финальный синтез
+        # ── REDUCE ───────────────────────────────────────────────────────────
         elapsed_map = time.perf_counter() - t_start
         elapsed_fmt = f"{int(elapsed_map // 60)}м {int(elapsed_map % 60)}с"
-        _safe_print(f"[MAP-REDUCE] REDUCE start, map took {elapsed_fmt}")
-        if _progress_cb:
-            _progress_cb(total / (total + 1), f"REDUCE — финальный синтез {total} частей | MAP: {elapsed_fmt}")
+        _safe_print(f"[MAP-REDUCE] REDUCE start ({total} частей), map took {elapsed_fmt}")
 
-        combined = "\n\n".join(mini_summaries)
-        reduce_prompt = (
-            f"Ниже — резюме отдельных частей одного документа. "
-            f"Создай единый итоговый пересказ {instruction}.\n"
-            f"Объедини все части, устрани дублирование, сохрани все ключевые факты, "
-            f"цифры, даты, названия документов.\n"
-            f"Отвечай на русском, без вступлений и мета-комментариев.\n\n"
-            f"РЕЗЮМЕ ЧАСТЕЙ:\n{combined}"
+        _focus_reduce = (
+            f"Особо выдели и подробно раскрой в итоговом пересказе: {focus.strip()}\n"
+            if focus and focus.strip() else ""
         )
-        result = _lm_call(client, model, system_msg, reduce_prompt, max_tokens)
+
+        def _reduce_call(summaries: list, out_tokens: int, label: str) -> str:
+            """Один REDUCE-вызов: список мини-резюме → единый текст."""
+            combined = "\n\n".join(summaries)
+            prompt = (
+                f"Ниже — резюме отдельных частей одного документа. "
+                f"Создай единый связный пересказ.\n"
+                f"Объедини все части, устрани дублирование, сохрани все ключевые факты, "
+                f"цифры, даты, названия документов.\n"
+                f"{_focus_reduce}"
+                f"Отвечай на русском, без вступлений и мета-комментариев.\n\n"
+                f"РЕЗЮМЕ ЧАСТЕЙ:\n{combined}"
+            )
+            _safe_print(f"[{label}] {len(summaries)} резюме → {len(combined)} симв")
+            return _lm_call(client, model, system_msg, prompt, out_tokens, lm_url=lm_url, cfg=_lm_cfg)
+
+        def _final_reduce_call(summaries: list) -> str:
+            """Финальный REDUCE: добавляет instruction об объёме."""
+            combined = "\n\n".join(summaries)
+            prompt = (
+                f"Ниже — резюме отдельных частей одного документа. "
+                f"Создай единый итоговый пересказ {instruction}.\n"
+                f"Объедини все части, устрани дублирование, сохрани все ключевые факты, "
+                f"цифры, даты, названия документов.\n"
+                f"{_focus_reduce}"
+                f"Отвечай на русском, без вступлений и мета-комментариев.\n\n"
+                f"РЕЗЮМЕ ЧАСТЕЙ:\n{combined}"
+            )
+            _safe_print(f"[REDUCE-FINAL] {len(summaries)} резюме → {len(combined)} симв")
+            return _lm_call(client, model, system_msg, prompt, max_tokens, lm_url=lm_url, cfg=_lm_cfg)
+
+        if total <= _REDUCE_L2_THRESHOLD:
+            # ── Одноуровневый REDUCE (документ до ~240 страниц) ──────────────
+            if _progress_cb:
+                _progress_cb(
+                    total / (total + 1),
+                    f"REDUCE — финальный синтез {total} частей | MAP: {elapsed_fmt}"
+                )
+            result = _final_reduce_call(mini_summaries)
+        else:
+            # ── Двухуровневый REDUCE (документ от ~240 страниц) ──────────────
+            # REDUCE-1: группируем мини-резюме по _REDUCE_GROUP_SIZE
+            groups = [
+                mini_summaries[i: i + _REDUCE_GROUP_SIZE]
+                for i in range(0, total, _REDUCE_GROUP_SIZE)
+            ]
+            n_groups = len(groups)
+            _safe_print(f"[MAP-REDUCE] двухуровневый REDUCE: {total} → {n_groups} групп по {_REDUCE_GROUP_SIZE}")
+            mid_summaries = []
+            for gi, grp in enumerate(groups, 1):
+                if _progress_cb:
+                    _pct = (total + gi - 1) / (total + n_groups + 1)
+                    _progress_cb(
+                        _pct,
+                        f"REDUCE-1 — группа {gi}/{n_groups} | MAP: {elapsed_fmt}"
+                    )
+                mid = _reduce_call(grp, 500, f"REDUCE-1 группа {gi}/{n_groups}")
+                if mid.startswith("[Ошибка"):
+                    _safe_print(f"[REDUCE-1] группа {gi} error: {mid}")
+                    mid = f"[Группа {gi}: данные недоступны]"
+                mid_summaries.append(f"=== Блок {gi}/{n_groups} ===\n{mid}")
+
+            # REDUCE-2: финальный синтез из промежуточных резюме
+            if _progress_cb:
+                _progress_cb(
+                    (total + n_groups) / (total + n_groups + 1),
+                    f"REDUCE-2 — финальный синтез {n_groups} блоков"
+                )
+            result = _final_reduce_call(mid_summaries)
 
         total_fmt = f"{int((time.perf_counter()-t_start)//60)}м {int((time.perf_counter()-t_start)%60)}с"
         _safe_print(f"[MAP-REDUCE] done in {total_fmt}. result: {len(result)} chars")
@@ -721,9 +941,116 @@ def export_docx(doc: Dict, summary: str = None) -> io.BytesIO:
 
 
 # =============================================================================
+# Переход по ссылке из «Задач» — самостоятельный экран одного документа
+#
+# Раздел «Задачи» может привязать к завершённой задаче конкретный документ
+# из этого реестра (core/entity_picker.py, source="scanner"). Клик по такой
+# ссылке кладёт id документа в session_state["_scan_jump_doc_id"] и
+# переключает main_choice на «Сканер документов». show_doc_scanner()
+# проверяет этот флаг ДО инициализации OCR (открыть уже готовый документ
+# не требует прогрева EasyOCR) и, если документ найден, показывает ТОЛЬКО
+# его — по той же схеме, что и запись Советчика в advisor_page.py.
+#
+# Флаг читается через get(), не через pop(): Streamlit иногда выполняет
+# скрипт дважды подряд без участия пользователя — при одноразовом pop()
+# второй, никем не инициированный прогон видел бы уже пустой флаг и
+# откатывался на обычный интерфейс сам по себе. Флаг живёт в session_state,
+# пока пользователь явно не нажмёт «Назад к задачам».
+# =============================================================================
+def _render_jumped_document(doc: Dict):
+    st.markdown(
+        '<span style="background:#1B5C74;color:#fff;padding:3px 10px;'
+        'border-radius:10px;font-size:0.75rem;font-weight:600">'
+        '🔗 Документ, связанный с задачей</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+    _pc = doc.get("page_count") or len(doc.get("pages", []))
+    _wc = doc.get("word_count", 0)
+    _orig = doc.get("original_path", "")
+    _summary = load_summary_file(_orig)
+
+    with st.container(border=True):
+        st.markdown(f"### {_fname(doc)}")
+        st.caption(
+            f"{_pc} стр. · {_wc:,} слов · OCR-страниц: {doc.get('ocr_pages', 0)} · "
+            f"обработан {(doc.get('processed_at') or '')[:16].replace('T', ' ')}"
+        )
+
+        if _summary:
+            st.divider()
+            st.markdown("**Пересказ**")
+            st.markdown(_summary)
+
+        st.divider()
+        st.markdown("**Текст документа**")
+        _full_text = doc.get("full_text", "")
+        _preview = _full_text[:4000]
+        _truncated = len(_full_text) > len(_preview)
+        st.markdown(
+            f"<div style='font-size:0.87em;line-height:1.55;"
+            f"background:#f8f9fa;border:1px solid #e0e0e0;"
+            f"border-radius:6px;padding:12px 14px;"
+            f"max-height:320px;overflow-y:auto;"
+            f"white-space:pre-wrap;word-break:break-word;'>"
+            f"{_preview.replace('<', '&lt;').replace('>', '&gt;')}"
+            f"{'…' if _truncated else ''}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        if _truncated:
+            st.caption("Показаны первые ~4000 символов. Полный текст — в скачиваемом файле ниже.")
+
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "Скачать TXT", data=export_txt(doc),
+            file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.txt",
+            mime="text/plain", key="_scan_jumped_dl_txt", use_container_width=True,
+        )
+    with dl2:
+        try:
+            _docx_buf = export_docx(doc, summary=_summary or None)
+            st.download_button(
+                "Скачать DOCX", data=_docx_buf,
+                file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="_scan_jumped_dl_docx", use_container_width=True,
+            )
+        except Exception:
+            pass
+
+    st.divider()
+    if st.button("← Назад к задачам", key="_scan_jumped_back", type="primary"):
+        st.session_state.pop("_scan_jump_doc_id", None)
+        st.session_state["main_choice"]  = "Задачи"
+        st.session_state["show_landing"] = False
+        st.rerun()
+
+
+# =============================================================================
 # UI — главная страница сканера
 # =============================================================================
 def show_doc_scanner():
+    # Переход по ссылке из «Задач» — см. докстринг _render_jumped_document выше.
+    _jump_doc_id = st.session_state.get("_scan_jump_doc_id")
+    if _jump_doc_id:
+        if "scanner_db" not in st.session_state:
+            st.session_state["scanner_db"] = load_db()
+        _db = st.session_state["scanner_db"]
+        _jump_doc = next((d for d in _db.get("documents", []) if d.get("id") == _jump_doc_id), None)
+        if _jump_doc:
+            _render_jumped_document(_jump_doc)
+        else:
+            st.warning("Документ, на который ссылалась задача, не найден — возможно, был удалён.")
+            if st.button("← Назад к задачам", key="_scan_jumped_back_missing", type="primary"):
+                st.session_state.pop("_scan_jump_doc_id", None)
+                st.session_state["main_choice"]  = "Задачи"
+                st.session_state["show_landing"] = False
+                st.rerun()
+        return
+
     st.header("Сканер документов")
     st.caption("PDF · DOCX · DOC · XLSX · JPG · PNG — распознавание, пересказ, поиск")
 
@@ -825,13 +1152,19 @@ def show_doc_scanner():
                 if d["id"] in last_ids and d["id"] not in _seen
                 and not _seen.add(d["id"])
             ]
-            # Восстанавливаем пересказы из файлов в session_state
+            # Восстанавливаем пересказы и фокус из файлов в session_state
             for _ld in last_docs:
                 _sk = f"summary_{_ld['id']}"
+                _fk = f"sum_focus_{_ld['id']}"
+                _op = _ld.get("original_path", "")
                 if _sk not in st.session_state:
-                    _loaded = load_summary_file(_ld.get("original_path", ""))
+                    _loaded = load_summary_file(_op)
                     if _loaded:
                         st.session_state[_sk] = _loaded
+                if _fk not in st.session_state:
+                    _foc = load_focus_file(_op)
+                    if _foc:
+                        st.session_state[_fk] = _foc
 
 
             # ── Список документов ─────────────────────────────────────────
@@ -952,6 +1285,16 @@ def show_doc_scanner():
             else:
                 summary_length = sum_mode
 
+            _focus_key = f"sum_focus_{doc['id']}"
+            _sum_focus = st.text_area(
+                "Фокус внимания при пересказе",
+                value=st.session_state.get(_focus_key, ""),
+                placeholder="Например: расходы на оплату труда, арендные платежи, НДС — ИИ уделит этому особое внимание",
+                height=68,
+                key=_focus_key,
+                help="Необязательно. Если заполнить — ИИ акцентирует пересказ на указанных аспектах.",
+            )
+
             _already_has = bool(st.session_state.get(summary_key))
 
             _bL, _bC, _bR = st.columns([2, 3, 2])
@@ -986,7 +1329,7 @@ def show_doc_scanner():
 
                 st.warning("⚠️ Идёт генерация пересказа — не переключайте раздел и не закрывайте вкладку")
                 with st.spinner("🤖 Генерирую пересказ..."):
-                    _gresult = summarize_document(_gft, summary_length, _progress_cb=_gcb)
+                    _gresult = summarize_document(_gft, summary_length, _progress_cb=_gcb, focus=st.session_state.get(_focus_key, ""))
 
                 _gprog.empty()
                 _gcap.empty()
@@ -997,6 +1340,7 @@ def show_doc_scanner():
                 _orig_p = doc.get("original_path", "")
                 if _orig_p:
                     save_summary_file(_orig_p, _gresult)
+                    save_focus_file(_orig_p, st.session_state.get(_focus_key, ""))
                 # Нет st.rerun() — результат показывается сразу ниже
 
             # ── Результат пересказа ───────────────────────────────────────
@@ -1113,6 +1457,15 @@ def show_doc_scanner():
                         use_container_width=True,
                     )
 
+                _batch_focus = st.text_area(
+                    "Фокус внимания при пересказе (для всех файлов)",
+                    value=st.session_state.get("batch_sum_focus", ""),
+                    placeholder="Например: тарифные решения, НВВ, ДПР — ИИ уделит этому особое внимание во всех документах",
+                    height=68,
+                    key="batch_sum_focus",
+                    help="Необязательно. Применяется ко всем файлам пакетного пересказа.",
+                )
+
                 if _do_batch:
                     st.warning("⚠️ Идёт пакетный пересказ — не переключайте раздел и не закрывайте вкладку")
                     _batch_progress = st.progress(0.0)
@@ -1137,7 +1490,8 @@ def show_doc_scanner():
                             )
 
                         _bres = summarize_document(
-                            _bft, _batch_length, _progress_cb=_bcb
+                            _bft, _batch_length, _progress_cb=_bcb,
+                            focus=st.session_state.get("batch_sum_focus", "")
                         )
                         _inner_cap.empty()
 
@@ -1150,6 +1504,7 @@ def show_doc_scanner():
                         _borig = _bd.get("original_path", "")
                         if _borig:
                             save_summary_file(_borig, _bres)
+                            save_focus_file(_borig, st.session_state.get("batch_sum_focus", ""))
 
                     _batch_progress.progress(1.0)
                     _batch_status.empty()
@@ -1722,12 +2077,13 @@ def show_doc_scanner():
                 _cy, _cn = st.columns(2)
                 if _cy.button("Да, удалить всё", key="clear_confirm_yes",
                               type="primary", use_container_width=True):
-                    # Удаляем файлы originals + пересказы
+                    # Удаляем файлы originals + пересказы + фокусы
                     _del_ok, _del_err = 0, 0
                     for _ddoc in docs:
                         for _fpath in [
                             _ddoc.get("original_path", ""),
                             _summary_path(_ddoc.get("original_path", "")),
+                            _focus_path(_ddoc.get("original_path", "")),
                         ]:
                             if _fpath and os.path.exists(_fpath):
                                 try:

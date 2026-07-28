@@ -168,6 +168,12 @@ EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 class E5EmbeddingFunction:
     """ChromaDB-совместимая embedding function для intfloat/multilingual-e5-large."""
 
+    # ChromaDB требует метод name() у embedding function начиная с версии 0.5+
+    # Возвращает идентификатор EF — используется во внутренней валидации.
+    @staticmethod
+    def name() -> str:
+        return "e5-multilingual-large"
+
     def __init__(self, model_name: str = EMBEDDING_MODEL):
         from sentence_transformers import SentenceTransformer
         import torch
@@ -224,7 +230,7 @@ def initialize_db():
     try:
         collection = client.get_collection(name="tariff_docs", embedding_function=ef)
     except Exception:
-        collection = client.create_collection(name="tariff_docs", embedding_function=ef)
+        collection = client.get_or_create_collection(name="tariff_docs", embedding_function=ef)
     return client, collection
 
 def load_chunking_settings() -> dict:
@@ -746,7 +752,7 @@ def index_file_to_collection(
         try:
             collection = client.get_collection(name=collection_name, embedding_function=ef)
         except Exception:
-            collection = client.create_collection(name=collection_name, embedding_function=ef)
+            collection = client.get_or_create_collection(name=collection_name, embedding_function=ef)
 
         # Нормализуем extra_metadata
         _extra = {}
@@ -899,7 +905,7 @@ def clear_index():
     try:
         os.makedirs(vector_db_path, exist_ok=True)
         client = _get_chroma_client()
-        client.create_collection(name="tariff_docs")
+        client.get_or_create_collection(name="tariff_docs")
         print("[INDEX] Индекс пересоздан с нуля")
         return {"status": "success"}
     except Exception as e:

@@ -382,12 +382,31 @@ def transcribe_audio(
                 pass
 
     ext = os.path.splitext(filename.lower())[1]
-    _upd(f"Файл: {filename} ({len(file_bytes)/1024/1024:.1f} МБ), формат: {ext.upper()}")
+
+    # ── Диагностика: сколько байт реально пришло на вход ────────────────────
+    # Частая причина "0 символов / 0:00" — пустой или сильно урезанный
+    # file_bytes из-за повторного .read() на объекте загрузки Streamlit
+    # (после первого чтения — например, для st.audio() — курсор стоит
+    # в конце потока, повторный .read() без seek(0) возвращает b"").
+    _upd(f"Файл: {filename} ({len(file_bytes)/1024/1024:.2f} МБ), формат: {ext.upper()}")
+    if len(file_bytes) < 1024:
+        result["error"] = (
+            f"⚠️ Получено подозрительно мало данных: {len(file_bytes)} байт. "
+            "Похоже, файл был прочитан пустым (частая причина — повторное чтение "
+            "объекта загрузки в Streamlit). Попробуйте загрузить файл заново."
+        )
+        _upd(f"ОШИБКА: получено всего {len(file_bytes)} байт — файл пуст или повреждён")
+        return result
 
     if ext not in [f".{e}" for e in SUPPORTED_AUDIO_FFMPEG]:
         result["error"] = f"Формат {ext.upper()} не поддерживается."
         return result
 
+    # ПРИМЕЧАНИЕ: faster-whisper декодирует звук через PyAV, которая несёт
+    # собственные FFmpeg-библиотеки внутри пакета — системный ffmpeg
+    # для самого декодирования НЕ обязателен (нужен только как fallback
+    # для UI-проверки поддерживаемых форматов ниже). Подробнее:
+    # https://github.com/SYSTRAN/faster-whisper
     if ext != ".wav" and not _ffmpeg_available():
         result["error"] = (
             f"Для файлов {ext.upper()} требуется ffmpeg.\n"
@@ -428,6 +447,10 @@ def transcribe_audio(
         with open(temp_path, "wb") as f:
             f.write(file_bytes)
 
+        # Диагностика: реальный размер записанного файла на диске
+        _written_size = os.path.getsize(temp_path)
+        _upd(f"Записан временный файл: {_written_size/1024:.1f} КБ")
+
         from faster_whisper import WhisperModel
 
         _upd(f"Загрузка faster-whisper {whisper_model} на {_devname}...")
@@ -454,6 +477,27 @@ def transcribe_audio(
 
         trans_sec = (datetime.now() - t1).seconds
 
+        # ── Fallback: если VAD-фильтр «съел» весь звук как тишину ──────────
+        # (last_end == 0.0 при валидном info.duration > 0 означает, что
+        # VAD посчитал всё аудио тишиной — перезапускаем без VAD один раз,
+        # чтобы не терять реальный, но тихий контент.)
+        if last_end == 0.0 and getattr(info, "duration", 0) > 1.0:
+            _upd(
+                f"VAD-фильтр не нашёл речи при валидной длительности "
+                f"{info.duration:.1f} сек — повторяю распознавание без VAD..."
+            )
+            segments_gen2, info2 = model.transcribe(
+                temp_path,
+                language=language,
+                beam_size=5,
+                vad_filter=False,
+            )
+            full_text = []
+            for seg in segments_gen2:
+                full_text.append(seg.text.strip())
+                last_end = seg.end
+            info = info2
+
         result["text"]     = " ".join(full_text).strip()
         result["status"]   = "success"
         result["duration"] = f"{int(last_end // 60)}:{int(last_end % 60):02d}"
@@ -461,7 +505,8 @@ def transcribe_audio(
         _upd(
             f"Готово! Транскрибация: {trans_sec} сек · "
             f"Аудио: {result['duration']} · "
-            f"Символов: {len(result['text'])}"
+            f"Символов: {len(result['text'])} · "
+            f"info.duration={getattr(info, 'duration', '?')}"
         )
 
     except Exception as exc:
@@ -544,6 +589,56 @@ def _load_lm_config() -> Dict:
         except Exception:
             pass
     return dict(_LM_STUDIO_DEFAULTS)
+
+
+def _ollama_native_base_url(lm_url: str) -> str:
+    """Базовый URL Ollama БЕЗ суффикса /v1 — для нативного /api/chat."""
+    url = (lm_url or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def _ollama_chat_native(lm_url: str, model: str, system: str, user: str,
+                        max_tokens: int, cfg: dict, timeout: float = 180.0) -> dict:
+    """
+    Нестриминговый вызов нативного Ollama /api/chat с think:false.
+
+    ВАЖНО: предыдущая версия передавала extra_body={"think": False} через
+    _client.chat.completions.create() — то есть всё равно через OpenAI-
+    совместимый /v1/chat/completions, а НЕ через нативный /api/chat. Именно
+    там это поле ненадёжно транслируется Ollama (issue ollama/ollama#14809),
+    поэтому баг "Модель вернула пустой ответ" сохранялся, несмотря на
+    видимость правильного фикса. Настоящий надёжный путь — прямой HTTP-запрос
+    к /api/chat, как уже сделано в core/advisor.py, doc_scanner.py, predictor.py.
+    """
+    import requests
+    url = _ollama_native_base_url(lm_url) + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature":    0.15,
+            "num_predict":    max_tokens,
+            "num_ctx":        cfg.get("num_ctx", 20000),
+            "top_p":          cfg.get("top_p", 0.9),
+            "top_k":          cfg.get("top_k", 40),
+            "repeat_penalty": cfg.get("repeat_penalty", 1.1),
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data.get("message") or {}
+    return {
+        "content": msg.get("content", ""),
+        "done_reason": data.get("done_reason", "stop"),
+    }
 
 
 # =============================================================================
@@ -657,36 +752,51 @@ def generate_protocol(
         source_text    = text[:14000],
     )
 
+    _model = model  # для доступности в except-блоке ниже
+
     try:
         from openai import OpenAI
         cfg     = _load_lm_config()
         _model  = model or cfg["default_model"]
-        _client = OpenAI(base_url=cfg["lm_studio_url"], api_key="lm-studio")
 
-        # Qwen3 — отключаем thinking
-        is_qwen3   = "qwen3" in _model.lower()
-        extra_body = {"enable_thinking": False} if is_qwen3 else {}
-        if is_qwen3:
-            prompt = "/no_think\n\n" + prompt
+        # Qwen3 — отключаем thinking. Для Ollama — ТОЛЬКО через нативный
+        # /api/chat (см. комментарий в _ollama_chat_native выше); передача
+        # think:false через extra_body в OpenAI-совместимый /v1/chat/completions
+        # ненадёжна и была причиной "Модель вернула пустой ответ".
+        is_qwen3     = "qwen3" in _model.lower()
+        llm_backend  = cfg.get("llm_backend", "ollama")
+        use_native   = is_qwen3 and llm_backend == "ollama"
 
         _max_tok = max_tokens or DETAIL_MAX_TOKENS.get(detail_level, 2500)
 
-        kwargs: Dict = dict(
-            model=_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": prompt},
-            ],
-            temperature=0.15,
-            max_tokens=_max_tok,
-            timeout=cfg["timeout_seconds"],
-        )
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+        print(f"[PROTOCOL] {llm_backend}: {_model} | max_tokens={_max_tok} | native={use_native}", flush=True)
 
-        print(f"[PROTOCOL] LM Studio: {_model} | max_tokens={_max_tok}", flush=True)
-        response = _client.chat.completions.create(**kwargs)
-        raw = response.choices[0].message.content or ""
+        if use_native:
+            native_result = _ollama_chat_native(
+                cfg["lm_studio_url"], _model, system_prompt, prompt, _max_tok, cfg,
+                timeout=cfg.get("timeout_seconds", 120),
+            )
+            raw = native_result.get("content") or ""
+        else:
+            _client = OpenAI(base_url=cfg["lm_studio_url"], api_key="lm-studio")
+            extra_body = {}
+            if is_qwen3:
+                prompt = "/no_think\n\n" + prompt
+                extra_body = {"enable_thinking": False}
+            kwargs: Dict = dict(
+                model=_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature=0.15,
+                max_tokens=_max_tok,
+                timeout=cfg["timeout_seconds"],
+            )
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            response = _client.chat.completions.create(**kwargs)
+            raw = response.choices[0].message.content or ""
 
         # Убираем thinking-блоки если есть
         import re as _re
@@ -701,9 +811,9 @@ def generate_protocol(
     except Exception as exc:
         err = str(exc)
         if "Connection" in err or "refused" in err:
-            result["error"] = "🔌 Нет подключения к LM Studio. Убедитесь что сервер запущен на 127.0.0.1:1234"
+            result["error"] = "🔌 Нет подключения к LLM-серверу. Проверьте адрес в config/advisor_config.json"
         elif "404" in err:
-            result["error"] = f"❌ Модель не найдена в LM Studio: {_model}. Загрузите её в LM Studio."
+            result["error"] = f"❌ Модель не найдена: {_model}. Проверьте, что она загружена (ollama pull)."
         else:
             result["error"] = f"❌ {type(exc).__name__}: {exc}"
 
@@ -783,6 +893,7 @@ def show_protocol_bot():
         ("proto_saved_id",       None),   # ID сохранённого протокола
         ("proto_transcript",     None),   # Текст расшифровки аудио
         ("proto_audio_file_id",  None),   # Идентификатор последнего аудиофайла
+        ("proto_audio_bytes",    None),   # Байты аудиофайла — читаем ОДИН раз
         ("pb_open_card",         None),   # ID раскрытой карточки в базе
     ]:
         if key not in st.session_state:
@@ -915,9 +1026,21 @@ def show_protocol_bot():
                     st.session_state.proto_transcript    = None
                     st.session_state.proto_result        = None
                     st.session_state.proto_saved_id      = None
+                    # ─────────────────────────────────────────────────────────
+                    # КРИТИЧЕСКИ ВАЖНО: читаем байты файла РОВНО ОДИН РАЗ
+                    # здесь и кэшируем в session_state. UploadedFile — это
+                    # обёртка над BytesIO с внутренним курсором: повторный
+                    # .read() (например, после st.audio() ниже) без явного
+                    # seek(0) вернёт ПУСТЫЕ байты — это была причина
+                    # "0 символов / 0:00" при транскрибации.
+                    # ─────────────────────────────────────────────────────────
+                    uploaded_audio.seek(0)
+                    st.session_state.proto_audio_bytes = uploaded_audio.read()
                     st.rerun()
 
-                st.audio(uploaded_audio)
+                # Проигрыватель — используем уже прочитанные байты из кэша,
+                # а не сам объект uploaded_audio (чтобы не трогать его курсор)
+                st.audio(st.session_state.proto_audio_bytes)
 
                 # Выбор модели
                 _MODELS = {
@@ -956,11 +1079,14 @@ def show_protocol_bot():
                 if do_transcribe:
                     st.warning("⚠️ Идёт транскрибация аудио — не переключайте раздел и не закрывайте вкладку")
                     import time as _time
-                    audio_bytes = uploaded_audio.read()
+
+                    # Используем закэшированные байты — НЕ читаем uploaded_audio
+                    # повторно (его курсор уже мог быть тронут виджетами выше).
+                    audio_bytes = st.session_state.proto_audio_bytes
                     _mb = len(audio_bytes) / 1024 / 1024
 
                     _status = st.empty()
-                    _status.info(f"⏳ Подготовка... файл {_mb:.1f} МБ, модель: {_selected_key}")
+                    _status.info(f"⏳ Подготовка... файл {_mb:.2f} МБ, модель: {_selected_key}")
 
                     _start = _time.time()
                     tr = transcribe_audio(
@@ -1001,6 +1127,7 @@ def show_protocol_bot():
                                  help="Сбросить расшифровку и результат"):
                         st.session_state.proto_transcript   = None
                         st.session_state.proto_audio_file_id = None
+                        st.session_state.proto_audio_bytes  = None
                         st.session_state.proto_result       = None
                         st.session_state.proto_saved_id     = None
                         st.rerun()

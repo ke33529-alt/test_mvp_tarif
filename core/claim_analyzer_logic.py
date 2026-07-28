@@ -154,6 +154,68 @@ def _load_lm_config() -> Tuple[str, str]:
     )
 
 
+def _load_lm_full_config() -> dict:
+    """Возвращает полный конфиг advisor_config.json (для нативного Ollama API)."""
+    path = os.path.join("config", "advisor_config.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _ollama_native_base_url(lm_url: str) -> str:
+    """Базовый URL Ollama БЕЗ суффикса /v1 — для нативного /api/chat."""
+    url = (lm_url or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def _ollama_chat_native(lm_url: str, model: str, system: str, user: str,
+                        max_tokens: int, cfg: dict, timeout: float = 300.0) -> dict:
+    """
+    Нестриминговый вызов нативного Ollama /api/chat с think:false.
+
+    ВАЖНО: extra_body={"enable_thinking": False, "chat_template_kwargs": {...}}
+    через OpenAI-совместимый /v1/chat/completions — это синтаксис LM Studio,
+    Ollama его ненадёжно транслирует (issue ollama/ollama#14809). Именно
+    поэтому резюме заявки и вердикт по рискам возвращались пустыми: модель
+    уходила в незакрытый <think>-блок, весь max_tokens уходил на рассуждения.
+    Тот же фикс уже применён в core/advisor.py, doc_scanner.py, predictor.py,
+    protocol_bot.py.
+    """
+    import requests
+    url = _ollama_native_base_url(lm_url) + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature":    0.2,
+            "num_predict":    max_tokens,
+            "num_ctx":        cfg.get("num_ctx", 20000),
+            "top_p":          cfg.get("top_p", 0.9),
+            "top_k":          cfg.get("top_k", 40),
+            "repeat_penalty": cfg.get("repeat_penalty", 1.1),
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data.get("message") or {}
+    return {
+        "content": msg.get("content", ""),
+        "done_reason": data.get("done_reason", "stop"),
+    }
+
+
 def _is_complete(text: str) -> bool:
     t = text.rstrip()
     return not t or t[-1] in ".!?:»\n" or t.endswith("---") or t.endswith("```")
@@ -163,9 +225,16 @@ def _lm_call(system: str, user: str, max_tokens: int = 2000) -> str:
     try:
         from openai import OpenAI
         lm_url, model = _load_lm_config()
+        _lm_cfg      = _load_lm_full_config()
+        is_qwen3     = "qwen3" in model.lower()
+        use_native   = is_qwen3 and _lm_cfg.get("llm_backend", "ollama") == "ollama"
+
+        if use_native:
+            result = _ollama_chat_native(lm_url, model, system, user, max_tokens, _lm_cfg)
+            return (result.get("content") or "").strip()
+
         client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=300.0)
 
-        is_qwen3 = "qwen3" in model.lower()
         extra_body: dict = {}
         if is_qwen3:
             extra_body = {
@@ -1201,6 +1270,19 @@ def _build_file_summaries(
             print(f"[ANALYSIS] Пустой текст: {file_name}")
 
     print(f"[ANALYSIS] Прочитано: {len(heads)}")
+
+    # Освобождаем VRAM сразу после чтения заголовков — при дефиците памяти
+    # держать EasyOCR постоянно загруженным нецелесообразно, LLM/embeddings
+    # важнее в промежутках между анализами заявок.
+    try:
+        try:
+            from streamlit_pages.doc_scanner import _unload_ocr
+        except ImportError:
+            from doc_scanner import _unload_ocr
+        _unload_ocr()
+    except Exception as e:
+        print(f"[ANALYSIS] Не удалось выгрузить OCR: {e}")
+
     return heads
 
 

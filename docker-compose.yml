@@ -4,6 +4,13 @@
 # Запуск:  docker compose up -d
 # Остановка: docker compose down
 # Логи:    docker compose logs -f regula
+#
+# Быстрая итерация разработки:
+#   Python-код смонтирован с хоста — изменения применяются через:
+#     docker compose restart regula
+#   Пересборка образа (docker compose build) нужна только когда меняется:
+#     - requirements.txt (новые библиотеки)
+#     - Dockerfile
 # =============================================================================
 
 services:
@@ -24,8 +31,32 @@ services:
     env_file:
       - .env                         # все секреты и настройки из .env файла
 
+    # Позволяет контейнеру достучаться до Ollama, запущенного в отдельном
+    # Docker-контейнере на хосте (порт 11434 опубликован на хосте)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Доступ к GPU — нужен для EasyOCR, embeddings и reranker,
+    # которые работают внутри ЭТОГО контейнера (не только Ollama)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
     volumes:
-      # Данные приложения — хранятся на сервере, не внутри контейнера
+      # ── Python-код — смонтирован с хоста для быстрой итерации ───────────────
+      # Изменения в этих файлах применяются через docker compose restart,
+      # без пересборки образа.
+      - ./app.py:/app/app.py
+      - ./core:/app/core
+      - ./streamlit_pages:/app/streamlit_pages
+      - ./init_data_structure.py:/app/init_data_structure.py
+      - ./init_superadmin.py:/app/init_superadmin.py
+
+      # ── Данные приложения — хранятся на сервере, не внутри контейнера ──────
       # Формат: /путь/на/сервере:/путь/в/контейнере
       - ./data:/app/data                     # заявки, feedback, протоколы
       - ./config:/app/config                 # промпты, настройки, сферы
@@ -43,11 +74,9 @@ services:
       - PYTHONDONTWRITEBYTECODE=1    # не создавать .pyc файлы
 
     # Ограничения ресурсов (раскомментируйте и подберите под ваш сервер)
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 8G
-    #       cpus: '4'
+    # limits:
+    #   memory: 8G
+    #   cpus: '4'
 
     # Запускать только после Ollama (если Ollama тоже в compose)
     # depends_on:
@@ -63,8 +92,9 @@ services:
 
   # ---------------------------------------------------------------------------
   # Ollama — LLM сервис (Qwen3 и другие модели)
-  # Комментарий: если Ollama уже запущен на хост-машине напрямую,
-  # этот блок можно удалить и в .env указать OLLAMA_BASE_URL=http://host.docker.internal:11434
+  # Комментарий: сейчас Ollama уже запущен отдельным Docker-контейнером
+  # вручную (docker run ... ollama/ollama), поэтому этот блок остаётся
+  # закомментированным. В .env указан OLLAMA_BASE_URL=http://host.docker.internal:11434
   # ---------------------------------------------------------------------------
   # ollama:
   #   image: ollama/ollama:latest
@@ -73,15 +103,14 @@ services:
   #   ports:
   #     - "11434:11434"
   #   volumes:
-  #     - ollama_models:/root/.ollama   # модели сохраняются между перезапусками
-  #   # Для GPU (NVIDIA):
-  #   # deploy:
-  #   #   resources:
-  #   #     reservations:
-  #   #       devices:
-  #   #         - driver: nvidia
-  #   #           count: all
-  #   #           capabilities: [gpu]
+  #     - ollama_models:/root/.ollama
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
   #   healthcheck:
   #     test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
   #     interval: 30s

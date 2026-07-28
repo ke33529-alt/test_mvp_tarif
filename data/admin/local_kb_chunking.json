@@ -1,0 +1,8 @@
+{
+  "org_20260711_212904": {
+    "method": "fixed",
+    "chunk_size": 1000,
+    "overlap": 100,
+    "word_safe": true
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "org_20260711_212904": {
+    "Запрос АРМ.docx": {
+      "indexed_at": "2026-07-15T08:55:54",
+      "chunks": 1,
+      "ext": "DOCX",
+      "size_kb_original": 15.0
+    },
+    "FSD_НСИ_обязательность_name (2).docx": {
+      "indexed_at": "2026-07-15T09:40:18",
+      "chunks": 7,
+      "ext": "DOCX",
+      "size_kb_original": 11.0
+    },
+    "2026-07-02 1031 (MSK) ФАС. Демонстрация интеграции Госключ.txt": {
+      "indexed_at": "2026-07-15T20:33:41",
+      "chunks": 9,
+      "ext": "TXT",
+      "size_kb_original": 64.5,
+      "chunk_method": "legal",
+      "chunk_size": null,
+      "overlap": null,
+      "word_safe": null
+    },
+    "Замечания к платформе.docx": {
+      "indexed_at": "2026-07-18T10:07:48",
+      "chunks": 7,
+      "ext": "DOCX",
+      "size_kb_original": 16.1,
+      "chunk_method": "fixed",
+      "chunk_size": 1000,
+      "overlap": 100,
+      "word_safe": true
+    }
+  }
+}

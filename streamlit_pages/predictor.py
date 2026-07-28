@@ -19,6 +19,7 @@ import os
 import re
 import time
 import threading
+import difflib
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -40,6 +41,8 @@ _CHUNK_OVERLAP       = 300
 
 _DEFAULT_TOP_K = 30
 _RAG_CONTEXT_CHAR_BUDGET = 35_000  # суммарный лимит символов по всем найденным чанкам перед классификацией
+_RAW_CHUNK_MAX_CHARS = 2500  # жёсткий потолок сырого чанка сразу после поиска — Прогнозисту соседние
+                              # чанки не нужны никогда, это защита от их "протечки" независимо от причины
 
 _REGISTRY_LOCK = threading.Lock()
 
@@ -54,6 +57,12 @@ _PRED_CFG_DEFAULTS = {
     "classify_max_tokens": 350,
     "default_top_k":       30,
     "disable_thinking":    True,
+    # ВТОРОЙ ЭТАП независимой проверки (quote vs позиция пользователя).
+    # Подозревается в чрезмерном понижении positive/negative → neutral
+    # (модель слишком часто находит "противоречие" там, где его нет).
+    # Можно отключить здесь или переключателем в интерфейсе прогнозиста,
+    # чтобы сравнить результат с выключенной верификацией.
+    "enable_verification": True,
 }
 
 
@@ -71,9 +80,24 @@ def load_predictor_config() -> dict:
 _PROMPTS_FILE = os.path.join("config", "prompts.json")
 _PRED_PROMPT_DEFAULTS = {
     "predictor_classify_system": (
-        "Ты — тарифный эксперт РФ. Тебе нужно определить, ПОДТВЕРЖДАЕТ или "
-        "ОПРОВЕРГАЕТ найденный прецедент МЕТОДОЛОГИЮ/ПРИНЦИП пользователя — "
-        "а не тему статьи затрат и не числовой результат (снижено/повышено). "
+        "Ты — тарифный эксперт РФ. ГЛАВНОЕ ПРАВИЛО, определяющее всё "
+        "остальное: тебя интересует, какой ПРИНЦИП ОБОСНОВАНИЯ статьи "
+        "затрат избрал регулятор — а НЕ то, увеличилась или уменьшилась "
+        "сумма по статье, и НЕ то, была ли заявка организации в целом "
+        "одобрена или отклонена. Регулятор должен ВЫБРАТЬ ПРИНЦИП — вот "
+        "что нужно определить.\n"
+        "- Если из текста ясно, что регулятор в отношении этой статьи "
+        "руководствовался ТЕМ ЖЕ обоснованием/принципом, что указывает "
+        "пользователь — это 'за' (positive). Неважно, поддержал регулятор "
+        "позицию той, другой организации из прецедента или отклонил её по "
+        "цифрам — главное, что регулятор избрал ТОТ ЖЕ подход/принцип, что "
+        "и пользователь.\n"
+        "- Если из текста ясно, что регулятор явно ОТКЛОНИЛ именно этот "
+        "принцип обоснования (избрал другой, противоположный принцип) — "
+        "это 'против' (negative).\n"
+        "- Если статья просто упомянута с ДРУГИМ, не связанным по "
+        "существу обоснованием (другой принцип, другая логика) — это "
+        "'нейтрально' (neutral).\n\n"
         "Сравнивай ИМЕННО ПОДХОД: каким способом регулятор определяет "
         "значение. Совпадение ОБЩЕЙ ТЕМЫ подхода (например, оба случая "
         "касаются 'срока полезного использования' или 'выбора варианта из "
@@ -82,9 +106,25 @@ _PRED_PROMPT_DEFAULTS = {
         "(например, один настаивает на максимальном значении, другой — на "
         "минимальном; один — на фактических данных, другой — на нормативе), "
         "это ПРОТИВОРЕЧИЕ (negative), а не совпадение. Числовой результат "
-        "(сумма выросла или снизилась) сам по себе не определяет "
-        "positive/negative — важно, выбрал ли регулятор ТОТ ЖЕ вариант "
-        "решения, что и пользователь, или ПРОТИВОПОЛОЖНЫЙ.\n\n"
+        "(сумма выросла или снизилась) сам по себе НИКОГДА не определяет "
+        "positive/negative — важно ТОЛЬКО, выбрал ли регулятор ТОТ ЖЕ "
+        "принцип решения, что и пользователь, или ПРОТИВОПОЛОЖНЫЙ.\n\n"
+        "ОСОБО ВАЖНАЯ ОШИБКА, КОТОРУЮ НУЖНО ИЗБЕГАТЬ: не приравнивай два "
+        "РАЗНЫХ КОНКРЕТНЫХ ИСТОЧНИКА/ДОКУМЕНТА только потому, что оба "
+        "можно назвать 'официальными' или 'нормативными'. Например, "
+        "'штатное расписание' и 'приказы об изменении ФОТ' — это ДВА "
+        "РАЗНЫХ конкретных документа, и то, что оба являются формальными/"
+        "нормативными по своей природе, НЕ делает их совпадающим вариантом "
+        "решения. Совпадением считается только использование ОДНОГО И "
+        "ТОГО ЖЕ конкретного источника/показателя (оба — штатное "
+        "расписание, оба — приказ, оба — фактическая отчётность и т.п.), "
+        "а не абстрактной надкатегории вроде 'использование официальных/"
+        "нормативных документов' или 'методология опоры на документы'. "
+        "Если пользователь ссылается на конкретный документ X, а в "
+        "прецеденте регулятор упоминает другой конкретный документ Y (даже "
+        "того же типа — 'тоже официальный', 'тоже нормативный') — по "
+        "умолчанию это НЕ positive; ставь positive только если это "
+        "буквально тот же документ/показатель или его прямой синоним.\n\n"
         "КРИТИЧЕСКИ ВАЖНО: в материалах ДВА РАЗНЫХ ИСТОЧНИКА текста — "
         "позиция ТЕКУЩЕГО пользователя (помечена '=== ПОЗИЦИЯ ТЕКУЩЕГО "
         "ПОЛЬЗОВАТЕЛЯ ===') и решение регулятора по ДРУГОЙ организации из "
@@ -92,6 +132,20 @@ _PRED_PROMPT_DEFAULTS = {
         "блока прецедента может быть фраза 'заявлено предприятием X тыс. "
         "руб.' — это позиция ДРУГОЙ организации из прецедента, а НЕ "
         "текущего пользователя. Не путай их.\n\n"
+        "ВАЖНАЯ АКСИОМА ОБ ИСТОЧНИКЕ ДОКУМЕНТОВ ПРЕЦЕДЕНТА: все документы "
+        "в блоке '=== РЕШЕНИЕ ИЗ ПРЕЦЕДЕНТА ===' — это протоколы заседаний "
+        "РЭК (регионального регулятора) или экспертные заключения, "
+        "подготовленные для обоснования решения РЭК. Это значит, что "
+        "ЛЮБОЕ утверждение о принятии, непринятии или корректировке "
+        "затрат в этих документах ПО УМОЛЧАНИЮ является позицией именно "
+        "РЭКа (регулятора) — а не организации, обратившейся за тарифом "
+        "(РСО), даже если документ называется 'экспертное заключение', а "
+        "не 'протокол'. Единственное исключение — явно помеченные фразы "
+        "вида 'заявлено предприятием', 'по расчётам организации', "
+        "'организация настаивает' — вот это действительно позиция РСО, а "
+        "не РЭКа. Во всех остальных случаях не сомневайся в том, чья это "
+        "позиция: если формулировка не помечена как позиция заявителя — "
+        "перед тобой решение/вывод регулятора.\n\n"
         "ФОРМАТ ОТВЕТА — СТРОГО ВАЖНО: ты должен выдать ТОЛЬКО готовый "
         "финальный результат сравнения, БЕЗ цепочки рассуждений, БЕЗ "
         "цитирования инструкции, БЕЗ слов 'перечитаем', 'однако', 'но "
@@ -116,6 +170,13 @@ _PRED_PROMPT_DEFAULTS = {
         "'применил норматив вместо факта') и сравни этот ВЫБОР с тем, что "
         "заявляет пользователь в блоке '=== ПОЗИЦИЯ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ "
         "==='.\n\n"
+        "НАПОМИНАНИЕ: тебя интересует только ПРИНЦИП, который избрал "
+        "регулятор — а не итог заявки той организации из прецедента "
+        "(одобрена целиком/отклонена/скорректирована) и не то, выросла "
+        "или снизилась у неё сумма. Регулятор мог полностью отклонить "
+        "заявку той организации по цифрам, но при этом руководствоваться "
+        "ТЕМ ЖЕ принципом, который сейчас заявляет пользователь — это всё "
+        "равно positive.\n\n"
         "Определи decision:\n"
         "- positive — регулятор выбрал ТОТ ЖЕ вариант/подход, что заявляет "
         "пользователь (например, оба настаивают на максимальном сроке, оба "
@@ -147,6 +208,17 @@ _PRED_PROMPT_DEFAULTS = {
         "позицией ТЕКУЩЕГО пользователя. Конкретные числа (года, проценты, "
         "суммы) сравнивать не нужно — сравнивай только то, какой "
         "вариант/подход выбран.\n\n"
+        "ОТДЕЛЬНО ПРОВЕРЬ СЕБЯ ПЕРЕД ОТВЕТОМ: если пользователь называет "
+        "конкретный документ/источник (например, 'штатное расписание'), а "
+        "регулятор в прецеденте называет ДРУГОЙ конкретный документ/"
+        "источник (например, 'приказы', 'норматив численности', 'акт "
+        "сверки') — это РАЗНЫЕ варианты, даже если оба формально можно "
+        "назвать 'официальными' или 'нормативными'. Не ставь positive "
+        "только на основании того, что 'оба опираются на официальные "
+        "документы' — это тематическое, а не конкретное совпадение. "
+        "positive допустим только если названы буквально один и тот же "
+        "документ/показатель (или явный синоним одного и того же), а не "
+        "просто одна и та же общая категория документов.\n\n"
         "Ответь СРАЗУ готовым JSON без рассуждений, без вопросов самому "
         "себе, без цитирования этой инструкции в ответе:\n"
         'JSON: {{"decision":"positive|negative|neutral","quote":"цитата, какой вариант выбрал регулятор, до 120 симв.","reason":"краткий итоговый вывод одним предложением: совпадают варианты или нет, до 120 симв."}}'
@@ -227,6 +299,64 @@ def load_registry(max_records: int = 200) -> List[Dict]:
 
 
 # =============================================================================
+# Регистрация ручных правок эксперта (аудит: где пользователь исправил ИИ)
+# =============================================================================
+_OVERRIDE_LOG_FILE  = os.path.join(_BASE_DIR, "expert_overrides.jsonl")
+_OVERRIDE_LOG_LOCK  = threading.Lock()
+
+_DECISION_RU = {"positive": "за", "negative": "против", "neutral": "нейтрально"}
+
+
+def _log_expert_override(
+    article: str, fkey: str, ai_decision: str,
+    previous_decision: str, new_decision: str, quote: str = "",
+) -> None:
+    """
+    Дописывает запись о ручной правке эксперта в постоянный лог
+    (data/predictor/expert_overrides.jsonl) — отдельно от сессии, чтобы
+    сохранялась история даже после сброса прогноза/session_state.
+    Каждая строка — один факт "эксперт вручную изменил вердикт ИИ",
+    с исходным вердиктом модели и итоговым решением эксперта.
+    """
+    _ensure_dirs()
+    record = {
+        "timestamp":          datetime.now().isoformat(),
+        "article":            article,
+        "file":               fkey,
+        "ai_decision":        ai_decision,
+        "previous_decision":  previous_decision,
+        "new_decision":       new_decision,
+        "quote":              (quote or "")[:200],
+    }
+    try:
+        with _OVERRIDE_LOG_LOCK:
+            with open(_OVERRIDE_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[PREDICTOR] Не удалось записать лог правки эксперта: {e}", flush=True)
+
+
+def load_expert_overrides_log(max_records: int = 500) -> List[Dict]:
+    """Загружает последние правки эксперта из постоянного лога (для аудита)."""
+    if not os.path.exists(_OVERRIDE_LOG_FILE):
+        return []
+    try:
+        with open(_OVERRIDE_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        records = []
+        for line in reversed(lines):
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                pass
+            if len(records) >= max_records:
+                break
+        return records
+    except Exception:
+        return []
+
+
+# =============================================================================
 # LM Studio — переиспользуем логику doc_scanner
 # =============================================================================
 def _load_lm_config() -> Tuple[str, str]:
@@ -243,14 +373,106 @@ def _load_lm_config() -> Tuple[str, str]:
     return lm_url, model
 
 
+def _load_lm_full_config() -> dict:
+    """Возвращает полный конфиг advisor_config.json (нужен для нативного Ollama API)."""
+    config_path = os.path.join("config", "advisor_config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _ollama_native_base_url(lm_url: str) -> str:
+    """Базовый URL Ollama БЕЗ суффикса /v1 — для нативного /api/chat."""
+    url = (lm_url or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def _ollama_chat_native(lm_url: str, model: str, system: str, user: str,
+                        max_tokens: int, cfg: dict, temperature: float = 0.1,
+                        timeout: float = 180.0) -> dict:
+    """
+    Нестриминговый вызов нативного Ollama /api/chat с think:false.
+
+    ВАЖНО: "think": false здесь — единственный надёжный способ отключить
+    режим рассуждения Qwen3.5. Прежний способ через extra_body={"thinking":
+    {"type": "disabled"}} на OpenAI-совместимом /v1/chat/completions — не
+    формат Ollama и не отключал thinking надёжно: модель уходила в
+    незакрытый <think>-блок, весь max_tokens тратился на рассуждения, и
+    classify_chunk/_verify_regulator_choice_vs_user_position получали
+    пустую строку вместо JSON — что и приводило к массовому "нейтрально"
+    (см. тот же фикс в core/advisor.py, doc_scanner.py, core/predictor.py).
+    """
+    import requests
+    url = _ollama_native_base_url(lm_url) + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature":    temperature,
+            "num_predict":    max_tokens,
+            "num_ctx":        cfg.get("num_ctx", 20000),
+            "top_p":          cfg.get("top_p", 0.9),
+            "top_k":          cfg.get("top_k", 40),
+            "repeat_penalty": cfg.get("repeat_penalty", 1.1),
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data.get("message") or {}
+    return {
+        "content": msg.get("content", ""),
+        "done_reason": data.get("done_reason", "stop"),
+    }
+
+
 def _strip_thinking(text: str) -> str:
     cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
 
 def _lm_call(client, model: str, system: str, user: str, max_tokens: int = 600) -> str:
-    cfg = load_predictor_config()
+    """
+    Один вызов LLM; возвращает текст ответа или строку с ошибкой.
+
+    Для Ollama (llm_backend="ollama" в config/advisor_config.json, по
+    умолчанию) используется нативный /api/chat с think:false — единственный
+    надёжный способ отключить thinking-режим Qwen3.5 (extra_body/"thinking"
+    на OpenAI-совместимом /v1/chat/completions ненадёжен — см.
+    core/advisor.py, doc_scanner.py, core/predictor.py, где та же проблема
+    давала пустой ответ). base_url берём прямо из уже созданного client —
+    не нужно менять сигнатуру и пробрасывать lm_url через все вызовы
+    (classify_chunk, _verify_regulator_choice_vs_user_position и т.д.).
+    """
+    cfg               = load_predictor_config()
     _disable_thinking = bool(cfg.get("disable_thinking", True))
+    _lm_cfg           = _load_lm_full_config()
+    _is_ollama        = _lm_cfg.get("llm_backend", "ollama") == "ollama"
+
+    if _is_ollama:
+        try:
+            lm_url = str(client.base_url)
+            result = _ollama_chat_native(
+                lm_url, model, system, user, max_tokens, _lm_cfg,
+            )
+            raw = (result.get("content") or "").strip()
+            return _strip_thinking(raw)
+        except Exception as e:
+            print(f"[LM] Нативный Ollama-вызов не удался, фоллбек на OpenAI-клиент: {e}", flush=True)
+            # падаем в старый путь ниже (например, если requests недоступен
+            # или сервер временно не отвечает на нативный эндпоинт)
+
     _kwargs = dict(
         model=model,
         messages=[
@@ -444,6 +666,25 @@ def _build_where_clause(filters: Optional[Dict]) -> dict:
     return {}
 
 
+def _cap_raw_chunk_text(text: str, source_label: str = "") -> str:
+    """
+    Жёстко обрезает сырой текст чанка до _RAW_CHUNK_MAX_CHARS сразу при
+    получении из поиска. Прогнозисту соседние чанки не нужны никогда —
+    единая точка защиты от любой инфляции чанка (neighbor-expansion,
+    протёкшая настройка Советчика, изменение chunk_size при индексации и
+    т.п.), независимо от конкретной причины.
+    """
+    text = text or ""
+    if len(text) > _RAW_CHUNK_MAX_CHARS:
+        print(
+            f"[PREDICTOR] ⚠️ Чанк {('из ' + source_label) if source_label else ''} — "
+            f"{len(text)} симв., обрезан до {_RAW_CHUNK_MAX_CHARS}.",
+            flush=True,
+        )
+        return text[:_RAW_CHUNK_MAX_CHARS]
+    return text
+
+
 def search_documents(query: str, top_k: int = _DEFAULT_TOP_K,
                       filters: Optional[Dict] = None,
                       sources: Optional[List[str]] = None) -> List[Dict]:
@@ -481,7 +722,7 @@ def search_documents(query: str, top_k: int = _DEFAULT_TOP_K,
                 distances = results.get("distances",  [[]])[0]
                 for doc, meta, dist in zip(docs, metas, distances):
                     all_chunks.append({
-                        "text":          doc,
+                        "text":          _cap_raw_chunk_text(doc, meta.get("filename", "")),
                         "file":          meta.get("filename", ""),
                         "date":          meta.get("protocol_date", ""),
                         "sphere":        meta.get("sphere", ""),
@@ -518,7 +759,7 @@ def search_documents(query: str, top_k: int = _DEFAULT_TOP_K,
                 distances = results.get("distances",  [[]])[0]
                 for doc, meta, dist in zip(docs, metas, distances):
                     all_chunks.append({
-                        "text":         doc,
+                        "text":         _cap_raw_chunk_text(doc, meta.get("file", "")),
                         "file":         meta.get("file", ""),
                         "date":         meta.get("date", ""),
                         "sphere":       meta.get("sphere", ""),
@@ -649,13 +890,36 @@ def search_documents_hybrid(
 
     При недоступности BM25/reranker — мягкий fallback на обычный
     векторный поиск (search_documents).
+
+    ПРОГНОЗИСТУ СОСЕДНИЕ ЧАНКИ НЕ НУЖНЫ НИКОГДА — только сам целевой
+    чанк с конкретным решением регулятора; окружающий контекст соседних
+    фрагментов только размывает узкую задачу классификации "какой вариант
+    выбран" и может приводить к раздутым (35 000+ симв.) чанкам,
+    съедающим весь бюджет контекста (см. _truncate_chunks_by_char_budget).
+    HybridRetriever — общий с Советчиком (core/advisor.py), который умеет
+    подтягивать соседей через st.session_state["neighbor_radius"]
+    (настройка на странице Советчика, session_state общий на весь процесс
+    Streamlit) — если пользователь недавно выставил её в Советчике, она
+    могла "протечь" и в поиск Прогнозиста в той же сессии. Поэтому здесь
+    временно форсируем 0 на время вызова и восстанавливаем прежнее
+    значение сразу после — чтобы не сбить настройку Советчика.
     """
     retriever = _get_expertise_hybrid_retriever()
     if retriever is None:
         print("[PREDICTOR] Гибридный поиск недоступен, fallback на векторный поиск.")
         return search_documents(query, top_k=top_k, filters=filters, sources=["expertise"])
 
-    candidates = retriever.search(query, top_k=retrieval_pool)
+    _had_neighbor_key = "neighbor_radius" in st.session_state
+    _prev_neighbor_radius = st.session_state.get("neighbor_radius")
+    st.session_state["neighbor_radius"] = 0
+    try:
+        candidates = retriever.search(query, top_k=retrieval_pool)
+    finally:
+        if _had_neighbor_key:
+            st.session_state["neighbor_radius"] = _prev_neighbor_radius
+        else:
+            st.session_state.pop("neighbor_radius", None)
+
     candidates = _filter_candidates_by_where(candidates, filters)
 
     if not candidates:
@@ -679,7 +943,7 @@ def search_documents_hybrid(
     for c in reranked:
         meta = c.get("meta", {})
         results.append({
-            "text":          c.get("doc", ""),
+            "text":          _cap_raw_chunk_text(c.get("doc", ""), meta.get("filename", "")),
             "file":          meta.get("filename", ""),
             "date":          meta.get("protocol_date", ""),
             "sphere":        meta.get("sphere", ""),
@@ -711,16 +975,39 @@ def _truncate_chunks_by_char_budget(
     включённом Unified KV Cache в LM Studio, который накапливает
     контекст между последовательными вызовами).
 
+    ВАЖНО — ФИКС "ОСТАЁТСЯ ТОЛЬКО 1 ИСТОЧНИК": раньше в сумму бюджета
+    считалась ПОЛНАЯ сырая длина текста чанка, как его вернул поиск. Но
+    каждый чанк и так обрезается до `chunk_chars_to_llm` (по умолчанию
+    1500) непосредственно перед отправкой в LLM — см. classify_chunk.
+    Если ретривер начинает возвращать раздутые чанки (например, из-за
+    neighbor-expansion — известная проблема, см. заметку про
+    debug_search_candidates в claim_analyzer: один чанк может раздуться с
+    ~1750 до 35 000+ символов), ОДИН такой чанк сам по себе исчерпывал
+    весь 35-тысячный бюджет — и все остальные источники отбрасывались,
+    сколько бы top-K ни было выбрано. Теперь бюджет считается по той же
+    ЭФФЕКТИВНОЙ длине (после обрезки до chunk_chars_to_llm), что реально
+    уйдёт в LLM — а не по сырой длине из поиска.
+
     Возвращает (обрезанный_список, отброшено_чанков).
     """
+    _chunk_chars_to_llm = int(load_predictor_config().get("chunk_chars_to_llm", 1500))
+
     kept: List[Dict] = []
     total_chars = 0
     for chunk in chunks:
-        chunk_len = len(chunk.get("text", "") or "")
-        if kept and total_chars + chunk_len > budget:
+        raw_len = len(chunk.get("text", "") or "")
+        effective_len = min(raw_len, _chunk_chars_to_llm)
+        if raw_len > _chunk_chars_to_llm * 3:
+            print(
+                f"[BUDGET] ⚠️ Чанк из '{chunk.get('file', '?')}' — {raw_len} симв. сырых "
+                f"(>{_chunk_chars_to_llm * 3}), похоже на инфляцию чанка (neighbor-expansion?). "
+                f"Учтён как {effective_len} симв. (после обрезки до chunk_chars_to_llm).",
+                flush=True,
+            )
+        if kept and total_chars + effective_len > budget:
             break
         kept.append(chunk)
-        total_chars += chunk_len
+        total_chars += effective_len
     dropped = len(chunks) - len(kept)
     return kept, dropped
 
@@ -806,6 +1093,128 @@ def _reconcile_decision_with_reason(decision: str, reason: str) -> tuple[str, bo
     return decision, False
 
 
+_GENERIC_CHOICE_FILLER_WORDS = {
+    "данные", "данных", "данным", "данными", "данные,",
+    "сведения", "сведений", "сведениям", "сведениями",
+    "информация", "информации", "информацию",
+    "показатели", "показателей", "показателям", "показателями",
+    "документ", "документа", "документу", "документе",
+}
+
+# Известные пары ПРОТИВОПОЛОЖНЫХ по смыслу вариантов в этой предметной
+# области (тарифное регулирование). Расширенный список: сроки/величины,
+# методология расчёта, итоговое решение по заявке, объём удовлетворения.
+#
+# ВАЖНО про формат: каждый элемент — (regex_1, regex_2). Используется
+# re.search, а не plain-substring — это принципиально для пар вида
+# "обоснован"/"необоснован", где второе слово ЛИТЕРАЛЬНО содержит первое
+# как подстроку ("не"+"обоснованный"). При обычной substring-проверке
+# "необоснованный" ложно засчитывался бы одновременно и за "обоснован", и
+# за "необоснован", создавая ложный конфликт даже при сравнении слова
+# самого с собой. Для таких пар позитивный вариант помечен
+# (?<!не) — "не встречается сразу после 'не'".
+_ANTONYM_MARKER_PAIRS = [
+    # Сроки / величины
+    (r"максимальн", r"минимальн"),
+    (r"максимум", r"минимум"),
+    (r"верхн", r"нижн"),
+    (r"остаточн", r"первоначальн"),
+    # Методология расчёта: факт vs норматив/план
+    (r"фактическ", r"норматив"),
+    (r"\bфакт", r"норматив"),
+    (r"(?<!не)план", r"\bфакт"),
+    (r"(?<!не)расчётн", r"фактическ"),
+    (r"(?<!не)расчетн", r"фактическ"),
+    # Включение / исключение из расчёта
+    (r"включ", r"исключ"),
+    (r"(?<!не)учит", r"неучит"),
+    (r"(?<!не)учит", r"не\s+учит"),
+    # Итоговое решение регулятора по заявке/подходу
+    (r"принят", r"отклон"),
+    (r"принят", r"отказ"),
+    (r"одобр", r"отказ"),
+    (r"одобр", r"отклон"),
+    (r"удовлетвор", r"отказ"),
+    (r"согласи", r"не\s+согласи"),
+    (r"поддерж", r"отклон"),
+    # Объём удовлетворения
+    (r"полност", r"частичн"),
+    (r"в\s+полном\s+объ[её]ме", r"частичн"),
+    (r"цели[кч]ом", r"частичн"),
+    # Динамика величины (используется реже, но встречается в reason)
+    (r"повышен", r"понижен"),
+    (r"увеличен", r"уменьшен"),
+    (r"увеличен", r"снижен"),
+    (r"рост", r"снижен"),
+    # Обоснованность/целесообразность/правомерность — частые формулировки в
+    # экспертных заключениях ("расходы признаны необоснованными" и т.п.)
+    (r"(?<!не)обоснован", r"необоснован"),
+    (r"(?<!не)эффективн", r"неэффективн"),
+    (r"(?<!не)целесообразн", r"нецелесообразн"),
+    (r"(?<!не)правомерн", r"неправомерн"),
+    (r"(?<!не)корректн", r"некорректн"),
+    (r"(?<!не)обусловлен", r"необусловлен"),
+    # Линейный/нелинейный метод амортизации (типичная развилка по статье
+    # "Амортизация") — lookbehind нужен по той же причине, что и выше
+    (r"(?<!не)линейн", r"нелинейн"),
+]
+
+
+def _has_antonym_conflict(a: str, b: str) -> bool:
+    """True, если в двух нормализованных строках обнаружены маркеры
+    противоположных по смыслу вариантов из разных пар _ANTONYM_MARKER_PAIRS
+    (в любом порядке сторон). Использует re.search (не substring) — см.
+    комментарий к _ANTONYM_MARKER_PAIRS про lookbehind для пар вида
+    "обоснован"/"необоснован"."""
+    for pat1, pat2 in _ANTONYM_MARKER_PAIRS:
+        a1, a2 = re.search(pat1, a), re.search(pat2, a)
+        b1, b2 = re.search(pat1, b), re.search(pat2, b)
+        if (a1 and b2) or (a2 and b1):
+            return True
+    return False
+
+
+def _normalize_choice_text(s: str) -> str:
+    """Убирает пунктуацию и общие слова-обвязки ('данные X' → 'X'), чтобы
+    сравнение не спотыкалось на чисто стилистической разнице формулировок."""
+    s = (s or "").lower().strip()
+    s = re.sub(r'[«»"\'.,;:!?()]', '', s)
+    words = [w for w in s.split() if w not in _GENERIC_CHOICE_FILLER_WORDS]
+    return " ".join(words).strip()
+
+
+def _choices_look_same(reg_choice: str, user_choice: str) -> bool:
+    """
+    Детерминированная страховка ПОВЕРХ LLM-сравнения независимого
+    верификатора. Небольшая модель на узкой задаче сравнения двух
+    коротких формулировок иногда слишком буквально придирается к разнице
+    в словах и объявляет same_choice=false там, где по сути один и тот же
+    документ/показатель просто сформулирован чуть иначе — например,
+    "данные штатного расписания" и "штатное расписание" (реальный кейс,
+    из-за которого верный positive ошибочно понижался до neutral).
+
+    ВАЖНО: сначала проверяется _has_antonym_conflict — "максимальный срок"
+    и "минимальный срок" совпадают на 85% посимвольно, но это семантические
+    противоположности (реальный кейс ложного positive). Явный антоним
+    перебивает любую строковую похожесть и сразу даёт "не совпадают".
+
+    Не заменяет LLM-сравнение полностью (для действительно разных
+    документов эвристика ничего не даст — ratio будет низким), а лишь
+    ловит явные случаи почти дословного совпадения, которые модель могла
+    пропустить.
+    """
+    a = _normalize_choice_text(reg_choice)
+    b = _normalize_choice_text(user_choice)
+    if not a or not b:
+        return False
+    if _has_antonym_conflict(a, b):
+        return False
+    if a == b or a in b or b in a:
+        return True
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return ratio >= 0.65
+
+
 def _verify_regulator_choice_vs_user_position(
     quote: str, justification: str, client, model: str,
 ) -> tuple[bool, str]:
@@ -840,16 +1249,30 @@ def _verify_regulator_choice_vs_user_position(
     user_prompt = (
         f"ТЕКСТ 1 (решение регулятора, цитата из документа): {quote}\n"
         f"ТЕКСТ 2 (позиция пользователя): {justification}\n\n"
+        f"Помни: ТЕКСТ 1 взят из протокола РЭК или экспертного заключения, "
+        f"подготовленного для обоснования решения РЭК — то есть по "
+        f"умолчанию это позиция самого регулятора, а не организации-"
+        f"заявителя (если только в тексте прямо не сказано 'заявлено "
+        f"предприятием'/'по расчётам организации').\n\n"
         f"Шаг 1: определи, какой конкретный вариант/подход выбран в "
         f"ТЕКСТЕ 1 (например 'норматив', 'фактические показатели', "
-        f"'максимальный срок', 'минимальный срок' — конкретное значение, "
-        f"а не общая тема).\n"
+        f"'максимальный срок', 'минимальный срок', 'штатное расписание', "
+        f"'приказ об изменении ФОТ' — конкретный документ/значение, а не "
+        f"общая тема).\n"
         f"Шаг 2: определи, какой конкретный вариант/подход заявлен в "
         f"ТЕКСТЕ 2.\n"
-        f"Шаг 3: сравни — это ОДИН И ТОТ ЖЕ вариант, или ПРОТИВОПОЛОЖНЫЕ "
-        f"варианты внутри одной темы (например 'норматив' и "
+        f"Шаг 3: сравни — это ОДИН И ТОТ ЖЕ вариант, или ПРОТИВОПОЛОЖНЫЕ/"
+        f"РАЗНЫЕ варианты внутри одной темы (например 'норматив' и "
         f"'фактические показатели' — противоположны; 'максимальный' и "
-        f"'минимальный' — противоположны)?\n\n"
+        f"'минимальный' — противоположны; 'штатное расписание' и 'приказы "
+        f"об изменении ФОТ' — это РАЗНЫЕ конкретные документы, даже если "
+        f"оба формально официальные/нормативные)?\n\n"
+        f"ВАЖНО: не считай совпадением то, что оба текста просто "
+        f"'опираются на официальные/нормативные документы' — это "
+        f"абстрактная категория, а не конкретный вариант. same_choice=true "
+        f"ставь только если названы буквально один и тот же документ/"
+        f"показатель (или явный синоним), а не просто оба относятся к "
+        f"одному типу источников.\n\n"
         'JSON: {{"same_choice": true|false, "regulator_choice": "вариант из ТЕКСТА 1, до 40 симв.", "user_choice": "вариант из ТЕКСТА 2, до 40 симв."}}'
     )
 
@@ -865,23 +1288,66 @@ def _verify_regulator_choice_vs_user_position(
         if same_choice is None:
             # Модель не дала однозначный ответ — не блокируем
             return True, ""
-        reg_choice = data.get("regulator_choice", "")
-        user_choice = data.get("user_choice", "")
+        reg_choice = (data.get("regulator_choice") or "").strip()
+        user_choice = (data.get("user_choice") or "").strip()
+
+        # ВАЖНО: если верификатор сам не смог извлечь один из двух вариантов
+        # (пустая строка на месте regulator_choice или user_choice) — это
+        # означает СБОЙ ИЗВЛЕЧЕНИЯ самого верификатора, а не реальное
+        # противоречие позиций. Раньше в этом случае same_choice=false
+        # (пустое ≠ непустое) неправомерно понижал корректный
+        # positive/negative первого этапа до neutral — именно так терялись
+        # результаты вида "регулятор: «штатное расписание», пользователь:
+        # «»". Считаем такую проверку неинформативной и НЕ блокируем
+        # результат первого этапа.
+        if not reg_choice or not user_choice:
+            print(
+                f"[VERIFY] Пустой вариант при извлечении "
+                f"(регулятор='{reg_choice}', пользователь='{user_choice}') — "
+                f"проверка неинформативна, не понижаем decision",
+                flush=True,
+            )
+            return True, ""
+
+        same_choice = bool(same_choice)
+
+        # ДЕТЕРМИНИРОВАННАЯ СТРАХОВКА: если LLM сказала same_choice=false,
+        # но по факту извлечённые формулировки почти дословно совпадают
+        # (например, "данные штатного расписания" и "штатное расписание" —
+        # реальный кейс), не доверяем решению модели вслепую и признаём
+        # совпадение эвристически. Модель на этой узкой задаче иногда
+        # слишком буквально придирается к стилистической разнице
+        # формулировок вместо содержательного сравнения.
+        if not same_choice and _choices_look_same(reg_choice, user_choice):
+            print(
+                f"[VERIFY] LLM вернула same_choice=false, но формулировки "
+                f"почти совпадают ('{reg_choice}' ~ '{user_choice}') — "
+                f"эвристика перебивает вердикт на 'совпадают', не понижаем",
+                flush=True,
+            )
+            same_choice = True
+
         note = f"регулятор: «{reg_choice}», пользователь: «{user_choice}»"
         print(f"[VERIFY] Независимый результат: same_choice={same_choice} ({note})", flush=True)
-        return bool(same_choice), note
+        return same_choice, note
     except Exception as e:
         print(f"[VERIFY] Сбой независимой проверки (raw='{raw if 'raw' in dir() else '?'}'): {e}", flush=True)
         return True, ""
 
 
 def classify_chunk(chunk_text: str, article_name: str, justification_summary: str,
-                   client, model: str) -> Dict:
+                   client, model: str, force_verification: Optional[bool] = None) -> Dict:
     """
     Классифицирует один чанк протокола.
     Возвращает: {"decision": "positive"|"negative"|"neutral", "quote": str, "reason": str}
     Параметры читаются из config/predictor_config.json,
     промпты — из config/prompts.json (настраиваются в Админке).
+
+    `force_verification` — если передан (True/False), перебивает значение
+    "enable_verification" из конфига для этого конкретного запуска
+    (используется переключателем в интерфейсе, чтобы можно было быстро
+    сравнить результат с включённой/выключенной второй проверкой без
+    правки config-файла).
     """
     cfg     = load_predictor_config()
     prompts = load_predictor_prompts()
@@ -952,22 +1418,58 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
         quote  = data.get("quote", chunk_text[:150])
         decision, _was_fixed = _reconcile_decision_with_reason(decision, reason)
 
-        # ВТОРОЙ ЭТАП: НЕЗАВИСИМАЯ проверка quote vs justification_summary
-        # (позиция пользователя), без посредника reason. Если регулятор в
-        # цитате выбрал вариант, противоположный позиции пользователя —
-        # понижаем результат до neutral с пометкой на проверку эксперта,
-        # не пытаясь угадать "правильный" decision программно.
         needs_expert_review = False
-        if decision != "neutral":
+        original_decision = None
+
+        # ВТОРОЙ ЭТАП: НЕЗАВИСИМАЯ проверка quote vs justification_summary
+        # (позиция пользователя), без посредника reason.
+        #
+        # ВАЖНО — НАПРАВЛЕННАЯ ПРОВЕРКА (правило: neutral только если этапы
+        # РАСХОДЯТСЯ): same_choice сам по себе НЕ говорит, верен ли decision
+        # — это зависит от того, что предсказал ПЕРВЫЙ этап:
+        #   - decision == "positive" ожидает same_choice == True (регулятор
+        #     должен был выбрать ТОТ ЖЕ вариант, что и пользователь).
+        #     same_choice == False здесь означает: 1-й этап сказал "за",
+        #     2-й — "против" → это и есть расхождение этапов → neutral.
+        #   - decision == "negative" ожидает same_choice == False (регулятор
+        #     должен был выбрать ПРОТИВОПОЛОЖНЫЙ вариант — это и делает его
+        #     "против"). same_choice == True здесь означает: 1-й этап сказал
+        #     "против", а 2-й, наоборот, нашёл совпадение → зеркальное
+        #     расхождение → тоже neutral.
+        #
+        # РАНЬШЕ код всегда требовал same_choice == True для ЛЮБОГО decision
+        # (в т.ч. для negative) — из-за этого КАЖДЫЙ верно определённый
+        # "против" результат ошибочно понижался в neutral: для negative
+        # same_choice ПРАВИЛЬНО должен быть False, а старый код трактовал
+        # такой (корректный!) False как "проверка провалилась". Это было
+        # главной причиной того, что почти все результаты уходили в
+        # нейтраль.
+        _verification_on = (
+            force_verification if force_verification is not None
+            else bool(cfg.get("enable_verification", True))
+        )
+        if decision != "neutral" and _verification_on:
             print(f"[VERIFY] Запуск второго этапа для decision={decision}", flush=True)
-            is_consistent, verify_note = _verify_regulator_choice_vs_user_position(
+            same_choice, verify_note = _verify_regulator_choice_vs_user_position(
                 quote, justification_summary, client, model,
             )
-            if not is_consistent:
-                print(f"[VERIFY] ⚠️ Противоречие найдено, понижаем decision {decision} → neutral", flush=True)
+            expected_same_choice = (decision == "positive")
+            if same_choice != expected_same_choice:
+                _stage1_label = "за" if decision == "positive" else "против"
+                _stage2_label = "за" if same_choice else "против"
+                print(
+                    f"[VERIFY] ⚠️ Расхождение этапов: 1-й этап='{_stage1_label}', "
+                    f"2-й этап='{_stage2_label}' — понижаем decision в neutral",
+                    flush=True,
+                )
+                original_decision = decision
                 decision = "neutral"
                 needs_expert_review = True
-                reason = f"Требует проверки эксперта: позиции не совпадают ({verify_note})"
+                reason = (
+                    f"Требует проверки эксперта: первый этап определил "
+                    f"«{_stage1_label}», независимая проверка — "
+                    f"«{_stage2_label}» ({verify_note})"
+                )
 
         return {
             "decision": decision,
@@ -975,6 +1477,7 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
             "reason":   reason,
             "decision_fields": decision_fields,
             "needs_expert_review": needs_expert_review,
+            "original_decision": original_decision,
         }
     except Exception:
         # Fallback: пробуем угадать по ключевым словам
@@ -1013,7 +1516,14 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
         fname = chunk.get("file") or "неизвестный файл"
         by_file[fname].append(chunk)
 
-    result = {"positive": [], "negative": [], "neutral": [], "total_files": 0}
+    result = {
+        "positive": [], "negative": [], "neutral": [], "total_files": 0,
+        # Сколько файлов попало в neutral именно из-за понижения второй
+        # проверкой (а не потому что прецедент по существу нейтрален) —
+        # ключевая диагностика при подозрении на завышенную строгость
+        # верификатора.
+        "verifier_downgraded_files": 0,
+    }
 
     for fname, chunks in by_file.items():
         # Считаем голоса
@@ -1021,10 +1531,16 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
         # Определяем победившее решение
         decision = counter.most_common(1)[0][0]
 
-        # Берём лучшую цитату — от чанка с победившим решением
+        # Берём лучшую цитату — от чанка с победившим решением.
+        # Если среди чанков с этим decision есть понижённые верификатором
+        # (needs_expert_review), предпочитаем такой чанк — эксперту нужно
+        # видеть именно спорный случай, а не случайный "тихо нейтральный".
+        candidates = [c for c in chunks if c["decision"] == decision]
         best_chunk = next(
-            (c for c in chunks if c["decision"] == decision), chunks[0]
-        )
+            (c for c in candidates if c.get("needs_expert_review")), candidates[0]
+        ) if candidates else chunks[0]
+
+        _file_needs_review = any(c.get("needs_expert_review") for c in chunks)
 
         file_record = {
             "file":         fname,
@@ -1039,12 +1555,15 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
             "quote":        best_chunk.get("quote", ""),
             "reason":       best_chunk.get("reason", ""),
             "decision_fields": best_chunk.get("decision_fields", {}),
-            "needs_expert_review": best_chunk.get("needs_expert_review", False),
+            "needs_expert_review": _file_needs_review,
+            "original_decision": best_chunk.get("original_decision"),
             "chunks_total": len(chunks),
             "chunks_decision": dict(counter),
         }
         result[decision].append(file_record)
         result["total_files"] += 1
+        if decision == "neutral" and _file_needs_review:
+            result["verifier_downgraded_files"] += 1
 
     return result
 
@@ -1059,10 +1578,13 @@ def run_prediction(
     filters: Optional[Dict] = None,
     sources: Optional[List[str]] = None,
     _progress_cb=None,
+    force_verification: Optional[bool] = None,
 ) -> Optional[Dict]:
     """
     Запускает полный цикл прогноза. Возвращает dict с результатами или None при ошибке.
     `sources` — список из {"protocols", "expertise"}; по умолчанию ["expertise"].
+    `force_verification` — переключатель второй ("верификационной") ступени
+    классификации; см. classify_chunk. None — берётся из конфига.
     """
     if not article_name.strip():
         return None
@@ -1157,7 +1679,8 @@ def run_prediction(
             pct = 0.40 + (i / total) * 0.50
             _progress_cb(pct, f"Классифицирую фрагмент {i + 1} / {total}…")
         classification = classify_chunk(
-            chunk["text"], article_name, justification_summary, client, model
+            chunk["text"], article_name, justification_summary, client, model,
+            force_verification=force_verification,
         )
         classified.append({**chunk, **classification})
 
@@ -1244,7 +1767,7 @@ def compute_approval_score(n_positive: int, n_negative: int, n_neutral: int) -> 
     }
 
 
-def _source_card(record: Dict, idx: int, decision: str) -> None:
+def _source_card(record: Dict, idx: int, decision: str, article: str = "") -> None:
     """Отображает одну карточку-источник в свёрнутом виде (как в советчике)."""
     color_map = {"positive": "#2e7a50", "negative": "#b33a3a", "neutral": "#888"}
     border_color = color_map.get(decision, "#888")
@@ -1296,43 +1819,73 @@ def _source_card(record: Dict, idx: int, decision: str) -> None:
         if record.get("reason"):
             st.caption(f"Оценка системы: {record['reason']}")
 
-        # ── Ручной выбор эксперта для спорных neutral-источников ───────────
-        # Только для тех, что понижены автоматической проверкой
-        # согласованности (needs_expert_review=True) — не для всех neutral,
-        # большинство которых нейтральны по делу (нет решения в прецеденте).
-        if decision == "neutral" and record.get("needs_expert_review"):
-            _fkey = record.get("file", "")
-            _current_override = st.session_state.get("pred_expert_overrides", {}).get(_fkey)
+        # ── Ручная коррекция эксперта — доступна для ЛЮБОЙ категории ────────
+        # Раньше кнопки "за/против" показывались только для нейтральных
+        # источников. Эксперт может ошибочно доверять ИИ и там, где ИИ сам
+        # ошибся на "за" или "против" — поэтому коррекция теперь доступна
+        # везде, всегда в виде трёх кнопок (за / против / нейтрально), а
+        # текущий активный вариант подсвечен. Каждое изменение — включая
+        # исходное решение эксперта поправить ИИ и возврат к вердикту ИИ —
+        # регистрируется в постоянном логе (data/predictor/expert_overrides.jsonl)
+        # через _log_expert_override, независимо от session_state.
+        _fkey = record.get("file", "")
+        _ai_decision = record.get("_ai_decision", decision)
+        _overrides = st.session_state.setdefault("pred_expert_overrides", {})
+        _current_final = _overrides.get(_fkey, _ai_decision)  # то, что показано сейчас (decision параметр)
 
-            st.caption("Модель не смогла однозначно определить позицию — выберите вручную:")
-            ec1, ec2, ec3 = st.columns(3)
-            with ec1:
-                if st.button(
-                    "Это «за»", key=f"override_pos_{idx}_{_fkey}",
-                    type="primary" if _current_override == "positive" else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state.setdefault("pred_expert_overrides", {})[_fkey] = "positive"
-                    st.rerun()
-            with ec2:
-                if st.button(
-                    "Это «против»", key=f"override_neg_{idx}_{_fkey}",
-                    type="primary" if _current_override == "negative" else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state.setdefault("pred_expert_overrides", {})[_fkey] = "negative"
-                    st.rerun()
-            with ec3:
-                if _current_override and st.button(
-                    "Сбросить", key=f"override_reset_{idx}_{_fkey}",
-                    use_container_width=True,
-                ):
-                    st.session_state.get("pred_expert_overrides", {}).pop(_fkey, None)
-                    st.rerun()
+        if record.get("needs_expert_review") and _ai_decision == "neutral":
+            _orig = record.get("original_decision")
+            _orig_label = _DECISION_RU.get(_orig, "")
+            if _orig_label:
+                st.caption(
+                    f"Первый этап определил это как «{_orig_label}», но вторая "
+                    f"проверка нашла несовпадение позиций и понизила до "
+                    f"нейтрального — уточните вручную при необходимости:"
+                )
+            else:
+                st.caption("Модель не смогла однозначно определить позицию — при необходимости уточните вручную:")
+        else:
+            st.caption(
+                f"ИИ определил как «{_DECISION_RU.get(_ai_decision, _ai_decision)}» — "
+                f"при необходимости исправьте вручную:"
+            )
 
-            if _current_override:
-                _override_label = "за" if _current_override == "positive" else "против"
-                st.caption(f"✓ Учтено вручную как «{_override_label}»")
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        _btn_specs = [
+            (ec1, "За",        "positive", "override_pos_"),
+            (ec2, "Против",    "negative", "override_neg_"),
+            (ec3, "Нейтрально", "neutral",  "override_neu_"),
+        ]
+        for _col, _label, _value, _key_prefix in _btn_specs:
+            with _col:
+                if st.button(
+                    _label, key=f"{_key_prefix}{idx}_{_fkey}",
+                    type="primary" if _current_final == _value else "secondary",
+                    use_container_width=True,
+                ):
+                    if _value != _current_final:
+                        _log_expert_override(
+                            article, _fkey, _ai_decision, _current_final, _value, quote,
+                        )
+                    if _value == _ai_decision:
+                        _overrides.pop(_fkey, None)  # совпало с ИИ — override не нужен
+                    else:
+                        _overrides[_fkey] = _value
+                    st.rerun()
+        with ec4:
+            if _fkey in _overrides and st.button(
+                "Сбросить", key=f"override_reset_{idx}_{_fkey}",
+                use_container_width=True,
+            ):
+                _log_expert_override(article, _fkey, _ai_decision, _current_final, _ai_decision, quote)
+                _overrides.pop(_fkey, None)
+                st.rerun()
+
+        if _fkey in _overrides:
+            st.caption(
+                f"✓ Исправлено вручную: ИИ определил «{_DECISION_RU.get(_ai_decision, _ai_decision)}», "
+                f"эксперт — «{_DECISION_RU.get(_current_final, _current_final)}»"
+            )
 
         # Метаданные
         meta_parts = []
@@ -1465,8 +2018,26 @@ def _show_file_preview_dialog():
     скроллом управлять не может. Сам текст экранируется от HTML-инъекций
     перед вставкой (документы пользовательские, могут случайно содержать
     символы вроде "<").
+
+    ВАЖНО — ФИКС "МОДАЛКА САМА ОТКРЫВАЕТСЯ СНОВА": раньше _preview_file
+    оставался в session_state до нажатия именно НАШЕЙ кнопки «Закрыть».
+    Но встроенный крестик «×» в углу st.dialog закрывает окно чисто
+    визуально, БЕЗ выполнения нашего Python-кода — _preview_file
+    оставался установленным. На следующем любом действии на странице
+    (клик по фильтру, разворачивание другой карточки и т.п.) скрипт
+    перезапускался, видел, что _preview_file всё ещё стоит, и Streamlit
+    открывал диалог заново "с нуля" — то самое неожиданное повторное
+    появление модалки.
+
+    Фикс: используем _preview_file как ОДНОРАЗОВЫЕ данные — забираем их
+    (pop) из session_state СРАЗУ при показе, а не при закрытии. Тогда на
+    любом следующем перезапуске скрипта (по любой причине, включая
+    закрытие через «×») флага уже не будет, и модалка не появится снова
+    сама по себе. Побочный эффект: клик по «Скачать» внутри диалога тоже
+    закроет модалку (это вызывает свой rerun) — приемлемый компромисс
+    ради того, чтобы модалка больше не всплывала непредсказуемо.
     """
-    preview = st.session_state.get("_preview_file")
+    preview = st.session_state.pop("_preview_file", None)
     if not preview:
         return
 
@@ -1598,7 +2169,6 @@ def _show_file_preview_dialog():
             )
         with dc2:
             if st.button("Закрыть", use_container_width=True):
-                st.session_state.pop("_preview_file", None)
                 st.rerun()
 
     _dialog()
@@ -1885,6 +2455,22 @@ def _show_predict_tab():
             key="pred_top_k",
             help="Сколько фрагментов протоколов извлекается перед классификацией",
         )
+        enable_verification = st.checkbox(
+            "Вторая (верификационная) проверка позиции",
+            value=bool(load_predictor_config().get("enable_verification", True)),
+            key="pred_enable_verification",
+            help=(
+                "Независимая перепроверка каждого предварительного "
+                "positive/negative результата. Если результаты почти всегда "
+                "уходят в «нейтрально» — отключите здесь и запустите прогноз "
+                "заново, чтобы проверить, не она ли тому причина."
+            ),
+        )
+        if not enable_verification:
+            st.caption(
+                "⚠️ Вторая проверка отключена — positive/negative от первого "
+                "этапа не будут понижаться до нейтральных."
+            )
 
     # ── Кнопка запуска ────────────────────────────────────────────────────────
     st.divider()
@@ -1908,6 +2494,7 @@ def _show_predict_tab():
                 "justification": justification_text,
                 "top_k":         top_k,
                 "sources":       selected_sources,
+                "enable_verification": enable_verification,
                 "filters": {
                     k: v for k, v in {
                         "spheres":  filter_spheres,   # список без эмодзи
@@ -1938,6 +2525,7 @@ def _show_predict_tab():
                 filters           = params["filters"],
                 sources           = params.get("sources", ["expertise"]),
                 _progress_cb      = _progress,
+                force_verification= params.get("enable_verification"),
             )
 
         progress_bar.progress(1.0, text="Готово")
@@ -1978,30 +2566,34 @@ def _show_predict_tab():
         return
 
     agg  = result["aggregated"]
-    pos  = list(agg.get("positive", []))
-    neg  = list(agg.get("negative", []))
-    neu  = list(agg.get("neutral",  []))
     total = agg.get("total_files", 0)
 
-    # ── Применяем ручные правки эксперта по спорным neutral-источникам ──────
+    # ── Применяем ручные правки эксперта — теперь для ЛЮБОЙ категории ───────
+    # (раньше override можно было поставить только источникам, попавшим в
+    # "нейтрально"; теперь эксперт может исправить и "за", и "против" —
+    # каждая правка регистрируется в data/predictor/expert_overrides.jsonl).
     # Хранится отдельно от result, чтобы не модифицировать исходные данные
     # прогноза — override применяется только к отображению/подсчёту.
     if "pred_expert_overrides" not in st.session_state:
         st.session_state["pred_expert_overrides"] = {}
     _overrides = st.session_state["pred_expert_overrides"]
 
-    if _overrides:
-        _still_neutral = []
-        for rec in neu:
-            _key = rec.get("file", "")
-            _override = _overrides.get(_key)
-            if _override == "positive":
-                pos.append(rec)
-            elif _override == "negative":
-                neg.append(rec)
-            else:
-                _still_neutral.append(rec)
-        neu = _still_neutral
+    # Помечаем каждую запись её ИСХОДНЫМ вердиктом ИИ (_ai_decision) ДО
+    # применения ручных правок — нужно для отображения "ИИ определил как X,
+    # эксперт исправил на Y" внутри карточки, независимо от того, в какой
+    # финальный список запись в итоге попадёт.
+    pos, neg, neu = [], [], []
+    for _ai_decision, _records in (
+        ("positive", agg.get("positive", [])),
+        ("negative", agg.get("negative", [])),
+        ("neutral",  agg.get("neutral",  [])),
+    ):
+        for _rec in _records:
+            _rec = dict(_rec)
+            _rec["_ai_decision"] = _ai_decision
+            _fkey = _rec.get("file", "")
+            _final = _overrides.get(_fkey, _ai_decision)
+            {"positive": pos, "negative": neg, "neutral": neu}[_final].append(_rec)
 
     st.divider()
     st.subheader("Результаты")
@@ -2020,6 +2612,15 @@ def _show_predict_tab():
             f"Контекст ограничен бюджетом {_RAG_CONTEXT_CHAR_BUDGET:,} символов — "
             f"{result['chunks_dropped_budget']} наименее релевантных фрагментов "
             f"не учитывались в анализе.".replace(",", " ")
+        )
+    _n_downgraded = agg.get("verifier_downgraded_files", 0)
+    if _n_downgraded:
+        st.caption(
+            f"ℹ️ Из нейтральных — {_n_downgraded} понижены со второго этапа "
+            f"проверки (были предварительно за/против, но вторая проверка "
+            f"нашла несовпадение позиций). Разверните карточку источника, "
+            f"чтобы увидеть исходную оценку и при необходимости выбрать "
+            f"вручную."
         )
     st.markdown("")
 
@@ -2094,7 +2695,7 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(pos):
-            _source_card(rec, i, "positive")
+            _source_card(rec, i, "positive", article=result.get("article", ""))
         st.markdown("")
 
     # ── Источники — отрицательные ─────────────────────────────────────────────
@@ -2105,7 +2706,7 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(neg):
-            _source_card(rec, i, "negative")
+            _source_card(rec, i, "negative", article=result.get("article", ""))
         st.markdown("")
 
     # ── Источники — нейтральные ───────────────────────────────────────────────
@@ -2116,7 +2717,7 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(neu):
-            _source_card(rec, i, "neutral")
+            _source_card(rec, i, "neutral", article=result.get("article", ""))
 
     if not pos and not neg and not neu:
         st.warning("По данной статье затрат не найдено релевантных фрагментов в протоколах.")

@@ -1,0 +1,98 @@
+{
+  "org_20260711_212904": {
+    "name": "Тамбовская область",
+    "created_at": "2026-07-11T21:29:04",
+    "status": "active",
+    "archived_at": null,
+    "rag_collection_name": "docs_tambov",
+    "rag_doc_count": 0,
+    "rag_last_indexed_at": null,
+    "license_until": "9999-12-31",
+    "max_users": 999,
+    "admin_notes": "Контактное лицо - Варкова Светлана Анатольевна",
+    "admin_notes_updated_at": "2026-07-11T22:35:08",
+    "modules": {
+      "advisor": {
+        "enabled": true,
+        "status": "active"
+      },
+      "scanner": {
+        "enabled": true,
+        "status": "active"
+      },
+      "analyzer": {
+        "enabled": false,
+        "status": "active"
+      },
+      "predictor": {
+        "enabled": false,
+        "status": "active"
+      },
+      "protocol": {
+        "enabled": false,
+        "status": "active"
+      }
+    }
+  },
+  "org_20260711_220403": {
+    "name": "Сахалинская область",
+    "created_at": "2026-07-11T22:04:03",
+    "status": "active",
+    "archived_at": null,
+    "rag_collection_name": "docs_sahalin",
+    "rag_doc_count": 0,
+    "rag_last_indexed_at": null,
+    "license_until": "9999-12-31",
+    "max_users": 999,
+    "admin_notes": "",
+    "admin_notes_updated_at": null
+  },
+  "org_20260712_205350": {
+    "name": "Регула",
+    "created_at": "2026-07-12T20:53:50",
+    "status": "active",
+    "archived_at": null,
+    "rag_collection_name": "regula_ doc",
+    "rag_doc_count": 0,
+    "rag_last_indexed_at": null,
+    "license_until": "9999-12-31",
+    "max_users": 999,
+    "admin_notes": "Сегмент ключевых лиц, разработки.",
+    "admin_notes_updated_at": "2026-07-15T21:03:22"
+  },
+  "org_20260716_152844": {
+    "name": "РЭК Ульяновска",
+    "created_at": "2026-07-16T15:28:44",
+    "status": "active",
+    "archived_at": null,
+    "rag_collection_name": "uli_doc",
+    "rag_doc_count": 0,
+    "rag_last_indexed_at": null,
+    "license_until": "9999-12-31",
+    "max_users": 999,
+    "admin_notes": "",
+    "admin_notes_updated_at": null,
+    "modules": {
+      "advisor": {
+        "enabled": true,
+        "status": "active"
+      },
+      "scanner": {
+        "enabled": true,
+        "status": "active"
+      },
+      "analyzer": {
+        "enabled": true,
+        "status": "active"
+      },
+      "predictor": {
+        "enabled": true,
+        "status": "active"
+      },
+      "protocol": {
+        "enabled": true,
+        "status": "active"
+      }
+    }
+  }
+}

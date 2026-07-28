@@ -861,8 +861,10 @@ def show_claim_analyzer():
         ]
         for _k in _CA_KEYS:
             st.session_state.pop(_k, None)
-        # Сбрасываем uploader через смену ключа
-        st.session_state["ca_uploader_key"] = st.session_state.get("ca_uploader_key", 0) + 1
+        # Явно очищаем список файлов в uploader (ключ теперь статичный —
+        # это часть диагностического теста на гипотезу "динамический key
+        # ломает upload"; permanent-версию решим по результату теста)
+        st.session_state.pop("ca_uploader_static", None)
         st.rerun()
 
     ss = st.session_state
@@ -982,12 +984,11 @@ def show_claim_analyzer():
         "Чтобы загрузить папку целиком: откройте папку в проводнике, "
         "нажмите Ctrl+A для выделения всех файлов, затем перетащите их сюда."
     )
-    _uploader_key = f"ca_uploader_{ss.get('ca_uploader_key', 0)}"
     uploaded = st.file_uploader(
         "Перетащите файлы или нажмите «Browse files»",
         type=["xlsx", "xls", "pdf", "docx", "doc"],
         accept_multiple_files=True,
-        key=_uploader_key,
+        key="ca_uploader_static",
     ) or []
 
     if uploaded:
@@ -1614,15 +1615,41 @@ def _show_registry():
                         f"{_format_size(fsize)}"
                     )
                     if fpath:
-                        with open(fpath, "rb") as f_bin:
+                        # ── Ленивое чтение файла — ТОЛЬКО по явному клику ────
+                        #
+                        # ПРИЧИНА БАГА "загрузка файлов не работает в Анализаторе":
+                        # раньше файл читался с диска БЕЗУСЛОВНО на каждом
+                        # rerun страницы (даже если экспандер свёрнут — код
+                        # внутри st.expander выполняется всегда, сворачивание
+                        # влияет только на отображение). При накопившемся
+                        # реестре заявок это означало: каждое взаимодействие
+                        # со страницей (включая простой выбор нового файла
+                        # для загрузки в другом месте страницы) синхронно
+                        # перечитывало С ДИСКА все файлы всех сохранённых
+                        # заявок — отсюда зависание upload-хэндшейка.
+                        _dl_bytes_key = f"reg_dl_bytes_{pid}_{fname}"
+                        if st.session_state.get(_dl_bytes_key) is not None:
                             fc2_f.download_button(
                                 "Скачать",
-                                data=f_bin.read(),
+                                data=st.session_state[_dl_bytes_key],
                                 file_name=fname,
                                 key=f"reg_dl_{pid}_{fname}",
                                 use_container_width=True,
                                 help="Скачать файл",
                             )
+                        else:
+                            if fc2_f.button(
+                                "Подготовить",
+                                key=f"reg_prep_{pid}_{fname}",
+                                use_container_width=True,
+                                help="Прочитать файл с диска перед скачиванием",
+                            ):
+                                try:
+                                    with open(fpath, "rb") as f_bin:
+                                        st.session_state[_dl_bytes_key] = f_bin.read()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Ошибка чтения файла: {e}")
 
             # ── Заметки ───────────────────────────────────────────────────
             new_notes = st.text_area(

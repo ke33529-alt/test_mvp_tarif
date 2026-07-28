@@ -10,7 +10,7 @@ LABEL description="Платформа анализа тарифного регу
 
 # -----------------------------------------------------------------------------
 # Системные зависимости
-# Нужны для: EasyOCR (OpenCV), PyMuPDF, python-docx, lxml
+# Нужны для: EasyOCR (OpenCV), PyMuPDF, python-docx, lxml, faster-whisper (ffmpeg)
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Для OpenCV / EasyOCR
@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-rus \
     # Для работы с документами
     poppler-utils \
+    # Для Протокольщика — конвертация аудио (M4A/iPhone, MP3 и др. в WAV)
+    ffmpeg \
     # Утилиты
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -42,6 +44,18 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
+
+# -----------------------------------------------------------------------------
+# CUDA-библиотеки для faster-whisper (CTranslate2 backend)
+#
+# CTranslate2 требует системные libcublas.so.12 / libcudnn, которых нет
+# в python:3.11-slim (нет CUDA-рантайма, только GPU-драйвер через
+# nvidia-container-toolkit). Пакеты nvidia-cublas-cu12/nvidia-cudnn-cu12
+# из requirements.txt кладут нужные .so-файлы в site-packages — здесь
+# просто добавляем эти пути в LD_LIBRARY_PATH, чтобы динамический
+# линковщик их находил при запуске.
+# -----------------------------------------------------------------------------
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # -----------------------------------------------------------------------------
 # Копируем код приложения

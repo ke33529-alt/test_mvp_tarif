@@ -1,4 +1,3 @@
-# core/advisor.py
 import os
 import re
 import sys
@@ -154,6 +153,232 @@ client = OpenAI(
     base_url=CONFIG.get("lm_studio_url", "http://127.0.0.1:1234/v1"),
     api_key="lm-studio",
 )
+
+
+# =============================================================================
+# Идентичность: пользователь, сегмент и неймспейс кэша
+#
+# ЗАЧЕМ. _llm_cache — процессный словарь, общий для ВСЕХ пользователей всех
+# сегментов (один Streamlit-процесс обслуживает всех). До этой правки ключ
+# кэша не содержал сегмент, поэтому ответ, сгенерированный с подмешиванием
+# ЛОКАЛЬНОЙ базы сегмента A (doc_types=["local"], см. core/local_kb.py),
+# при совпадении вопроса/модели/хэша источников мог быть отдан пользователю
+# сегмента B — межсегментная утечка данных.
+#
+# ГДЕ ЛЕЖИТ ЛИЧНОСТЬ. core/auth.py::get_current_user() кладёт словарь
+# пользователя в st.session_state["_auth_user"]:
+#     {"user_id", "org_id", "role", "name", "login", "status", ...}
+# Это ЕДИНСТВЕННЫЙ источник истины. Ключ с подчёркиванием — не описка.
+# Если auth.py когда-нибудь переименует ключ, менять здесь _AUTH_USER_KEY.
+#
+# ГРАНУЛЯРНОСТЬ КЭША — неймспейс, а не голый org_id. Причина: у суперадмина
+# org_id = None, у пользователя без сегмента org_id = "". Оба falsy, и при
+# наивном подходе они схлопнулись бы в один общий котёл с кем угодно.
+# Правила деградации — всегда В СТОРОНУ ИЗОЛЯЦИИ:
+#     роль superadmin        -> "org::__superadmin__"
+#     есть org_id            -> "org::{org_id}"        (общий на сегмент)
+#     есть user_id без org   -> "user::{user_id}"      (личный, не общий)
+#     ничего нет / не в Streamlit -> "anon::public"
+#
+# Внутри сегмента кэш общий — это осознанно: база знаний у них одна, ответы
+# идентичны, общий кэш даёт скорость без потери изоляции.
+# =============================================================================
+_AUTH_USER_KEY  = "_auth_user"      # ключ session_state из core/auth.py
+ANON_NAMESPACE  = "anon::public"
+SUPERADMIN_ORG  = "__superadmin__"
+ANON_USER_ID    = "anonymous"
+
+
+def _session_state():
+    """st.session_state или None, если код выполняется вне Streamlit-процесса."""
+    try:
+        import streamlit as st
+        return st.session_state
+    except Exception:
+        return None
+
+
+def get_auth_user() -> Dict:
+    """
+    Словарь текущего пользователя из session_state или {}.
+
+    Намеренно НЕ вызывает core.auth.get_current_user(): тот читает файлы
+    сессий с диска и может вызвать logout. Здесь нужен только быстрый
+    read-only-снимок уже провалидированной личности. Если пользователь не
+    авторизован, вернётся {} — и вызывающий код уйдёт в анонимный неймспейс.
+    """
+    ss = _session_state()
+    if ss is None:
+        return {}
+    try:
+        user = ss.get(_AUTH_USER_KEY)
+    except Exception:
+        return {}
+    return user if isinstance(user, dict) else {}
+
+
+def get_current_org_id(default: str = "") -> str:
+    """
+    СЫРОЙ org_id текущего пользователя ("" если нет сегмента).
+
+    Именно это значение уходит в core.local_kb.search_local_kb() как имя
+    коллекции local_kb_{org_id} — поэтому подменять его на неймспейс или
+    на "public" нельзя, иначе поиск уйдёт в несуществующую коллекцию.
+    Для ключа кэша используется get_cache_namespace(), а не эта функция.
+    """
+    org_id = get_auth_user().get("org_id")
+    return str(org_id) if org_id else default
+
+
+def get_current_user_id(default: str = ANON_USER_ID) -> str:
+    """Идентификатор текущего пользователя ("superadmin" для суперадмина)."""
+    user_id = get_auth_user().get("user_id")
+    return str(user_id) if user_id else default
+
+
+def get_current_role(default: str = "") -> str:
+    """Роль текущего пользователя: superadmin | segment_admin | superuser | user."""
+    role = get_auth_user().get("role")
+    return str(role) if role else default
+
+
+def _ns_from_parts(role: str, org_id: str, user_id: str) -> str:
+    """Собирает неймспейс кэша по правилам деградации (см. комментарий выше)."""
+    if role == "superadmin":
+        return f"org::{SUPERADMIN_ORG}"
+    if org_id:
+        return f"org::{org_id}"
+    if user_id and user_id != ANON_USER_ID:
+        return f"user::{user_id}"
+    return ANON_NAMESPACE
+
+
+def get_cache_namespace() -> str:
+    """Неймспейс кэша LLM для текущего пользователя."""
+    user = get_auth_user()
+    return _ns_from_parts(
+        role=str(user.get("role") or ""),
+        org_id=str(user.get("org_id") or ""),
+        user_id=str(user.get("user_id") or ""),
+    )
+
+
+def namespace_for_org(org_id: Optional[str]) -> str:
+    """
+    Неймспейс по явно переданному org_id — для вызовов из фоновых потоков
+    и скриптов, где session_state недоступен.
+    """
+    if not org_id:
+        return ANON_NAMESPACE
+    return f"org::{org_id}"
+
+
+def get_identity() -> Dict[str, str]:
+    """Личность одним вызовом — для session_scope, истории и логов."""
+    user = get_auth_user()
+    return {
+        "user_id":   str(user.get("user_id") or ANON_USER_ID),
+        "org_id":    str(user.get("org_id") or ""),
+        "role":      str(user.get("role") or ""),
+        "namespace": get_cache_namespace(),
+    }
+
+
+# =============================================================================
+# Нативный Ollama /api/chat — надёжное отключение thinking-режима
+#
+# ПРОБЛЕМА: параметр "think": false, переданный через extra_body в
+# OpenAI-совместимый эндпоинт (/v1/chat/completions), на некоторых версиях
+# Ollama НЕ транслируется в нативный формат запроса — модель qwen3.5 всё
+# равно уходит в режим рассуждения (см. github.com/ollama/ollama/issues/14809).
+# Единственный надёжный способ — обращаться к нативному /api/chat напрямую,
+# где think:false — задокументированный top-level параметр.
+#
+# Используется ТОЛЬКО когда backend — Ollama (llm_backend="ollama" в конфиге,
+# по умолчанию true). Если когда-нибудь вернётесь на LM Studio — переключите
+# "llm_backend": "lm_studio" в config/advisor_config.json, тогда код пойдёт
+# через прежний OpenAI-клиент с enable_thinking-параметрами LM Studio.
+# =============================================================================
+def _ollama_native_base_url() -> str:
+    """Базовый URL Ollama БЕЗ суффикса /v1 — для нативного /api/chat."""
+    url = CONFIG.get("lm_studio_url", "http://127.0.0.1:1234/v1").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def _is_ollama_backend() -> bool:
+    return CONFIG.get("llm_backend", "ollama") == "ollama"
+
+
+def _ollama_native_options(temperature: float, max_tokens: int) -> dict:
+    """
+    Собирает словарь "options" для нативного Ollama API из конфига.
+
+    ВАЖНО про num_ctx: у Ollama дефолт всего 2048 токенов контекста, если
+    явно не задать num_ctx — это НАМНОГО меньше лимита в 20 000 токенов,
+    под который спроектирован весь RAG-пайплайн (top_k источников + соседи).
+    Без явного num_ctx длинные промпты будут незаметно обрезаться Ollama.
+    """
+    return {
+        "temperature":    temperature,
+        "num_predict":    max_tokens,
+        "num_ctx":        CONFIG.get("num_ctx", 20000),
+        "top_p":          CONFIG.get("top_p", 0.9),
+        "top_k":          CONFIG.get("top_k", 40),
+        "repeat_penalty": CONFIG.get("repeat_penalty", 1.1),
+    }
+
+
+def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout):
+    """
+    Генератор токенов через нативный Ollama /api/chat с think:false.
+    """
+    import requests
+    url = _ollama_native_base_url() + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "think": False,
+        "options": _ollama_native_options(temperature, max_tokens),
+    }
+    resp = requests.post(url, json=payload, stream=True, timeout=timeout)
+    resp.raise_for_status()
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        data = json.loads(line)
+        msg = data.get("message") or {}
+        content = msg.get("content", "")
+        if content:
+            yield content
+        if data.get("done"):
+            break
+
+
+def _ollama_chat_native(model, messages, temperature, max_tokens, timeout) -> dict:
+    """
+    Нестриминговый вызов нативного Ollama /api/chat с think:false.
+    Возвращает {"content": str, "done_reason": str}.
+    """
+    import requests
+    url = _ollama_native_base_url() + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": _ollama_native_options(temperature, max_tokens),
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data.get("message") or {}
+    return {
+        "content": msg.get("content", ""),
+        "done_reason": data.get("done_reason", "stop"),
+    }
 
 
 # =============================================================================
@@ -735,15 +960,28 @@ def _preload_models_background():
     print("[PRELOAD] Все компоненты готовы.")
  
  
-threading.Thread(
-    target=_preload_models_background,
-    daemon=True,
-    name="model-preload",
-).start()
+# Поток предзагрузки запускается В КОНЦЕ ФАЙЛА, а не здесь.
+# Причина: _preload_models_background → get_reranker() → _get_reranker_models_list()
+# → _load_search_settings(), а эта функция и AVAILABLE_RERANKER_MODELS определены
+# НИЖЕ по файлу. Запуск потока отсюда — гонка с исполнением самого модуля:
+# поток обычно успевает раньше и падает с NameError, предзагрузка реранкера
+# тихо не выполняется, и первые 12-30 сек загрузки оплачивает первый же
+# пользовательский запрос. Проявлялось как «первый вопрос всегда долгий».
  
  
 # =============================================================================
-# Кэш LLM
+# Кэш LLM — изолирован по неймспейсу (сегмент / пользователь)
+#
+# Структура файла data/cache/llm_cache.json не изменилась: это по-прежнему
+# плоский словарь {cache_key: entry}. Изоляция достигается тем, что неймспейс
+# входит в ХЭШ ключа (см. get_cache_key) — записи разных сегментов физически
+# не могут совпасть. В entry дополнительно пишется поле "ns" — оно нужно
+# только для селективной очистки и статистики, на поиск по кэшу не влияет.
+#
+# СОВМЕСТИМОСТЬ: старые записи (созданные до этой правки) не содержат
+# неймспейс в ключе и никогда не будут найдены — они мертвы и вычищаются
+# purge_expired_cache(). Ключи ломать безопасно: кэш не источник истины,
+# максимальная потеря — один повторный вызов LLM.
 # =============================================================================
 _llm_cache:  Dict = {}
 _cache_lock = threading.Lock()
@@ -765,12 +1003,155 @@ def save_llm_cache():
         json.dump(_llm_cache, f, ensure_ascii=False, indent=2)
  
  
-def get_cache_key(query: str, sources: list, model: str) -> str:
+def _cache_ttl_seconds() -> int:
+    """TTL кэша в секундах из конфига (cache_ttl_days, по умолчанию 7 дней)."""
+    try:
+        return int(float(load_config().get("cache_ttl_days", 7)) * 86400)
+    except Exception:
+        return 7 * 86400
+
+
+def get_cache_key(query: str, sources: list, model: str,
+                  namespace: Optional[str] = None) -> str:
+    """
+    Ключ кэша LLM-ответа.
+
+    namespace ОБЯЗАТЕЛЬНО входит в хэш: без него ответ, построенный на
+    локальной базе одного сегмента, мог бы вернуться пользователю другого.
+    Если не передан — определяется автоматически (get_cache_namespace).
+    """
+    if namespace is None:
+        namespace = get_cache_namespace()
     s = json.dumps(
         sorted([x.get('file', '') + x.get('snippet', '')[:100] for x in sources]),
         sort_keys=True,
     )
-    return hashlib.md5(f"{query}|||{s}|||{model}".encode()).hexdigest()
+    return hashlib.md5(f"{namespace}|||{query}|||{s}|||{model}".encode()).hexdigest()
+
+
+def _cache_get(cache_key: str) -> Optional[str]:
+    """
+    Читает валидный ответ из кэша или None.
+    Сломанные записи (петли, обрезки) удаляются на месте.
+    """
+    ttl = _cache_ttl_seconds()
+    with _cache_lock:
+        cached = _llm_cache.get(cache_key)
+        if not cached:
+            return None
+        answer = cached.get("answer", "")
+        fresh  = datetime.now().timestamp() - cached.get("timestamp", 0) < ttl
+        if fresh and _is_valid_answer(answer):
+            return answer
+        if not _is_valid_answer(answer):
+            print("[CACHE] Сломанный ответ в кэше — удаляем, генерируем заново")
+            _llm_cache.pop(cache_key, None)
+        return None
+
+
+def _cache_put(cache_key: str, answer: str, query: str, model: str, namespace: str):
+    """
+    Кладёт ответ в кэш и сохраняет на диск.
+
+    Поля ns/user_id нужны только для селективной очистки и статистики —
+    на поиск по кэшу они не влияют (изоляция уже вшита в хэш ключа).
+    Текст запроса храним для админ-статистики; ответ и так лежит рядом.
+    """
+    with _cache_lock:
+        _llm_cache[cache_key] = {
+            "answer":    answer,
+            "timestamp": datetime.now().timestamp(),
+            "query":     query,
+            "model":     model,
+            "ns":        namespace,
+            "user_id":   get_current_user_id(),
+        }
+        save_llm_cache()
+
+
+def clear_llm_cache(namespace: Optional[str] = None) -> int:
+    """
+    Очищает кэш LLM.
+
+    namespace=None  → ВЕСЬ кэш всех сегментов. Только для суперадмина.
+    namespace="..." → только записи этого неймспейса.
+
+    Возвращает число удалённых записей.
+    """
+    with _cache_lock:
+        if namespace is None:
+            removed = len(_llm_cache)
+            _llm_cache.clear()
+        else:
+            victims = [k for k, v in _llm_cache.items()
+                       if (v or {}).get("ns") == namespace]
+            for k in victims:
+                _llm_cache.pop(k, None)
+            removed = len(victims)
+        save_llm_cache()
+    print(f"[CACHE] Удалено записей: {removed} (неймспейс: {namespace or 'ВСЕ'})")
+    return removed
+
+
+def clear_llm_cache_for_current_user() -> tuple:
+    """
+    Очистка кэша с учётом роли — для кнопки в UI Советчика.
+
+    Раньше кнопка «Очистить кэш LLM» вызывала _llm_cache.clear() и была
+    доступна каждому: рядовой пользователь одним нажатием вайпил кэш всех
+    сегментов сразу. Теперь:
+        superadmin -> весь кэш
+        остальные  -> только свой неймспейс
+
+    Возвращает (число_удалённых, человекочитаемая_область).
+    """
+    if get_current_role() == "superadmin":
+        return clear_llm_cache(None), "все сегменты"
+    ns = get_cache_namespace()
+    return clear_llm_cache(ns), "ваш сегмент"
+
+
+def purge_expired_cache() -> int:
+    """
+    Удаляет протухшие, сломанные и legacy-записи (созданные до введения
+    изоляции — у них нет поля "ns", найти их по ключу всё равно невозможно).
+    Безопасно вызывать при старте приложения.
+    """
+    ttl = _cache_ttl_seconds()
+    now = datetime.now().timestamp()
+    with _cache_lock:
+        victims = [
+            k for k, v in _llm_cache.items()
+            if not isinstance(v, dict)
+            or "ns" not in v                           # запись до введения изоляции
+            or now - v.get("timestamp", 0) >= ttl      # протухла
+            or not _is_valid_answer(v.get("answer", ""))
+        ]
+        for k in victims:
+            _llm_cache.pop(k, None)
+        if victims:
+            save_llm_cache()
+    if victims:
+        print(f"[CACHE] Очищено устаревших/legacy-записей: {len(victims)}")
+    return len(victims)
+
+
+def get_cache_stats(namespace: Optional[str] = None) -> Dict:
+    """
+    Статистика кэша для админ-панели.
+    namespace=None → всего + разбивка по неймспейсам; иначе — только по нему.
+    """
+    with _cache_lock:
+        entries = list(_llm_cache.values())
+    by_ns: Dict[str, int] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        key = e.get("ns", "legacy")
+        by_ns[key] = by_ns.get(key, 0) + 1
+    if namespace is not None:
+        return {"total": by_ns.get(namespace, 0), "namespace": namespace}
+    return {"total": len(entries), "by_ns": by_ns}
  
  
 # =============================================================================
@@ -1000,9 +1381,133 @@ def _sphere_match(chunk_sphere_str: str, selected_spheres: list) -> bool:
     return any(s in chunk_sphere_str for s in selected_spheres)
 
 
-def search_vector_db(query: str, top_k: int = 5, spheres: list = None, filenames: list = None) -> list:
+def _doc_type_match(chunk_doc_type: str, selected_doc_types: list) -> bool:
+    """
+    Проверяет, подходит ли чанк под фильтр видов документов.
+    Чанки без поля doc_type (старые документы / неопределённый тип)
+    всегда проходят фильтр — обратная совместимость.
+    Значения doc_type: 'npa', 'fas', 'court', 'methodics', 'unknown'.
+    """
+    if not chunk_doc_type or chunk_doc_type == "unknown":
+        return True
+    return chunk_doc_type in selected_doc_types
+
+
+# =============================================================================
+# Фильтр по статусу действия документа
+#
+# Статусы (поле "doc_status" в метаданных чанка ChromaDB):
+#   "active"  — действующая редакция
+#   "pending" — утверждён, не вступил в силу
+#   "expired" — утратил силу
+#   ""        — даты не проставлены (всегда проходит — обратная совместимость)
+# =============================================================================
+def _status_match(chunk_doc_status: str, doc_status_filter: str) -> bool:
+    """
+    Проверяет, подходит ли чанк под фильтр статуса документа.
+    Чанки без doc_status (даты не проставлены) всегда проходят.
+    doc_status_filter: "active" | "pending" | "expired" | None (все).
+    """
+    if not chunk_doc_status:       # даты не проставлены — пропускаем всегда
+        return True
+    if doc_status_filter is None:  # фильтр отключён — пропускаем всегда
+        return True
+    return chunk_doc_status == doc_status_filter
+
+
+# =============================================================================
+# Локальная база знаний сегмента — константа-ключ и вспомогательная функция
+#
+# "local" — специальное псевдо-значение внутри параметра doc_types мультиселекта
+# «Вид документа» в Советчике. В отличие от npa/fas/court/methodics оно не
+# фильтрует tariff_docs, а подключает ОТДЕЛЬНУЮ ChromaDB-коллекцию сегмента
+# (local_kb_{org_id}, см. core/local_kb.py) — физически изолированную от
+# остальных сегментов и от общей базы.
+# =============================================================================
+LOCAL_KB_DOC_TYPE = "local"
+
+
+def _merge_ranked_lists(primary: list, secondary: list, top_k: int, k: int = 60) -> list:
+    """
+    Сливает два УЖЕ отсортированных списка источников по рангу (RRF).
+
+    ЗАЧЕМ НЕ ПО distance. У общей базы "distance" — это pseudo_dist,
+    производная от RRF-скора (1 - score*60), где score ≈ 0.02…0.04: у топовых
+    чанков он схлопывается в 0.0. У локальной базы (core/local_kb.py)
+    distance — сырая косинусная дистанция ChromaDB, обычно 0.2…0.6.
+    Шкалы несопоставимы: при сортировке общим ключом локальные документы
+    систематически проигрывали бы общей базе независимо от релевантности.
+
+    Ранг свободен от шкалы: берём позицию внутри своего списка, где каждый
+    ранжирован своим — корректным для него — механизмом. При равенстве
+    скоров стабильная сортировка оставляет впереди primary (общую базу).
+    """
+    scored = []
+    for rank, src in enumerate(primary):
+        scored.append((1.0 / (k + rank + 1), src))
+    for rank, src in enumerate(secondary):
+        scored.append((1.0 / (k + rank + 1), src))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [src for _, src in scored[:top_k]]
+
+
+def _split_doc_types(doc_types: Optional[List[str]]) -> tuple:
+    """
+    Разбивает список doc_types на (обычные_типы_для_tariff_docs, нужна_ли_локальная_база).
+
+    Примеры:
+      None                       -> (None,  False)  — фильтр выключен, локальная база не запрашивается
+      ["npa"]                    -> (["npa"], False)
+      ["local"]                  -> (None,  True)   — искать ТОЛЬКО в локальной базе сегмента
+      ["npa", "local"]           -> (["npa"], True) — искать и там, и там
+    """
+    if not doc_types:
+        return None, False
+    include_local = LOCAL_KB_DOC_TYPE in doc_types
+    regular = [dt for dt in doc_types if dt != LOCAL_KB_DOC_TYPE]
+    return (regular if regular else None), include_local
+
+
+def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
+                     doc_types: list = None, doc_status: str = "active",
+                     filenames: list = None, org_id: str = None) -> list:
+    """
+    org_id — идентификатор сегмента текущего пользователя. Требуется только
+    когда doc_types содержит "local" (запрос к локальной базе сегмента);
+    для обычного поиска по tariff_docs не используется.
+
+    Если org_id не передан — определяется автоматически из session_state
+    (get_current_org_id). Явный аргумент имеет приоритет: он нужен для вызовов
+    из фоновых потоков, где session_state недоступен.
+    """
     t0 = time.perf_counter()
- 
+
+    # Явный аргумент имеет приоритет; иначе берём сегмент из session_state.
+    # "" превращаем в None — у пользователя без сегмента локальной базы нет.
+    org_id = org_id or get_current_org_id() or None
+
+    _regular_doc_types, _include_local = _split_doc_types(doc_types)
+
+    # ── Локальная база сегмента ─────────────────────────────────────────────
+    # Если выбрано ТОЛЬКО "Локальная база" (без npa/fas/court/methodics и без
+    # общего "все виды" = doc_types is None) — ищем исключительно в ней и не
+    # трогаем tariff_docs вообще.
+    _local_only = bool(doc_types) and _regular_doc_types is None and _include_local
+
+    if _local_only:
+        if not org_id:
+            print("[LOCAL_KB] org_id не передан — локальная база недоступна")
+            return []
+        try:
+            from core.local_kb import search_local_kb
+        except Exception as e:
+            print(f"[LOCAL_KB] Импорт не удался: {e}")
+            return []
+        local_sources = search_local_kb(query, org_id, top_k=top_k)
+        print(f"[TIMING] search_vector_db (только локальная база): "
+              f"{time.perf_counter()-t0:.3f} сек, {len(local_sources)} источников")
+        return local_sources
+
     retriever = get_hybrid_retriever()
  
     if retriever is not None:
@@ -1036,9 +1541,9 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None, filenames
         # лучший (максимальный) RRF-score.
         _ss = _load_search_settings()
         _cands_per_var = int(_ss.get("candidates_per_var", 15))
-        # При активном фильтре по сфере запрашиваем вдвое больше кандидатов,
-        # чтобы компенсировать потери от постфильтрации.
-        if spheres:
+        # При активном фильтре по сфере или виду документа запрашиваем вдвое больше
+        # кандидатов, чтобы компенсировать потери от постфильтрации.
+        if spheres or _regular_doc_types:
             _cands_per_var = _cands_per_var * 2
         _reranker_on   = bool(_ss.get("reranker_enabled", True))
  
@@ -1060,6 +1565,31 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None, filenames
             ]
             print(f"[SPHERE FILTER] {pre_count} → {len(candidates)} кандидатов "
                   f"по сферам: {spheres}")
+
+        # ── Фильтрация по виду документа (до реранкинга) ────────────────────
+        # _regular_doc_types — только npa/fas/court/methodics, "local" уже вырезан.
+        if _regular_doc_types:
+            pre_count  = len(candidates)
+            candidates = [
+                c for c in candidates
+                if _doc_type_match(c.get("meta", {}).get("doc_type", ""), _regular_doc_types)
+            ]
+            print(f"[DOCTYPE FILTER] {pre_count} → {len(candidates)} кандидатов "
+                  f"по видам: {_regular_doc_types}")
+
+        # ── Фильтрация по статусу документа (до реранкинга) ─────────────────
+        # doc_status="active" по умолчанию — утратившие силу исключаются.
+        # Чанки без doc_status (даты не проставлены) всегда проходят.
+        if doc_status is not None:
+            pre_count  = len(candidates)
+            candidates = [
+                c for c in candidates
+                if _status_match(c.get("meta", {}).get("doc_status", ""), doc_status)
+            ]
+            if pre_count != len(candidates):
+                print(f"[STATUS FILTER] {pre_count} → {len(candidates)} кандидатов "
+                      f"статус={doc_status}")
+
         if filenames:
             _fn_set = set(filenames)
             _pre = len(candidates)
@@ -1116,12 +1646,32 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None, filenames
                 "page":         meta.get("page", ""),
                 "category":     meta.get("category", "Общее"),
                 "doc_type":     meta.get("doc_type", ""),
+                "doc_status":   meta.get("doc_status", ""),
+                "valid_from":   meta.get("valid_from", ""),
+                "valid_to":     meta.get("valid_to", ""),
                 "article":      meta.get("article", ""),
                 "chunk_index":  meta.get("chunk_index", ""),
                 "distance":     pseudo_dist,
                 "sphere":       meta.get("sphere", ""),
+                "source_kind":  "global",
             })
- 
+
+        # ── Шаг 6: если локальная база выбрана ДОПОЛНИТЕЛЬНО к обычным видам —
+        # подмешиваем её результаты по РАНГУ (см. _merge_ranked_lists), а не по
+        # distance: шкалы pseudo_dist и косинусной дистанции несопоставимы.
+        if _include_local and org_id:
+            try:
+                from core.local_kb import search_local_kb
+                local_sources = search_local_kb(query, org_id, top_k=top_k)
+                if local_sources:
+                    sources = _merge_ranked_lists(sources, local_sources, top_k)
+                    _n_local = sum(1 for s in sources if s.get("source_kind") == "local")
+                    print(f"[LOCAL_KB] Найдено {len(local_sources)} локальных, "
+                          f"в итоговый топ-{top_k} попало {_n_local} "
+                          f"(сегмент {org_id})")
+            except Exception as e:
+                print(f"[LOCAL_KB] Ошибка подмешивания: {e}")
+
         print(f"[TIMING] search_vector_db итого: {time.perf_counter()-t0:.3f} сек")
         return sources
  
@@ -1133,17 +1683,46 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None, filenames
             s for s in _fallback_sources
             if _sphere_match(s.get("sphere", ""), spheres)
         ]
+    if _regular_doc_types:
+        _fallback_sources = [
+            s for s in _fallback_sources
+            if _doc_type_match(s.get("doc_type", ""), _regular_doc_types)
+        ]
+    if doc_status is not None:
+        _fallback_sources = [
+            s for s in _fallback_sources
+            if _status_match(s.get("doc_status", ""), doc_status)
+        ]
+    if _include_local and org_id:
+        try:
+            from core.local_kb import search_local_kb
+            local_sources = search_local_kb(query, org_id, top_k=top_k)
+            if local_sources:
+                # Здесь обе шкалы — сырая косинусная дистанция ChromaDB,
+                # поэтому сортировка по distance корректна.
+                _fallback_sources = sorted(
+                    _fallback_sources + local_sources,
+                    key=lambda s: s.get("distance", 1.0),
+                )[:top_k]
+        except Exception as e:
+            print(f"[LOCAL_KB] Ошибка подмешивания (fallback): {e}")
     return _fallback_sources
  
  
 def debug_search_candidates(query: str, top_k: int = 5,
                             spheres: Optional[List[str]] = None,
+                            doc_types: Optional[List[str]] = None,
+                            doc_status: Optional[str] = "active",
                             filenames: Optional[List[str]] = None) -> dict:
     """
     Отладочная функция для UI «Поиск и реранкинг».
     Возвращает кандидатов ДО и ПОСЛЕ реранкинга, а также варианты запроса.
     Не подтягивает соседей — нужен только чистый текст чанка для просмотра.
     spheres: список сфер для фильтрации (None = все сферы).
+    doc_types: список видов документов для фильтрации (None = все виды).
+               Значение "local" (локальная база сегмента) в этой отладочной
+               функции игнорируется — она предназначена только для tariff_docs.
+    doc_status: "active" | "pending" | "expired" | None (все).
     """
     result = {
         "query_variants": [query],
@@ -1153,6 +1732,8 @@ def debug_search_candidates(query: str, top_k: int = 5,
         "elapsed":        0.0,
         "error":          None,
     }
+
+    _regular_doc_types, _ = _split_doc_types(doc_types)
 
     t0 = time.perf_counter()
     try:
@@ -1178,7 +1759,7 @@ def debug_search_candidates(query: str, top_k: int = 5,
         _ss = _load_search_settings()
         _cands_per_var = int(_ss.get("candidates_per_var", 15))
         _reranker_on   = bool(_ss.get("reranker_enabled", True))
-        if spheres:
+        if spheres or _regular_doc_types or doc_status:
             _cands_per_var = _cands_per_var * 2  # компенсируем потери от постфильтрации
 
         merged: dict = {}
@@ -1198,6 +1779,26 @@ def debug_search_candidates(query: str, top_k: int = 5,
                 if _sphere_match(c.get("meta", {}).get("sphere", ""), spheres)
             ]
             print(f"[SPHERE FILTER/debug] {pre_count} → {len(pre_rerank)} по сферам: {spheres}")
+
+        # Фильтрация по виду документа до реранкинга
+        if _regular_doc_types:
+            pre_count  = len(pre_rerank)
+            pre_rerank = [
+                c for c in pre_rerank
+                if _doc_type_match(c.get("meta", {}).get("doc_type", ""), _regular_doc_types)
+            ]
+            print(f"[DOCTYPE FILTER/debug] {pre_count} → {len(pre_rerank)} по видам: {_regular_doc_types}")
+
+        # Фильтрация по статусу до реранкинга
+        if doc_status is not None:
+            pre_count  = len(pre_rerank)
+            pre_rerank = [
+                c for c in pre_rerank
+                if _status_match(c.get("meta", {}).get("doc_status", ""), doc_status)
+            ]
+            if pre_count != len(pre_rerank):
+                print(f"[STATUS FILTER/debug] {pre_count} → {len(pre_rerank)} статус={doc_status}")
+
         if filenames:
             _fn_set = set(filenames)
             _pre = len(pre_rerank)
@@ -1236,15 +1837,15 @@ def _is_valid_answer(text: str) -> bool:
  
  
 def _build_context(sources: list, max_chars: int = None) -> str:
-    if max_chars is None:
-        max_chars = int(_load_search_settings().get("context_max_chars", 8000))
     """
     Собирает контекст из источников.
- 
-    max_chars=12000 (~4000 токенов) — разумный бюджет для моделей с большим
-    контекстным окном. При radius=2 и чанке 1750 симв. один snippet ≈ 8750 симв.
-    Бюджет позволяет 1 источник полностью или несколько с разумной обрезкой.
+
+    max_chars по умолчанию берётся из настроек поиска (context_max_chars, 8000).
+    При radius=2 и чанке 1750 симв. один snippet ≈ 8750 симв., поэтому бюджет
+    позволяет 1 источник полностью или несколько с разумной обрезкой.
     """
+    if max_chars is None:
+        max_chars = int(_load_search_settings().get("context_max_chars", 8000))
     parts = []
     budget = max_chars
     for i, src in enumerate(sources, 1):
@@ -1318,6 +1919,7 @@ def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
             "chunk_index": meta.get("chunk_index", ""),
             "distance":    round(dist, 3),
             "sphere":      meta.get("sphere", ""),
+            "source_kind": "global",
         })
     return sources
  
@@ -1338,37 +1940,38 @@ def stream_ai_answer(
     sources: list,
     model: str = None,
     temperature: float = None,
+    user_context: str = "",
+    answer_length: str = "short",
+    org_id: str = None,
 ):
     """
     Генератор токенов для Streamlit st.write_stream().
     Если ответ есть в кэше — возвращает его сразу одним куском.
     Иначе стримит токены по мере генерации LLM.
     Автоматически сохраняет ответ в кэш после завершения.
+    answer_length: "short" — кратко по существу, "detailed" — развёрнуто с пояснениями.
+    org_id: сегмент пользователя. Если None — неймспейс кэша определяется
+            автоматически из session_state (см. get_cache_namespace).
     """
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
     temperature = temperature if temperature is not None else config.get("temperature", 0.3)
     max_tokens  = config.get("max_tokens", 2048)
     timeout     = config.get("timeout_seconds", 300)
+    namespace   = namespace_for_org(org_id) if org_id else get_cache_namespace()
  
     if _SOURCES_ONLY_MODE:
         yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
         return
  
-    # Кэш — возвращаем сразу без стриминга
-    cache_key = get_cache_key(query, sources, model)
-    with _cache_lock:
-        if cache_key in _llm_cache:
-            cached = _llm_cache[cache_key]
-            answer = cached.get("answer", "")
-            fresh  = datetime.now().timestamp() - cached.get("timestamp", 0) < 604800
-            if fresh and _is_valid_answer(answer):
-                print(f"[CACHE HIT stream] {model}")
-                yield answer
-                return
-            elif not _is_valid_answer(answer):
-                print(f"[CACHE] Сломанный ответ в кэше — удаляем, генерируем заново")
-                del _llm_cache[cache_key]
+    # Кэш — возвращаем сразу без стриминга (неймспейс вшит в хэш ключа →
+    # чужой сегмент физически не может попасть в выдачу)
+    cache_key = get_cache_key(query, sources, model, namespace=namespace)
+    cached_answer = _cache_get(cache_key)
+    if cached_answer is not None:
+        print(f"[CACHE HIT stream] {model} | ns={namespace}")
+        yield cached_answer
+        return
  
     # Строим промпт (та же логика что в generate_ai_answer)
     try:
@@ -1376,35 +1979,52 @@ def stream_ai_answer(
         context = _build_context(sources)
  
         system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
+        if user_context and user_context.strip():
+            system_prompt = (
+                system_prompt
+                + "\n\n---\nКонтекст пользователя:\n"
+                + user_context.strip()
+            )
+        _LENGTH_INSTRUCTIONS = {
+            "short":    "8. Отвечай КРАТКО: максимум 3–5 предложений или маркированный список до 5 пунктов. "
+                        "Без вводных слов и пересказа вопроса.",
+            "detailed": "8. Отвечай РАЗВЁРНУТО: подробно раскрой тему, приведи все релевантные нормы, "
+                        "условия применения и исключения. Используй подзаголовки если тем несколько.",
+        }
+        _len_instr = _LENGTH_INSTRUCTIONS.get(answer_length, _LENGTH_INSTRUCTIONS["short"])
+        system_prompt = system_prompt + "\n" + _len_instr
+        system_prompt = (
+            system_prompt
+            + "\n\nТекущая дата и время: "
+            + datetime.now().strftime("%d.%m.%Y, %H:%M")
+            + "."
+        )
         user_content  = prompts.get("advisor_user",   DEFAULT_PROMPTS["advisor_user"]).format(
             query=query, context=context,
         )
  
+        # ---------------------------------------------------------------
+        # Отключение thinking-режима для моделей семейства Qwen3 / Qwen3.5
+        #
+        # ВАЖНО: extra_body={"think": False} через OpenAI-совместимый
+        # /v1/chat/completions ненадёжен — на части версий Ollama это поле
+        # не транслируется в нативный запрос (ollama/ollama issue #14809),
+        # и модель всё равно уходит в незакрытый <think>-блок, съедая весь
+        # max_tokens на рассуждения — пользователь получает пустой ответ.
+        # Поэтому для Ollama-бэкенда используем нативный /api/chat напрямую
+        # (_ollama_chat_native_stream), где think:false — надёжный top-level
+        # параметр. OpenAI-клиент остаётся как fallback для LM Studio.
+        # ---------------------------------------------------------------
         is_qwen3   = "qwen3" in model.lower() or "qwen/qwen3" in model.lower()
-        extra_body = {}
-        if is_qwen3:
-            user_content = "/no_think\n\n" + user_content
-            extra_body = {
-                "enable_thinking": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
- 
-        kwargs = dict(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_content},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            frequency_penalty=0.1,   # штраф за повторения — предотвращает "CL CL CL..."
-            stream=True,
-        )
-        if extra_body:
-            kwargs["extra_body"] = extra_body
- 
-        print(f"[LLM stream] {model} | max_tokens={max_tokens} | "
+        use_native = is_qwen3 and _is_ollama_backend()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ]
+
+        print(f"[LLM stream] {model} | ns={namespace} | max_tokens={max_tokens} | "
+              f"native={use_native} | "
               f"промпт ~{len(system_prompt)+len(user_content)} симв. / "
               f"~{(len(system_prompt)+len(user_content))//4} токенов (оценка)")
         t0 = time.perf_counter()
@@ -1416,10 +2036,35 @@ def stream_ai_answer(
         last_token = ""
         repeat_cnt = 0
  
-        response = client.chat.completions.create(**kwargs)
+        if use_native:
+            response = _ollama_chat_native_stream(
+                model, messages, temperature, max_tokens, timeout,
+            )
+            response_iter = ({"delta": chunk} for chunk in response)
+        else:
+            extra_body = {}
+            if is_qwen3:
+                messages[-1]["content"] = "/no_think\n\n" + user_content
+                extra_body = {
+                    "enable_thinking": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            kwargs = dict(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                frequency_penalty=0.1,   # штраф за повторения — предотвращает "CL CL CL..."
+                stream=True,
+            )
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            raw_response = client.chat.completions.create(**kwargs)
+            response_iter = ({"delta": c.choices[0].delta.content} for c in raw_response)
  
-        for chunk in response:
-            delta = chunk.choices[0].delta.content
+        for chunk in response_iter:
+            delta = chunk["delta"]
             if not delta:
                 continue
  
@@ -1479,14 +2124,7 @@ def stream_ai_answer(
             or "зациклилась" in answer
         )
         if not is_broken:
-            with _cache_lock:
-                _llm_cache[cache_key] = {
-                    "answer":    answer,
-                    "timestamp": datetime.now().timestamp(),
-                    "query":     query,
-                    "model":     model,
-                }
-                save_llm_cache()
+            _cache_put(cache_key, answer, query, model, namespace)
  
     except Exception as e:
         err = str(e)
@@ -1507,7 +2145,8 @@ def stream_ai_answer(
 #
 # Каждый раунд уточнения берёт ОДИН предыдущий ответ как контекст и заново
 # ищет лучших кандидатов в RAG по чистому тексту уточнения.
-# Уточнения не кэшируются — они всегда зависят от предыдущего ответа.
+# Уточнения не кэшируются — они всегда зависят от предыдущего ответа,
+# поэтому вопрос изоляции кэша по сегментам здесь не возникает вовсе.
 # =============================================================================
 def stream_clarification_answer(
     clarify_q: str,
@@ -1515,16 +2154,20 @@ def stream_clarification_answer(
     new_sources: list,
     model: str = None,
     temperature: float = None,
+    user_context: str = "",
+    answer_length: str = "short",
 ):
     """
     Генератор токенов для уточняющих вопросов.
 
     Args:
-        clarify_q:    текст уточняющего вопроса
-        prev_answer:  предыдущий ответ LLM (исходный или последнее уточнение)
-        new_sources:  чанки из RAG, найденные по clarify_q
-        model:        модель LM Studio
-        temperature:  температура генерации
+        clarify_q:     текст уточняющего вопроса
+        prev_answer:   предыдущий ответ LLM (исходный или последнее уточнение)
+        new_sources:   чанки из RAG, найденные по clarify_q
+        model:         модель LM Studio
+        temperature:   температура генерации
+        user_context:  контекст пользователя (роль, организация)
+        answer_length: "short" | "detailed"
     """
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
@@ -1539,6 +2182,27 @@ def stream_clarification_answer(
     try:
         prompts       = load_prompts()
         system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
+        if user_context and user_context.strip():
+            system_prompt = (
+                system_prompt
+                + "\n\n---\nКонтекст пользователя:\n"
+                + user_context.strip()
+            )
+        _LENGTH_INSTRUCTIONS = {
+            "short":    "8. Отвечай КРАТКО: максимум 3–5 предложений или маркированный список до 5 пунктов. "
+                        "Без вводных слов и пересказа вопроса.",
+            "detailed": "8. Отвечай РАЗВЁРНУТО: подробно раскрой тему, приведи все релевантные нормы, "
+                        "условия применения и исключения. Используй подзаголовки если тем несколько.",
+        }
+        system_prompt = system_prompt + "\n" + _LENGTH_INSTRUCTIONS.get(
+            answer_length, _LENGTH_INSTRUCTIONS["short"]
+        )
+        system_prompt = (
+            system_prompt
+            + "\n\nТекущая дата и время: "
+            + datetime.now().strftime("%d.%m.%Y, %H:%M")
+            + "."
+        )
 
         # Контекст новых RAG-чанков (без псевдо-источника предыдущего ответа)
         rag_context = _build_context(new_sources) if new_sources else "(новых документов не найдено)"
@@ -1559,31 +2223,18 @@ def stream_clarification_answer(
             "Не повторяй то, что уже было сказано, если это не нужно для ответа."
         )
 
+        # См. комментарий в stream_ai_answer — надёжный think:false только
+        # через нативный Ollama /api/chat, extra_body на /v1 ненадёжен.
         is_qwen3   = "qwen3" in model.lower() or "qwen/qwen3" in model.lower()
-        extra_body = {}
-        if is_qwen3:
-            user_content = "/no_think\n\n" + user_content
-            extra_body = {
-                "enable_thinking": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
+        use_native = is_qwen3 and _is_ollama_backend()
 
-        kwargs = dict(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_content},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            frequency_penalty=0.1,
-            stream=True,
-        )
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ]
 
-        print(f"[CLARIFY stream] {model} | промпт ~{len(system_prompt)+len(user_content)} симв. | "
+        print(f"[CLARIFY stream] {model} | native={use_native} | "
+              f"промпт ~{len(system_prompt)+len(user_content)} симв. | "
               f"prev_answer={len(prev_answer)} симв. | rag_chunks={len(new_sources)}")
         t0 = time.perf_counter()
 
@@ -1593,10 +2244,35 @@ def stream_clarification_answer(
         last_token = ""
         repeat_cnt = 0
 
-        response = client.chat.completions.create(**kwargs)
+        if use_native:
+            response = _ollama_chat_native_stream(
+                model, messages, temperature, max_tokens, timeout,
+            )
+            response_iter = ({"delta": chunk} for chunk in response)
+        else:
+            extra_body = {}
+            if is_qwen3:
+                messages[-1]["content"] = "/no_think\n\n" + user_content
+                extra_body = {
+                    "enable_thinking": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            kwargs = dict(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                frequency_penalty=0.1,
+                stream=True,
+            )
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            raw_response = client.chat.completions.create(**kwargs)
+            response_iter = ({"delta": c.choices[0].delta.content} for c in raw_response)
 
-        for chunk in response:
-            delta = chunk.choices[0].delta.content
+        for chunk in response_iter:
+            delta = chunk["delta"]
             if not delta:
                 continue
 
@@ -1658,28 +2334,23 @@ def generate_ai_answer(
     sources: list,
     model: str = None,
     temperature: float = None,
+    org_id: str = None,
 ) -> str:
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
     temperature = temperature if temperature is not None else config.get("temperature", 0.3)
     max_tokens  = config.get("max_tokens", 2048)
     timeout     = config.get("timeout_seconds", 300)
+    namespace   = namespace_for_org(org_id) if org_id else get_cache_namespace()
  
     if _SOURCES_ONLY_MODE:
         return "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
  
-    cache_key = get_cache_key(query, sources, model)
-    with _cache_lock:
-        if cache_key in _llm_cache:
-            cached = _llm_cache[cache_key]
-            answer = cached.get("answer", "")
-            fresh  = datetime.now().timestamp() - cached.get("timestamp", 0) < 604800
-            if fresh and _is_valid_answer(answer):
-                print(f"[CACHE HIT] {model}")
-                return answer
-            elif not _is_valid_answer(answer):
-                print(f"[CACHE] Сломанный ответ — удаляем, генерируем заново")
-                del _llm_cache[cache_key]
+    cache_key = get_cache_key(query, sources, model, namespace=namespace)
+    cached_answer = _cache_get(cache_key)
+    if cached_answer is not None:
+        print(f"[CACHE HIT] {model} | ns={namespace}")
+        return cached_answer
  
     try:
         prompts = load_prompts()
@@ -1690,34 +2361,49 @@ def generate_ai_answer(
             query=query, context=context,
         )
  
+        # См. комментарий в stream_ai_answer — надёжный think:false только
+        # через нативный Ollama /api/chat, extra_body на /v1 ненадёжен.
         is_qwen3   = "qwen3" in model.lower() or "qwen/qwen3" in model.lower()
-        extra_body = {}
-        if is_qwen3:
-            user_content = "/no_think\n\n" + user_content
-            extra_body   = {"enable_thinking": False}
+        use_native = is_qwen3 and _is_ollama_backend()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ]
  
         t0 = time.perf_counter()
-        print(f"[LLM] {model} | max_tokens={max_tokens} | "
-              f"thinking={'OFF' if is_qwen3 else 'n/a'} | "
+        print(f"[LLM] {model} | ns={namespace} | max_tokens={max_tokens} | "
+              f"native={use_native} | "
               f"промпт ~{len(system_prompt)+len(user_content)} симв.")
  
-        kwargs = dict(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_content},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            frequency_penalty=0.1,   # штраф за повторения
-        )
-        if extra_body:
-            kwargs["extra_body"] = extra_body
- 
-        response      = client.chat.completions.create(**kwargs)
-        raw_content   = response.choices[0].message.content
-        finish_reason = response.choices[0].finish_reason
+        if use_native:
+            native_result = _ollama_chat_native(
+                model, messages, temperature, max_tokens, timeout,
+            )
+            raw_content   = native_result["content"]
+            # Ollama: "stop" | "length" | ... → приводим к OpenAI-совместимому виду
+            finish_reason = "length" if native_result["done_reason"] == "length" else "stop"
+        else:
+            extra_body = {}
+            if is_qwen3:
+                messages[-1]["content"] = "/no_think\n\n" + user_content
+                extra_body = {
+                    "enable_thinking": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            kwargs = dict(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                frequency_penalty=0.1,   # штраф за повторения
+            )
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            response      = client.chat.completions.create(**kwargs)
+            raw_content   = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
  
         print(f"[LLM] ответ за {time.perf_counter()-t0:.2f} сек | "
               f"finish={finish_reason} | len={len(raw_content or '')}")
@@ -1740,12 +2426,7 @@ def generate_ai_answer(
             or answer.count("CL ") > 10
         )
         if not is_broken:
-            with _cache_lock:
-                _llm_cache[cache_key] = {
-                    "answer": answer, "timestamp": datetime.now().timestamp(),
-                    "query": query, "model": model,
-                }
-            save_llm_cache()
+            _cache_put(cache_key, answer, query, model, namespace)
  
         return answer
  
@@ -1767,20 +2448,30 @@ def ask_question(
     temperature: float = None,
     use_faq: bool = True,
     model: str = None,
+    spheres: list = None,
+    doc_types: list = None,
+    doc_status: str = "active",
+    org_id: str = None,
 ) -> dict:
-    t_start = time.perf_counter()
-    config  = load_config()
-    model   = model or config.get("default_model", "qwen/qwen3.5-9b")
+    """
+    org_id — сегмент пользователя. Пробрасывается и в поиск (локальная база),
+    и в ключ кэша LLM. Если None — берётся из session_state автоматически.
+    """
+    t_start   = time.perf_counter()
+    config    = load_config()
+    model     = model or config.get("default_model", "qwen/qwen3.5-9b")
+    org_id    = org_id or get_current_org_id() or None
+    namespace = namespace_for_org(org_id) if org_id else get_cache_namespace()
  
     if not _llm_cache:
         load_llm_cache()
  
-    print(f"\n{'='*55}\n[ASK] «{query[:70]}» | {model}\n{'='*55}")
+    print(f"\n{'='*55}\n[ASK] «{query[:70]}» | {model} | ns={namespace}\n{'='*55}")
  
     result = {
         "answer": "", "sources": [], "redirect": None,
         "redirect_reason": None, "from_faq": False,
-        "from_cache": False, "model": model,
+        "from_cache": False, "model": model, "org_id": org_id,
     }
  
     # FAQ
@@ -1801,16 +2492,17 @@ def ask_question(
             return result
  
     # Гибридный поиск (BM25 + vector + reranking)
-    sources = search_vector_db(query, top_k=top_k)
+    sources = search_vector_db(
+        query, top_k=top_k, spheres=spheres, doc_types=doc_types,
+        doc_status=doc_status, org_id=org_id,
+    )
     result["sources"] = sources
  
     if sources:
-        cache_key  = get_cache_key(query, sources, model)
-        was_cached = (
-            cache_key in _llm_cache and
-            datetime.now().timestamp() - _llm_cache[cache_key].get("timestamp", 0) < 604800
-        )
-        result["answer"]     = generate_ai_answer(query, sources, model, temperature)
+        cache_key  = get_cache_key(query, sources, model, namespace=namespace)
+        was_cached = _cache_get(cache_key) is not None
+        result["answer"]     = generate_ai_answer(query, sources, model, temperature,
+                                                  org_id=org_id)
         result["from_cache"] = was_cached
     else:
         result["answer"] = ("❌ Не найдено релевантных документов в базе знаний. "
@@ -1823,3 +2515,18 @@ def ask_question(
  
     print(f"[ASK] Итого: {time.perf_counter()-t_start:.2f} сек\n")
     return result
+
+
+# =============================================================================
+# Старт фоновой предзагрузки — ПОСЛЕДНЯЯ строка модуля
+#
+# Только здесь все зависимости потока уже определены: _load_search_settings,
+# AVAILABLE_RERANKER_MODELS, get_hybrid_retriever. Раньше поток стартовал из
+# середины файла и выигрывал гонку у интерпретатора → NameError → реранкер
+# грузился лениво на первом запросе пользователя.
+# =============================================================================
+threading.Thread(
+    target=_preload_models_background,
+    daemon=True,
+    name="model-preload",
+).start()

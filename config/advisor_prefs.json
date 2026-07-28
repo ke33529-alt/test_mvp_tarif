@@ -1,1 +1,7 @@
-{"top_k": 40, "neighbor_radius": 0, "temperature": 0.2}
+{
+  "top_k": 40,
+  "neighbor_radius": 0,
+  "temperature": 0.1,
+  "answer_length": "detailed",
+  "user_context": "Я специалист регионального органа власти в сфере тарифного регулирования, устанавливаю тарифы. "
+}

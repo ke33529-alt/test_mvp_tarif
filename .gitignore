@@ -1,19 +1,32 @@
-﻿# Виртуальные окружения
-venv/
-venv``/
-.venv/
-env/
+# Тяжёлые данные — переносить вручную
+data/vector_db/
+data/claims/
+data/doc_scanner/
+data/protocol_bot/protocols/
+data/protocol_bot/temp/
+data/raw/
+data/bm25_cache.pkl
+data/documents_registry.json
 
-# Данные, БД, модели
-data/
-chroma/
-chroma_db/
-*.db
-*.sqlite
-*.pth
-*.bin
+# Персональные данные пользователей
+data/advisor_history/
+data/sessions/
+data/user_prefs/
+data/feedback/
+data/audit/
+data/llm_cache/
+data/cache/
 
-# Кэш Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code (опционально — можно оставить если хочешь)
+.vscode/
