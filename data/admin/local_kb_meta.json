@@ -31,6 +31,16 @@
       "chunk_size": 1000,
       "overlap": 100,
       "word_safe": true
+    },
+    "tasks_region_planfact_v2.docx": {
+      "indexed_at": "2026-08-26T20:53:28",
+      "chunks": 7,
+      "ext": "DOCX",
+      "size_kb_original": 11.8,
+      "chunk_method": "fixed",
+      "chunk_size": 1000,
+      "overlap": 100,
+      "word_safe": true
     }
   }
 }

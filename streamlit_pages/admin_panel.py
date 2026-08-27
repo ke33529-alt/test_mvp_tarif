@@ -24,6 +24,40 @@ from streamlit_pages.expertise_panel import show_documents_panel
 from streamlit_pages.expertise_chunking_panel import show_expertise_chunking_panel
 
 
+# ── Общие константы, доступные всем вкладкам ──────────────────────────────
+SPHERES = [
+    "🔥 Теплоснабжение",
+    "💧 Водоснабжение/водоотведение",
+    "🗑️ Обращение с ТКО",
+    "🔵 Газ",
+    "⚡ Электрика",
+    "📁 Иные сферы",
+]
+CATEGORY_FOLDERS = {
+    "📜 Общие НПА":              "npa",
+    "⚖️ Документы ФАС":          "fas",
+    "🏛️ Судебная практика":      "court",
+    "📋 Методички и разъяснения": "methodics",
+}
+SPHERES_FILE = os.path.join("config", "doc_spheres.json")
+
+
+def _load_spheres_map() -> dict:
+    if os.path.exists(SPHERES_FILE):
+        try:
+            with open(SPHERES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_spheres_map(m: dict) -> None:
+    os.makedirs(os.path.dirname(SPHERES_FILE), exist_ok=True)
+    with open(SPHERES_FILE, "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+
+
 def get_live_answer_stats(days: int = 7):
     """Статистика оценок советчика из feedback_log.jsonl."""
     feedback_file = os.path.join("data", "feedback", "feedback_log.jsonl")
@@ -82,6 +116,9 @@ def show_admin_panel():
             else:
                 st.error("❌ Неверный пароль")
     else:
+        # Загружаем общий словарь сфер один раз для всех вкладок
+        spheres_map = _load_spheres_map()
+
         tab_analytics, tab_docs, tab_chunking, tab_search, tab_prompts, tab_predictor, tab_claim_rag, tab_expertise, tab_expertise_chunking = st.tabs(
             ["📈 Аналитика ИИ", "📚 НПА", "⚙️ Чанкование НПА", "Поиск и реранкинг", "📝 Промпты", "Прогнозист", "📋 Анализатор заявок", "📑 Протоколы/Экспертные", "⚙️ Чанкование экспертных"],
             on_change="rerun",
@@ -131,21 +168,11 @@ def show_admin_panel():
         if tab_docs.open:
             with tab_docs:
                 st.header("База знаний — документы")
-                SPHERES = ["🔥 Теплоснабжение","💧 Водоснабжение/водоотведение","🗑️ Обращение с ТКО","🔵 Газ","⚡ Электрика","📁 Иные сферы"]
-                CATEGORY_FOLDERS = {"📜 Общие НПА":"npa","⚖️ Документы ФАС":"fas","🏛️ Судебная практика":"court","📋 Методички и разъяснения":"methodics"}
-                SPHERES_FILE = os.path.join("config","doc_spheres.json")
 
-                def load_spheres_map():
-                    if os.path.exists(SPHERES_FILE):
-                        try:
-                            with open(SPHERES_FILE,"r",encoding="utf-8") as f: return json.load(f)
-                        except Exception: pass
-                    return {}
+                # Локальные обёртки над общими функциями сохраняют совместимость
+                # со старым внутренним кодом вкладки, работающим со `spheres_map`.
                 def save_spheres_map(m):
-                    os.makedirs(os.path.dirname(SPHERES_FILE),exist_ok=True)
-                    with open(SPHERES_FILE,"w",encoding="utf-8") as f: json.dump(m,f,ensure_ascii=False,indent=2)
-
-                spheres_map = load_spheres_map()
+                    _save_spheres_map(m)
 
                 # ── Даты и статусы документов ────────────────────────────────────
                 DOC_DATES_FILE = os.path.join("config", "doc_dates.json")

@@ -30,3 +30,5 @@ Thumbs.db
 
 # VS Code (опционально — можно оставить если хочешь)
 .vscode/
+data/admin/users.json
+data/tasks/

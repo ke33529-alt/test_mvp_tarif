@@ -25,6 +25,12 @@ from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
+# Usage tracker — с защитой: если модуль ещё не создан, трекинг просто отключается
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
 # =============================================================================
 # Константы
 # =============================================================================
@@ -1799,6 +1805,10 @@ def _source_card(record: Dict, idx: int, decision: str, article: str = "") -> No
                     st.session_state["_preview_file"] = {
                         "name": _fname, "text": _file_text, "bytes": _file_bytes,
                     }
+                    _log_usage("predictor", "source_viewed", meta={
+                        "file":     _fname,
+                        "decision": decision,
+                    })
                     st.rerun()
             except Exception:
                 pass
@@ -1867,6 +1877,12 @@ def _source_card(record: Dict, idx: int, decision: str, article: str = "") -> No
                         _log_expert_override(
                             article, _fkey, _ai_decision, _current_final, _value, quote,
                         )
+                        _log_usage("predictor", "expert_override", meta={
+                            "article":       article[:80],
+                            "ai_decision":   _ai_decision,
+                            "from_decision": _current_final,
+                            "to_decision":   _value,
+                        })
                     if _value == _ai_decision:
                         _overrides.pop(_fkey, None)  # совпало с ИИ — override не нужен
                     else:
@@ -2303,24 +2319,13 @@ def _show_predict_tab():
 
     def _collect_available_years() -> List[str]:
         """
-        Год регулирования — не фиксированный справочник (бывают значения
-        вида "2025-2029"), поэтому собираем реально встречающиеся значения
-        из реестра документов (data/documents_registry.json), а не из
-        захардкоженного списка как со сферами/регионами.
+        Возвращает текущий год и 4 предыдущих в виде строк
+        (например: 2026, 2025, 2024, 2023, 2022).
+        Ранее читалось из documents_registry.json, где встречались мусорные
+        значения (диапазоны "2025-2029", числа "7433" и т.п.).
         """
-        try:
-            registry_path = os.path.join("data", "documents_registry.json")
-            if not os.path.exists(registry_path):
-                return []
-            with open(registry_path, "r", encoding="utf-8") as f:
-                reg = json.load(f)
-            years = {
-                entry.get("year") for entry in reg.values()
-                if entry.get("year") and "не_определён" not in entry.get("year", "")
-            }
-            return sorted(years)
-        except Exception:
-            return []
+        current_year = datetime.now().year
+        return [str(current_year - i) for i in range(5)]
 
     _PRED_YEARS = _collect_available_years()
 
@@ -2415,10 +2420,18 @@ def _show_predict_tab():
 
     _PRED_METHODS = [
         "Индексация",
-        "ЭОЗ",
+        "Метод экономически обоснованных расходов (ЭОЗ)",
         "RAB",
-        "Метод экономически обоснованных расходов",
     ]
+
+    # Алиасы для ChromaDB: одно отображаемое значение → несколько вариантов
+    # индексации, чтобы $in-запрос находил документы с любым из них.
+    _METHOD_ALIASES: Dict[str, List[str]] = {
+        "Метод экономически обоснованных расходов (ЭОЗ)": [
+            "ЭОЗ",
+            "Метод экономически обоснованных расходов",
+        ],
+    }
 
     fcol1, fcol2 = st.columns(2)
     with fcol1:
@@ -2500,7 +2513,12 @@ def _show_predict_tab():
                         "spheres":  filter_spheres,   # список без эмодзи
                         "regions":  filter_regions,   # список регионов
                         "years":    filter_years,     # список годов
-                        "methods":  filter_methods,   # список методов
+                        # Разворачиваем алиасы: "Метод ЭОЗ (ЭОЗ)" → ["ЭОЗ", "Метод ..."]
+                        "methods":  [
+                            alias
+                            for m in filter_methods
+                            for alias in _METHOD_ALIASES.get(m, [m])
+                        ],
                     }.items() if v
                 },
             }
@@ -2516,6 +2534,15 @@ def _show_predict_tab():
         def _progress(pct: float, msg: str):
             progress_bar.progress(min(pct, 0.99), text=msg)
             status_text.caption(msg)
+
+        # Событие: прогноз запущен
+        _log_usage("predictor", "prediction_started", meta={
+            "article":          params["article"][:80],
+            "top_k":            params["top_k"],
+            "sources":          params.get("sources"),
+            "has_filters":      bool(params.get("filters")),
+            "has_justification": bool((params.get("justification") or "").strip()),
+        })
 
         with st.spinner("Анализирую протоколы и экспертные заключения…"):
             result = run_prediction(
@@ -2552,6 +2579,29 @@ def _show_predict_tab():
                 ],
             }
             save_to_registry(registry_record)
+
+            # Событие: прогноз завершён успешно
+            _agg = result.get("aggregated", {})
+            _score = compute_approval_score(
+                len(_agg.get("positive", [])),
+                len(_agg.get("negative", [])),
+                len(_agg.get("neutral",  [])),
+            )
+            _log_usage("predictor", "prediction_completed", meta={
+                "article":    result.get("article", "")[:80],
+                "n_positive": len(_agg.get("positive", [])),
+                "n_negative": len(_agg.get("negative", [])),
+                "n_neutral":  len(_agg.get("neutral",  [])),
+                "score_pct":  _score["approval_pct"],
+                "confidence": _score["confidence"],
+                "sources":    result.get("sources"),
+            })
+        elif result and result.get("error"):
+            # Событие: прогноз завершился ошибкой (нет документов / LM недоступен)
+            _log_usage("predictor", "prediction_completed", meta={
+                "article": params["article"][:80],
+                "error":   result["error"][:120],
+            })
 
         st.rerun()
 

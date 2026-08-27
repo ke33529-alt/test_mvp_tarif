@@ -39,6 +39,14 @@ from core.auth import (
 )
 from core.audit import export_to_csv, get_module_stats, log_event, read_log
 
+# Usage tracker — с защитой: если модуль ещё не создан, показывается заглушка
+try:
+    from core.usage_tracker import show_usage_stats as _show_usage_stats
+    _USAGE_TRACKER_AVAILABLE = True
+except Exception:
+    _USAGE_TRACKER_AVAILABLE = False
+    def _show_usage_stats(): pass  # noqa: E731
+
 # ── Пути ─────────────────────────────────────────────────────────────────────
 
 _BASE_DIR = Path(__file__).parent.parent.resolve()
@@ -1011,142 +1019,156 @@ def _tab_audit_log():
 
     st.markdown("##### Лог действий")
 
-    # Первая строка фильтров: даты
-    fr1c1, fr1c2 = st.columns([1, 1])
-    with fr1c1:
-        log_date_from = st.date_input("С даты", value=date.today(), key="log_from")
-    with fr1c2:
-        log_date_to = st.date_input("По дату", value=date.today(), key="log_to")
+    # Под-вкладки: системный аудит + лог использования функций
+    sub1, sub2 = st.tabs(["Аудит системы", "Использование функций"])
 
-    # Вторая строка фильтров: сегмент, пользователь, событие
-    fr2c1, fr2c2, fr2c3 = st.columns([1, 1, 1])
-    with fr2c1:
-        seg_opts = {"": "Все сегменты"} | {k: v["name"] for k, v in segments.items()}
-        log_seg  = st.selectbox(
-            "Сегмент", options=list(seg_opts.keys()),
-            format_func=lambda x: seg_opts[x],
-            key="log_seg", label_visibility="collapsed",
-        )
-    with fr2c2:
-        user_opts = {"": "Все пользователи"} | {
-            uid: rec.get("name", uid) for uid, rec in users.items()
-        }
-        log_user = st.selectbox(
-            "Пользователь", options=list(user_opts.keys()),
-            format_func=lambda x: user_opts[x],
-            key="log_user", label_visibility="collapsed",
-        )
-    with fr2c3:
-        from core.audit import EVENT_TYPES
-        event_opts = {"": "Все события"} | {e: e for e in sorted(EVENT_TYPES)}
-        log_event_filter = st.selectbox(
-            "Событие", options=list(event_opts.keys()),
-            format_func=lambda x: event_opts[x],
-            key="log_event", label_visibility="collapsed",
-        )
+    # ── Под-вкладка 1: системный аудит (логин / выход / открытие модулей) ─────
+    with sub1:
+        # Первая строка фильтров: даты
+        fr1c1, fr1c2 = st.columns([1, 1])
+        with fr1c1:
+            log_date_from = st.date_input("С даты", value=date.today(), key="log_from")
+        with fr1c2:
+            log_date_to = st.date_input("По дату", value=date.today(), key="log_to")
 
-    records = read_log(
-        date_from=str(log_date_from),
-        date_to=str(log_date_to),
-        org_id=log_seg   or None,
-        user_id=log_user or None,
-        event=log_event_filter or None,
-        limit=200,
-    )
-
-    # Шапка + экспорт
-    meta_col, export_col = st.columns([3, 1])
-    with meta_col:
-        st.caption(f"Показано записей: {len(records)}")
-    with export_col:
-        if records:
-            csv = export_to_csv(records)
-            st.download_button(
-                "Экспорт CSV",
-                data=csv,
-                file_name=f"audit_{log_date_from}_{log_date_to}.csv",
-                mime="text/csv",
-                key="export_csv",
+        # Вторая строка фильтров: сегмент, пользователь, событие
+        fr2c1, fr2c2, fr2c3 = st.columns([1, 1, 1])
+        with fr2c1:
+            seg_opts = {"": "Все сегменты"} | {k: v["name"] for k, v in segments.items()}
+            log_seg  = st.selectbox(
+                "Сегмент", options=list(seg_opts.keys()),
+                format_func=lambda x: seg_opts[x],
+                key="log_seg", label_visibility="collapsed",
+            )
+        with fr2c2:
+            user_opts = {"": "Все пользователи"} | {
+                uid: rec.get("name", uid) for uid, rec in users.items()
+            }
+            log_user = st.selectbox(
+                "Пользователь", options=list(user_opts.keys()),
+                format_func=lambda x: user_opts[x],
+                key="log_user", label_visibility="collapsed",
+            )
+        with fr2c3:
+            from core.audit import EVENT_TYPES
+            event_opts = {"": "Все события"} | {e: e for e in sorted(EVENT_TYPES)}
+            log_event_filter = st.selectbox(
+                "Событие", options=list(event_opts.keys()),
+                format_func=lambda x: event_opts[x],
+                key="log_event", label_visibility="collapsed",
             )
 
-    if not records:
-        st.info("Событий за выбранный период не найдено.")
-        return
+        records = read_log(
+            date_from=str(log_date_from),
+            date_to=str(log_date_to),
+            org_id=log_seg   or None,
+            user_id=log_user or None,
+            event=log_event_filter or None,
+            limit=200,
+        )
 
-    # Таблица лога
-    EVENT_LABELS = {
-        "login":            "Вход",
-        "logout":           "Выход",
-        "module_open":      "Раздел",
-        "button_click":     "Кнопка",
-        "llm_query":        "Запрос",
-        "file_upload":      "Файл",
-        "file_deleted":     "Удалён",
-        "password_reset":   "Сброс пароля",
-        "user_created":     "Создан польз.",
-        "user_archived":    "Архив польз.",
-        "segment_created":  "Создан сегм.",
-        "segment_archived": "Архив сегм.",
-    }
+        # Шапка + экспорт
+        meta_col, export_col = st.columns([3, 1])
+        with meta_col:
+            st.caption(f"Показано записей: {len(records)}")
+        with export_col:
+            if records:
+                csv = export_to_csv(records)
+                st.download_button(
+                    "Экспорт CSV",
+                    data=csv,
+                    file_name=f"audit_{log_date_from}_{log_date_to}.csv",
+                    mime="text/csv",
+                    key="export_csv",
+                )
 
-    EVENT_BADGE_COLORS = {
-        "login":        ("#EAF3DE", "#27500A"),
-        "logout":       ("#F1EFE8", "#5F5E5A"),
-        "module_open":  ("#E6F1FB", "#0C447C"),
-        "button_click": ("#FAECE7", "#712B13"),
-        "llm_query":    ("#EEEDFE", "#3C3489"),
-        "file_upload":  ("#FAEEDA", "#633806"),
-        "file_deleted": ("#F1EFE8", "#5F5E5A"),
-    }
+        if not records:
+            st.info("Событий за выбранный период не найдено.")
+        else:
+            # Таблица лога
+            EVENT_LABELS = {
+                "login":            "Вход",
+                "logout":           "Выход",
+                "module_open":      "Раздел",
+                "button_click":     "Кнопка",
+                "llm_query":        "Запрос",
+                "file_upload":      "Файл",
+                "file_deleted":     "Удалён",
+                "password_reset":   "Сброс пароля",
+                "user_created":     "Создан польз.",
+                "user_archived":    "Архив польз.",
+                "segment_created":  "Создан сегм.",
+                "segment_archived": "Архив сегм.",
+            }
 
-    # Заголовок таблицы
-    hc = st.columns([1, 1, 2, 1, 3])
-    for col, label in zip(hc, ["Время", "Сегмент", "Пользователь", "Событие", "Детали"]):
-        col.markdown(f"<small style='color:#5a6a7a;font-weight:600'>{label}</small>",
-                     unsafe_allow_html=True)
-    st.divider()
+            EVENT_BADGE_COLORS = {
+                "login":        ("#EAF3DE", "#27500A"),
+                "logout":       ("#F1EFE8", "#5F5E5A"),
+                "module_open":  ("#E6F1FB", "#0C447C"),
+                "button_click": ("#FAECE7", "#712B13"),
+                "llm_query":    ("#EEEDFE", "#3C3489"),
+                "file_upload":  ("#FAEEDA", "#633806"),
+                "file_deleted": ("#F1EFE8", "#5F5E5A"),
+            }
 
-    for rec in records:
-        ts       = rec.get("ts", "")[:16].replace("T", " ")
-        org_id   = rec.get("org_id", "")
-        uid      = rec.get("user_id", "")
-        ev       = rec.get("event", "")
-        mod      = rec.get("module") or ""
-        meta     = rec.get("meta", {})
+            # Заголовок таблицы
+            hc = st.columns([1, 1, 2, 1, 3])
+            for col, label in zip(hc, ["Время", "Сегмент", "Пользователь", "Событие", "Детали"]):
+                col.markdown(f"<small style='color:#5a6a7a;font-weight:600'>{label}</small>",
+                             unsafe_allow_html=True)
+            st.divider()
 
-        seg_name  = segments.get(org_id, {}).get("name", org_id or "—")
-        user_name = users.get(uid, {}).get("name", uid or "суперадмин")
+            for rec in records:
+                ts       = rec.get("ts", "")[:16].replace("T", " ")
+                org_id   = rec.get("org_id", "")
+                uid      = rec.get("user_id", "")
+                ev       = rec.get("event", "")
+                mod      = rec.get("module") or ""
+                meta     = rec.get("meta", {})
 
-        # Формируем детали из метаданных
-        details_parts = []
-        if mod:
-            details_parts.append(MODULE_LABELS.get(mod, mod))
-        if meta.get("label"):
-            details_parts.append(meta["label"])
-        if meta.get("file_type"):
-            size = meta.get("size_kb", "")
-            details_parts.append(f"{meta['file_type'].upper()} {size}КБ" if size else meta["file_type"].upper())
-        if meta.get("target_user_id"):
-            target = users.get(meta["target_user_id"], {}).get("name", meta["target_user_id"])
-            details_parts.append(f"→ {target}")
-        if meta.get("target_org_id"):
-            target_seg = segments.get(meta["target_org_id"], {}).get("name", meta["target_org_id"])
-            details_parts.append(f"→ {target_seg}")
-        if meta.get("duration_min"):
-            details_parts.append(f"длит. {meta['duration_min']} мин")
+                seg_name  = segments.get(org_id, {}).get("name", org_id or "—")
+                user_name = users.get(uid, {}).get("name", uid or "суперадмин")
 
-        details = " · ".join(details_parts) if details_parts else "—"
+                # Формируем детали из метаданных
+                details_parts = []
+                if mod:
+                    details_parts.append(MODULE_LABELS.get(mod, mod))
+                if meta.get("label"):
+                    details_parts.append(meta["label"])
+                if meta.get("file_type"):
+                    size = meta.get("size_kb", "")
+                    details_parts.append(f"{meta['file_type'].upper()} {size}КБ" if size else meta["file_type"].upper())
+                if meta.get("target_user_id"):
+                    target = users.get(meta["target_user_id"], {}).get("name", meta["target_user_id"])
+                    details_parts.append(f"→ {target}")
+                if meta.get("target_org_id"):
+                    target_seg = segments.get(meta["target_org_id"], {}).get("name", meta["target_org_id"])
+                    details_parts.append(f"→ {target_seg}")
+                if meta.get("duration_min"):
+                    details_parts.append(f"длит. {meta['duration_min']} мин")
 
-        # Цвет бейджа события
-        bg, color = EVENT_BADGE_COLORS.get(ev, ("#F1EFE8", "#5F5E5A"))
-        ev_badge  = _badge(EVENT_LABELS.get(ev, ev), bg, color)
+                details = " · ".join(details_parts) if details_parts else "—"
 
-        rc = st.columns([1, 1, 2, 1, 3])
-        rc[0].markdown(f"<small style='color:#5a6a7a'>{ts}</small>", unsafe_allow_html=True)
-        rc[1].markdown(f"<small>{seg_name}</small>", unsafe_allow_html=True)
-        rc[2].markdown(f"<small>{user_name}</small>", unsafe_allow_html=True)
-        rc[3].markdown(ev_badge, unsafe_allow_html=True)
-        rc[4].markdown(f"<small style='color:#5a6a7a'>{details}</small>", unsafe_allow_html=True)
+                # Цвет бейджа события
+                bg, color = EVENT_BADGE_COLORS.get(ev, ("#F1EFE8", "#5F5E5A"))
+                ev_badge  = _badge(EVENT_LABELS.get(ev, ev), bg, color)
+
+                rc = st.columns([1, 1, 2, 1, 3])
+                rc[0].markdown(f"<small style='color:#5a6a7a'>{ts}</small>", unsafe_allow_html=True)
+                rc[1].markdown(f"<small>{seg_name}</small>", unsafe_allow_html=True)
+                rc[2].markdown(f"<small>{user_name}</small>", unsafe_allow_html=True)
+                rc[3].markdown(ev_badge, unsafe_allow_html=True)
+                rc[4].markdown(f"<small style='color:#5a6a7a'>{details}</small>", unsafe_allow_html=True)
+
+    # ── Под-вкладка 2: использование функций (usage_tracker) ─────────────────
+    with sub2:
+        if _USAGE_TRACKER_AVAILABLE:
+            _show_usage_stats()
+        else:
+            st.warning(
+                "Модуль `core/usage_tracker.py` не найден. "
+                "Добавьте его в проект — он уже создан и готов к использованию."
+            )
 
 
 def _tab_help():

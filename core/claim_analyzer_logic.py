@@ -615,6 +615,12 @@ def _rag_search(query: str, top_k: int = 10,
 
     spheres: список сфер для фильтрации (None = все сферы).
     10 чанков × 600 симв = 6000 симв чистого релевантного текста в промпте.
+
+    ВАЖНО: doc_status=None — Анализатор НЕ фильтрует по статусу действия
+    документа (в отличие от Советчика, у которого дефолт "active"). Часть
+    НПА в базе может не иметь проставленных дат действия, и на время
+    диагностики фильтрация по статусу отключена полностью, чтобы исключить
+    её как возможную причину пустой выдачи.
     """
     global _rag_status
     _rag_status["last_query"] = query
@@ -624,22 +630,78 @@ def _rag_search(query: str, top_k: int = 10,
     except ImportError as e:
         _rag_status["ok"]    = False
         _rag_status["error"] = f"Импорт core.advisor: {e}"
+        print(f"[RAG_CLAIM] IMPORT ERROR: {e}")
         return []
 
     try:
-        res    = debug_search_candidates(query, top_k=top_k,
-                                         spheres=spheres or None,
-                                         filenames=doc_filter or None)
-        err    = res.get("error")
+        res = debug_search_candidates(
+            query, top_k=top_k,
+            spheres=spheres or None,
+            filenames=doc_filter or None,
+            doc_status=None,   # анализатор не фильтрует по статусу документа
+        )
+        err = res.get("error")
         if err:
             _rag_status["ok"]    = False
             _rag_status["error"] = err
             print(f"[RAG_CLAIM] ERROR: {err}")
             return []
 
+        pre_rerank  = res.get("pre_rerank", []) or []
+        post_rerank = res.get("post_rerank", []) or []
+        reranker_used = res.get("reranker_used", False)
+        elapsed = res.get("elapsed", "?")
+
+        # ── Диагностический лог: видно на каком именно этапе теряются кандидаты ──
+        print(f"[RAG_CLAIM] query={query!r} spheres={spheres} "
+              f"doc_filter={len(doc_filter) if doc_filter else 0} "
+              f"pre_rerank={len(pre_rerank)} post_rerank={len(post_rerank)} "
+              f"reranker_used={reranker_used} elapsed={elapsed}с")
+
+        # ── Автофоллбек: узкий doc_filter (whitelist файлов из Админки,
+        # config/claim_analyzer_config.json → rag_docs) режет кандидатов
+        # ДО фильтрации по имени файла top-K отбирается по всей базе, и для
+        # специфичных/редких формулировок статей затрат топ-кандидаты почти
+        # никогда не попадают в узкий whitelist — в отличие от общих фраз
+        # вроде "тарифное регулирование НВВ", которые есть почти везде.
+        # Если с doc_filter пусто — повторяем без него (сферы сохраняем).
+        if not pre_rerank and doc_filter:
+            print(f"[RAG_CLAIM] Пусто с doc_filter ({len(doc_filter)} файлов) — "
+                  f"повторяю запрос без ограничения по файлам...")
+            res_nf = debug_search_candidates(
+                query, top_k=top_k,
+                spheres=spheres or None,
+                filenames=None,
+                doc_status=None,
+            )
+            if not res_nf.get("error"):
+                pre_nf  = res_nf.get("pre_rerank", []) or []
+                post_nf = res_nf.get("post_rerank", []) or []
+                if pre_nf:
+                    print(f"[RAG_CLAIM] ✅ Без doc_filter найдено {len(pre_nf)} "
+                          f"кандидатов (post_rerank={len(post_nf)}). ПРИЧИНА: "
+                          f"настройка «Ограничить RAG документами» в Админке "
+                          f"(config/claim_analyzer_config.json → rag_docs, "
+                          f"сейчас {len(doc_filter)} файл(ов)) отсекает почти "
+                          f"все результаты для специфичных статей затрат — "
+                          f"whitelist слишком узкий. Рекомендация: очистить "
+                          f"или расширить список в Админке → Анализатор заявок.")
+                    pre_rerank, post_rerank = pre_nf, post_nf
+                    reranker_used = res_nf.get("reranker_used", reranker_used)
+
+        if not pre_rerank:
+            print(f"[RAG_CLAIM] ⚠️ ПУСТО до реранкинга (и без doc_filter тоже) — "
+                  f"hybrid search (BM25+вектор) не вернул ни одного кандидата для "
+                  f"запроса {query!r}. Проверьте: 1) проиндексирована ли база НПА, "
+                  f"2) не отфильтровали ли сферы {spheres} все документы, "
+                  f"3) доступен ли core.advisor.get_chroma_collection().")
+        elif pre_rerank and not post_rerank:
+            print(f"[RAG_CLAIM] ⚠️ Кандидаты были ({len(pre_rerank)}), "
+                  f"но post_rerank пуст — проблема в реранкере.")
+
         # post_rerank = топ-K без соседей
         # если реранкер упал — возвращает pre_rerank[:K]
-        candidates = res.get("post_rerank") or res.get("pre_rerank", [])
+        candidates = post_rerank or pre_rerank
         chunks = []
         for c in candidates:
             doc  = (c.get("doc") or "").strip()
@@ -660,9 +722,11 @@ def _rag_search(query: str, top_k: int = 10,
         return chunks
 
     except Exception as e:
+        import traceback
         _rag_status["ok"]    = False
         _rag_status["error"] = str(e)
-        print(f"[RAG_CLAIM] EXCEPTION: {e}")
+        print(f"[RAG_CLAIM] EXCEPTION: {type(e).__name__}: {e}")
+        print(f"[RAG_CLAIM] TRACEBACK: {traceback.format_exc()}")
         return []
 
 
@@ -2028,12 +2092,33 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     # Определяем регулируемый год автоматически если не задан явно
     _reg_year = reg_year
     if _reg_year == 0 and articles:
-        # берём максимальный год из amounts всех статей
+        # Собираем все годы из amounts всех статей.
+        #
+        # ВАЖНО: раньше брался max(all_years), что делало детекцию хрупкой —
+        # одна статья с ошибочным/аномальным годом в данных (опечатка,
+        # артефакт OCR, случайно попавшая в текст дата вроде "срок действия
+        # до 2035 г.") сдвигала регулируемый год для ВСЕХ статей сразу,
+        # и рост переставал считаться везде ("год N не найден в данных").
+        # Вместо максимума берём МОДУ (самый частый год) — единичная
+        # аномалия не может перевесить десятки статей с реальными 2025/2026.
+        # Если несколько лет одинаково частые — из них берём максимальный
+        # (обычно это и есть плановый/регулируемый период).
         all_years = []
         for _a in articles:
             ts = _parse_amounts_timeseries(_a.get("amounts", ""))
             all_years.extend(yr for yr, _, _ in ts)
-        _reg_year = max(all_years) if all_years else datetime.now().year
+        if all_years:
+            from collections import Counter as _Counter
+            _year_counts = _Counter(all_years)
+            _max_freq    = max(_year_counts.values())
+            _top_years   = [y for y, c in _year_counts.items() if c == _max_freq]
+            _reg_year    = max(_top_years)
+            if len(_year_counts) > 1:
+                print(f"[ANALYSIS] Годы в данных статей: {dict(_year_counts)} → "
+                      f"регулируемый год выбран как {_reg_year} "
+                      f"(по частоте встречаемости, не по максимуму)")
+        else:
+            _reg_year = datetime.now().year
 
     # ── Диапазоны прогресс-бара (монотонно возрастают) ───────────────────────
     # [0.00..0.05] — инициализация реранкера
@@ -2070,6 +2155,12 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         pass
 
     # Маппинг sphere_id → ключевое слово для _sphere_match
+    # ВАЖНО: значения — подстроки, которые встречаются в поле "sphere" в ChromaDB
+    # (формат "🔥 Теплоснабжение", "💧 Водоснабжение/водоотведение", "⚡ Электрика",
+    #  "🔵 Газ", "🗑️ Обращение с ТКО", "📁 Иные сферы" — см. config/doc_spheres.json).
+    # _sphere_match делает `any(kw in chunk_sphere_str for kw in selected_spheres)`,
+    # поэтому короткая русская подстрока без эмодзи достаточна и надёжнее,
+    # чем пытаться угадать точный emoji-префикс.
     _SPHERE_ID_KW = {
         'heat':  'Тепло',
         'water': 'Водо',
@@ -2099,7 +2190,21 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
     if progress_cb:
         sphere_label = f" · сферы: {', '.join(spheres)}" if spheres else " · все сферы"
         progress_cb(P_INIT_START, f"Инициализация RAG (русский реранкер DiTy){sphere_label}...")
-    _rag_search("тарифное регулирование НВВ", top_k=1, spheres=spheres or None)
+
+    # ── Диагностический прогрев: пробуем ОБА варианта — со сферами и без —
+    # чтобы сразу увидеть в логах, режут ли сферы весь результат до нуля.
+    _warmup_chunks = _rag_search("тарифное регулирование НВВ", top_k=5, spheres=spheres or None)
+    if spheres and not _warmup_chunks:
+        _warmup_no_sphere = _rag_search("тарифное регулирование НВВ", top_k=5, spheres=None)
+        if _warmup_no_sphere:
+            print(f"[RAG_CLAIM] ⚠️ ДИАГНОЗ: без фильтра сфер прогрев вернул "
+                  f"{len(_warmup_no_sphere)} чанков, а со сферами {spheres} — 0. "
+                  f"Фильтр сфер отсекает всю базу. Проверьте соответствие "
+                  f"значений {spheres} полю 'sphere' в ChromaDB (config/doc_spheres.json).")
+        else:
+            print(f"[RAG_CLAIM] ⚠️ ДИАГНОЗ: даже без фильтра сфер прогрев вернул 0 чанков — "
+                  f"проблема не в сферах, а в самом hybrid search / индексе НПА.")
+
     if progress_cb:
         progress_cb(P_INIT_END, f"Реранкер готов. Статей к анализу: {total}")
 
@@ -2129,6 +2234,7 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         progress_cb(P_RAG_START, f"RAG-поиск для {total} статей...")
 
     all_chunks: List[List[Dict]] = []
+    _empty_count = 0
     for rag_done, art in enumerate(articles):
         chunks = _rag_search(_make_rag_query(art["name"]), top_k=20,
                              spheres=spheres or None,
@@ -2136,11 +2242,15 @@ def analyze_risks(calc_context: str, summary: str, progress_cb=None,
         all_chunks.append(chunks)
         if not chunks:
             rag_available = False
+            _empty_count += 1
 
         # Периодически освобождаем реранкер чтобы не держать VRAM весь цикл
         if (rag_done + 1) % RAG_FLUSH_EVERY == 0:
             print(f"[RAG] Flush реранкера после {rag_done + 1} статей")
             _flush_reranker()
+
+    print(f"[RAG_CLAIM] Итог RAG-фазы: {total - _empty_count}/{total} статей "
+          f"получили хотя бы один чанк, {_empty_count} — без результатов.")
 
     # ── Финальная выгрузка реранкера перед LLM-фазой ─────────────────────────
     _flush_reranker()

@@ -86,13 +86,20 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
         if _rv is None:
             _ts = _parse_amounts_timeseries(_a.get("amounts", ""))
             _rv = _ts[-1][2] if _ts else 0
+        # ВАЖНО: фильтруем по округлённому значению, а не по сырому float.
+        # Иначе статья с исходным значением вроде 0.3 тыс.руб. проходит фильтр
+        # ">0", но после round() превращается в 0 — и тогда в _sq() на
+        # последнем шаге рекурсии total может стать равным rS при непустом
+        # остатке items, что даёт ZeroDivisionError при rS / total.
         if _rv and float(_rv) > 0:
-            _viz_rows.append({
-                "name":  _a.get("name", "")[:45],
-                "value": round(float(_rv)),
-                "risk":  _a.get("risk", "gray"),
-                "sheet": _a.get("sheet", ""),
-            })
+            _rounded_val = round(float(_rv))
+            if _rounded_val > 0:
+                _viz_rows.append({
+                    "name":  _a.get("name", "")[:45],
+                    "value": _rounded_val,
+                    "risk":  _a.get("risk", "gray"),
+                    "sheet": _a.get("sheet", ""),
+                })
     if _viz_rows:
         import matplotlib
         matplotlib.use("Agg")
@@ -134,8 +141,32 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
         def _sq(items, x, y, w, h, total, out):
             if not items:
                 return
-            if len(items) == 1:
-                out.append((items[0], x, y, w, h))
+            # ── Защита от деления на ноль ────────────────────────────────
+            # total может стать <= 0 на глубоких уровнях рекурсии, даже
+            # если items непустой: это происходит когда сумма значений
+            # оставшихся элементов (total) рассинхронизировалась с их
+            # фактическим весом (из-за округления value ещё на этапе
+            # построения _viz_rows) или когда все оставшиеся элементы
+            # имеют value=0. В обоих случаях пропорциональное разбиение
+            # невозможно — просто раскладываем элементы равными долями,
+            # чтобы не упасть с ZeroDivisionError.
+            if len(items) == 1 or total <= 0:
+                if len(items) == 1:
+                    out.append((items[0], x, y, w, h))
+                else:
+                    n = len(items)
+                    if w >= h:
+                        step = w / n
+                        cx = x
+                        for d in items:
+                            out.append((d, cx, y, step, h))
+                            cx += step
+                    else:
+                        step = h / n
+                        cy = y
+                        for d in items:
+                            out.append((d, x, cy, w, step))
+                            cy += step
                 return
             row, rS = [items[0]], items[0]["value"]
             for i in range(1, len(items)):
@@ -148,14 +179,14 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
             if w >= h:
                 rw, cy = w * rf, y
                 for d in row:
-                    ch = h * (d["value"] / rS)
+                    ch = h * (d["value"] / rS) if rS else h / len(row)
                     out.append((d, x, cy, rw, ch))
                     cy += ch
                 _sq(rest, x + rw, y, w - rw, h, total - rS, out)
             else:
                 rh, cx = h * rf, x
                 for d in row:
-                    cw = w * (d["value"] / rS)
+                    cw = w * (d["value"] / rS) if rS else w / len(row)
                     out.append((d, cx, y, cw, rh))
                     cx += cw
                 _sq(rest, x, y + rh, w, h - rh, total - rS, out)
@@ -167,7 +198,8 @@ def _render_risks_tab(risks_json: str, claim_summary: str = "", show_summary: bo
             _sorted = sorted(_viz_rows, key=lambda x: -x["value"])
             _total  = sum(d["value"] for d in _sorted)
             _rects  = []
-            _sq(_sorted, 0, 0, 1, 1, _total, _rects)
+            if _total > 0:
+                _sq(_sorted, 0, 0, 1, 1, _total, _rects)
 
             fig1, ax1 = plt.subplots(figsize=(14, 6))
             ax1.set_xlim(0, 1)

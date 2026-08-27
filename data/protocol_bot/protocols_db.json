@@ -17,64 +17,10 @@
       "txt_size": 8016,
       "docx_size": 39613,
       "word_count": 547
-    },
-    {
-      "id": "proto_0014_20260707_171056",
-      "meeting_name": "Совещание",
-      "organization": "Ваша организация",
-      "meeting_date": "2026-07-07",
-      "meeting_time": "17:09",
-      "attendees": [],
-      "source_type": "🎤",
-      "source_filename": "улица Молдагуловой 2.m4a",
-      "structure": "1. Дата и время встречи\n2. Присутствовали\n3. Повестка дня\n4. Обсуждаемые вопросы\n5. Принятые решения\n6. Поручения (кто, что, срок)\n7. Следующая встреча",
-      "detail_level": "средний",
-      "created_at": "2026-07-07T17:10:56.370733",
-      "txt_path": "data/protocol_bot/protocols/proto_0014_20260707_171056.txt",
-      "docx_path": "data/protocol_bot/protocols/proto_0014_20260707_171056.docx",
-      "txt_size": 845,
-      "docx_size": 37329,
-      "word_count": 74
-    },
-    {
-      "id": "proto_0003_20260708_222122",
-      "meeting_name": "Совещание",
-      "organization": "Ваша организация",
-      "meeting_date": "2026-07-08",
-      "meeting_time": "22:16",
-      "attendees": [],
-      "source_type": "🎤",
-      "source_filename": "005 Типы данных в PostgreSQL.mp4",
-      "structure": "1. Дата и время встречи\n2. Присутствовали\n3. Повестка дня\n4. Обсуждаемые вопросы\n5. Принятые решения\n6. Поручения (кто, что, срок)\n7. Следующая встреча",
-      "detail_level": "подробный",
-      "created_at": "2026-07-08T22:21:22.351131",
-      "txt_path": "data/protocol_bot/protocols/proto_0003_20260708_222122.txt",
-      "docx_path": "data/protocol_bot/protocols/proto_0003_20260708_222122.docx",
-      "txt_size": 2623,
-      "docx_size": 38067,
-      "word_count": 215
-    },
-    {
-      "id": "proto_0004_20260718_095146",
-      "meeting_name": "Совещание",
-      "organization": "Ваша организация",
-      "meeting_date": "2026-07-18",
-      "meeting_time": "09:49",
-      "attendees": [],
-      "source_type": "🎤",
-      "source_filename": "С Днем рождения, Платформа.mp4",
-      "structure": "Какие конкретно мысли озвучил санников",
-      "detail_level": "средний",
-      "created_at": "2026-07-18T09:51:46.855146",
-      "txt_path": "data/protocol_bot/protocols/proto_0004_20260718_095146.txt",
-      "docx_path": "data/protocol_bot/protocols/proto_0004_20260718_095146.docx",
-      "txt_size": 4418,
-      "docx_size": 38553,
-      "word_count": 274
     }
   ],
   "stats": {
-    "total": 4,
+    "total": 1,
     "last_created": "2026-07-18T09:51:46.855146"
   }
 }
