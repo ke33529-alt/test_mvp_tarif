@@ -53,6 +53,7 @@ services:
       - ./app.py:/app/app.py
       - ./core:/app/core
       - ./streamlit_pages:/app/streamlit_pages
+      - ./.streamlit:/app/.streamlit
       - ./init_data_structure.py:/app/init_data_structure.py
       - ./init_superadmin.py:/app/init_superadmin.py
 
