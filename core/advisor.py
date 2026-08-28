@@ -8,6 +8,12 @@ from datetime import datetime
 import threading
 from typing import Optional, List, Dict
 from openai import OpenAI
+
+# Usage tracker — с защитой: если модуль недоступен, трекинг отключается молча
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
  
 # =============================================================================
 # Исправление кодировки консоли на Windows (cp1252 → utf-8)
@@ -1963,13 +1969,21 @@ def stream_ai_answer(
     if _SOURCES_ONLY_MODE:
         yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
         return
- 
+
+    # Событие: запрос отправлен в советчик
+    _log_usage("advisor", "query_submitted", meta={
+        "query_len": len(query),
+        "sources":   len(sources),
+        "model":     model,
+    })
+
     # Кэш — возвращаем сразу без стриминга (неймспейс вшит в хэш ключа →
     # чужой сегмент физически не может попасть в выдачу)
     cache_key = get_cache_key(query, sources, model, namespace=namespace)
     cached_answer = _cache_get(cache_key)
     if cached_answer is not None:
         print(f"[CACHE HIT stream] {model} | ns={namespace}")
+        _log_usage("advisor", "cache_hit", meta={"query_len": len(query)})
         yield cached_answer
         return
  
@@ -2125,6 +2139,12 @@ def stream_ai_answer(
         )
         if not is_broken:
             _cache_put(cache_key, answer, query, model, namespace)
+            _log_usage("advisor", "answer_streamed", meta={
+                "query_len":  len(query),
+                "answer_len": len(answer),
+                "sources":    len(sources),
+                "model":      model,
+            })
  
     except Exception as e:
         err = str(e)
@@ -2178,6 +2198,12 @@ def stream_clarification_answer(
     if _SOURCES_ONLY_MODE:
         yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
         return
+
+    # Событие: уточняющий вопрос
+    _log_usage("advisor", "clarification_submitted", meta={
+        "query_len":   len(clarify_q),
+        "new_sources": len(new_sources),
+    })
 
     try:
         prompts       = load_prompts()
@@ -2489,6 +2515,7 @@ def ask_question(
                 result["redirect"]        = sec
                 result["redirect_reason"] = f"Для деталей рекомендуем раздел «{sec}»"
             print(f"[ASK] FAQ за {time.perf_counter()-t_start:.2f} сек")
+            _log_usage("advisor", "faq_matched", meta={"query_len": len(query)})
             return result
  
     # Гибридный поиск (BM25 + vector + reranking)
@@ -2512,7 +2539,14 @@ def ask_question(
     if sec:
         result["redirect"]        = sec
         result["redirect_reason"] = f"💡 Ваш вопрос относится к разделу «{sec}»."
- 
+
+    _log_usage("advisor", "answer_generated", meta={
+        "query_len":  len(query),
+        "sources":    len(result.get("sources", [])),
+        "from_cache": result.get("from_cache", False),
+        "has_answer": bool((result.get("answer") or "").strip()),
+    })
+
     print(f"[ASK] Итого: {time.perf_counter()-t_start:.2f} сек\n")
     return result
 

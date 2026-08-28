@@ -92,6 +92,10 @@ ACTION_LABELS: Dict[str, str] = {
     # advisor
     "query_submitted":         "Запрос отправлен",
     "answer_generated":        "Ответ получен",
+    "answer_streamed":         "Ответ сгенерирован",
+    "cache_hit":               "Ответ из кэша",
+    "faq_matched":             "Ответ из FAQ",
+    "clarification_submitted": "Уточняющий вопрос",
     "letter_generated":        "Письмо сгенерировано",
     "source_opened":           "Источник НПА открыт",
     # claim_analyzer
@@ -99,6 +103,7 @@ ACTION_LABELS: Dict[str, str] = {
     "analysis_completed":      "Анализ завершён",
     "risk_detail_opened":      "Риск открыт",
     "report_downloaded":       "Отчёт скачан",
+    "project_deleted":         "Заявка удалена",
     # predictor
     "prediction_started":      "Прогноз запущен",
     "prediction_completed":    "Прогноз завершён",
@@ -107,26 +112,30 @@ ACTION_LABELS: Dict[str, str] = {
     # doc_scanner
     "scan_started":            "Сканирование запущено",
     "scan_completed":          "Сканирование завершено",
-    "summary_generated":       "Резюме сгенерировано",
+    "summary_generated":       "Пересказ сгенерирован",
     "document_exported":       "Документ экспортирован",
+    "document_deleted":        "Документ удалён",
     # protocol
     "transcription_started":   "Транскрипция запущена",
     "transcription_completed": "Транскрипция завершена",
     "protocol_generated":      "Протокол сгенерирован",
     "protocol_exported":       "Протокол скачан",
+    "protocol_deleted":        "Протокол удалён",
     # tasks
     "task_created":            "Задача создана",
     "task_completed":          "Задача выполнена",
-    "task_viewed":             "Задача открыта",
+    "task_status_changed":     "Статус изменён",
+    "task_deleted":            "Задача удалена",
 }
 
 # Воронка: (событие_старта, событие_финиша) — для расчёта конверсии
 FUNNEL_PAIRS: Dict[str, Tuple[str, str]] = {
-    "advisor":        ("query_submitted",       "answer_generated"),
+    "advisor":        ("query_submitted",       "answer_streamed"),
     "claim_analyzer": ("analysis_started",      "analysis_completed"),
     "predictor":      ("prediction_started",    "prediction_completed"),
     "doc_scanner":    ("scan_started",          "scan_completed"),
     "protocol":       ("transcription_started", "protocol_generated"),
+    "tasks":          ("task_created",          "task_completed"),
 }
 
 
@@ -372,24 +381,68 @@ def _format_meta(action: str, meta: Dict) -> str:
         return f"статей: {meta.get('article_count', '—')}"
 
     if action == "analysis_completed":
-        return f"высоких: {meta.get('high', 0)} · средних: {meta.get('med', 0)} · низких: {meta.get('low', 0)}"
+        return (f"высоких: {meta.get('n_high', meta.get('high', 0))} · "
+                f"средних: {meta.get('n_medium', meta.get('med', 0))} · "
+                f"статей: {meta.get('n_articles', '—')}")
 
     if action == "scan_started":
         return f"файлов: {meta.get('file_count', '—')}"
 
     if action == "scan_completed":
         parts = []
+        if meta.get("total_pages") or meta.get("pages"):
+            parts.append(f"{meta.get('total_pages', meta.get('pages', '?'))} стр.")
+        if meta.get("total_words") or meta.get("words"):
+            parts.append(f"{meta.get('total_words', meta.get('words', '?'))} слов")
+        return " · ".join(parts) or "—"
+
+    if action == "summary_generated":
+        parts = []
+        if meta.get("filename"):
+            parts.append(meta["filename"][:30])
         if meta.get("pages"):
             parts.append(f"{meta['pages']} стр.")
-        if meta.get("words"):
-            parts.append(f"{meta['words']} слов")
+        return " · ".join(parts) or "—"
+
+    if action == "document_exported":
+        fname = meta.get("filename", "")
+        fmt   = meta.get("format", "")
+        return f"{fname[:40]}" + (f" ({fmt})" if fmt else "")
+
+    if action == "transcription_started":
+        parts = []
+        if meta.get("filename"):
+            parts.append(meta["filename"][:30])
+        if meta.get("size_mb"):
+            parts.append(f"{meta['size_mb']} МБ")
         return " · ".join(parts) or "—"
 
     if action == "transcription_completed":
-        return f"{meta.get('words', '—')} слов" if meta.get("words") else "—"
+        parts = []
+        if meta.get("elapsed_sec"):
+            parts.append(f"{meta['elapsed_sec']} сек")
+        if meta.get("chars"):
+            parts.append(f"{meta['chars']} симв.")
+        return " · ".join(parts) or "—"
+
+    if action == "protocol_generated":
+        parts = []
+        if meta.get("source_type"):
+            parts.append(meta["source_type"])
+        if meta.get("attendees"):
+            parts.append(f"{meta['attendees']} участн.")
+        return " · ".join(parts) or "—"
+
+    if action == "protocol_exported":
+        return meta.get("meeting_name", "")[:50] or "—"
 
     if action == "task_created":
-        return meta.get("source_module", "—")
+        return f"приоритет: {meta.get('priority', '—')}"
+
+    if action == "task_status_changed":
+        fr = meta.get("from", "")
+        to = meta.get("to", "")
+        return f"{fr} → {to}" if fr and to else "—"
 
     # Общий случай: первые 3 поля meta
     parts = [f"{k}: {v}" for k, v in list(meta.items())[:3] if v not in (None, "", False)]

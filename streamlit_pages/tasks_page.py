@@ -42,6 +42,12 @@ def _audit(user: dict, event: str) -> None:
         pass
 
 
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
+
 def _micro_label(text: str) -> str:
     """Компактная подпись категории перед чипом (мелкий серый капс)."""
     return (f'<span style="font-size:0.62rem;color:#9aa5b1;text-transform:uppercase;'
@@ -110,6 +116,28 @@ def _ref_link_text(ref: dict) -> str:
     src_label = entity_picker.SOURCE_LABELS.get(ref.get("source", ""), ref.get("source", ""))
     label = ref.get("label", "")
     return f"🔗 {src_label}: {label} →" if label else f"🔗 {src_label} →"
+
+
+@st.dialog("Удаление задачи")
+def _show_delete_dialog(user: dict, pending: dict):
+    """Модальное подтверждение удаления задачи."""
+    st.markdown("Удалить эту задачу?")
+    _txt = (pending.get("text", "") or "")[:200]
+    if _txt:
+        st.caption(_txt)
+    st.caption("Действие необратимо.")
+
+    c_yes, c_no = st.columns(2)
+    if c_yes.button("Удалить", type="primary", use_container_width=True, key="_task_del_yes"):
+        ok = tasks_core.delete_task(user, pending["id"], pending["owner_id"], pending["segment"])
+        st.session_state.pop("_task_del", None)
+        if ok:
+            _audit(user, "task_delete")
+            _log_usage("tasks", "task_deleted", meta={"task_id": pending["id"]})
+        st.rerun()
+    if c_no.button("Отмена", use_container_width=True, key="_task_del_no"):
+        st.session_state.pop("_task_del", None)
+        st.rerun()
 
 
 @st.dialog("Завершение задачи")
@@ -221,6 +249,11 @@ def _show_complete_dialog(user: dict, pending: dict):
         if st.button("Завершить задачу", type="primary", use_container_width=True, key=f"_tc_ok_{tid}"):
             tasks_core.complete_task(user, tid, note=note, refs=list(st.session_state.get(refs_key, [])))
             _audit(user, "task_complete")
+            _log_usage("tasks", "task_completed", meta={
+                "task_id":  tid,
+                "has_note": bool((note or "").strip()),
+                "refs":     len(st.session_state.get(refs_key, [])),
+            })
             st.session_state["_task_complete_pending"] = None
             st.session_state.pop(note_key, None)
             st.session_state.pop(refs_key, None)
@@ -344,6 +377,10 @@ def show_tasks():
                 due_date=(_new_due.isoformat() if _new_due else ""),
             )
             _audit(user, "task_add")
+            _log_usage("tasks", "task_created", meta={
+                "priority": _new_prio,
+                "has_due":  bool(_new_due),
+            })
             st.session_state["_task_clear_new"] = True
             st.rerun()
         else:
@@ -419,24 +456,10 @@ def show_tasks():
     if _complete_pending:
         _show_complete_dialog(user, _complete_pending)
 
-    # ── Подтверждение удаления ────────────────────────────────────────────────
+    # ── Подтверждение удаления (модалка) ──────────────────────────────────────
     pend = st.session_state.get("_task_del")
     if pend:
-        with st.container(border=True):
-            st.warning("Удалить эту задачу? Действие необратимо.")
-            st.caption((pend.get("text", "") or "")[:200])
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                if st.button("Да, удалить", type="primary", key="_task_del_yes", use_container_width=True):
-                    ok = tasks_core.delete_task(user, pend["id"], pend["owner_id"], pend["segment"])
-                    st.session_state.pop("_task_del", None)
-                    if ok:
-                        _audit(user, "task_delete")
-                    st.rerun()
-            with dc2:
-                if st.button("Отмена", key="_task_del_no", use_container_width=True):
-                    st.session_state.pop("_task_del", None)
-                    st.rerun()
+        _show_delete_dialog(user, pend)
 
     if not items:
         st.info("Задач по текущему фильтру нет.")
@@ -804,6 +827,11 @@ def show_tasks():
                                     st.rerun()
                                 else:
                                     tasks_core.update_task(user, tid, status=_ns)
+                                    _log_usage("tasks", "task_status_changed", meta={
+                                        "task_id":  tid,
+                                        "from":     status,
+                                        "to":       _ns,
+                                    })
                                     st.rerun()
                     with oc_right:
                         oc3, oc4 = st.columns(2)
@@ -812,7 +840,8 @@ def show_tasks():
                                 st.session_state["_task_edit_id"] = tid
                                 st.rerun()
                         with oc4:
-                            if st.button("Удалить", type="primary", key=f"del_{tid}", use_container_width=True):
+                            if st.button("✕", key=f"del_{tid}", use_container_width=True,
+                                         help="Удалить задачу"):
                                 st.session_state["_task_del"] = {
                                     "id": tid, "owner_id": owner_id,
                                     "segment": seg, "text": t.get("text", ""),
@@ -820,7 +849,8 @@ def show_tasks():
                                 st.rerun()
                 elif can_d:
                     # Чужая задача, но роль позволяет удалить (админ/суперадмин)
-                    if st.button("Удалить", type="primary", key=f"del_{tid}", use_container_width=False):
+                    if st.button("✕", key=f"del_{tid}", use_container_width=False,
+                                 help="Удалить задачу"):
                         st.session_state["_task_del"] = {
                             "id": tid, "owner_id": owner_id,
                             "segment": seg, "text": t.get("text", ""),

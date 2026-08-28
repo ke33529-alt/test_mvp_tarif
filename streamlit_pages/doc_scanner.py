@@ -18,6 +18,11 @@ from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
 # =============================================================================
 # Утилиты — загрузка/сохранение базы сканов
 # =============================================================================
@@ -387,6 +392,39 @@ def add_to_db(db: Dict, filename: str, pages: List[Dict],
     db["stats"]["total"] = len(db["documents"])
     db["stats"]["last_scan"] = doc["processed_at"]
     return doc_id
+
+
+def delete_doc_from_db(db: Dict, doc_id: str) -> Dict:
+    """
+    Удаляет один документ из базы и все его файлы с диска:
+    оригинал, пересказ (.txt), файл фокуса.
+
+    Возвращает {"ok": int, "err": int} — сколько файлов удалено / не удалено.
+    """
+    doc = next((d for d in db.get("documents", []) if d.get("id") == doc_id), None)
+    if not doc:
+        return {"ok": 0, "err": 0}
+
+    ok, err = 0, 0
+    for fpath in [
+        doc.get("original_path", ""),
+        _summary_path(doc.get("original_path", "") or ""),
+        _focus_path(doc.get("original_path", "") or ""),
+    ]:
+        if fpath and os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                ok += 1
+            except Exception:
+                err += 1
+
+    db["documents"] = [d for d in db["documents"] if d.get("id") != doc_id]
+    db["stats"]["total"] = len(db["documents"])
+    db["stats"]["last_scan"] = (
+        max((d.get("processed_at", "") for d in db["documents"]), default=None)
+        if db["documents"] else None
+    )
+    return {"ok": ok, "err": err}
 
 
 # =============================================================================
@@ -1030,6 +1068,49 @@ def _render_jumped_document(doc: Dict):
 
 
 # =============================================================================
+# Модалка подтверждения удаления документа
+# =============================================================================
+@st.dialog("Удаление документа")
+def _confirm_delete_dialog(doc_id: str, filename: str, has_summary: bool):
+    """
+    Модальное окно подтверждения удаления одного документа из базы.
+    При подтверждении вызывает delete_doc_from_db, чистит session_state,
+    логирует событие и закрывает модалку через st.rerun().
+    """
+    _bits = ["оригинал файла"]
+    if has_summary:
+        _bits.append("пересказ")
+    _bits.append("данные распознавания")
+    st.markdown(
+        f"Удалить документ **{filename}** из базы?\n\n"
+        f"Будут удалены: {', '.join(_bits)}."
+    )
+    st.caption("Это действие необратимо.")
+
+    c_yes, c_no = st.columns(2)
+    if c_yes.button("Удалить", type="primary", use_container_width=True,
+                    key=f"_dlg_del_yes_{doc_id}"):
+        db = st.session_state.get("scanner_db") or load_db()
+        res = delete_doc_from_db(db, doc_id)
+        save_db(db)
+        st.session_state["scanner_db"] = db
+        for _sk in list(st.session_state.keys()):
+            if _sk.endswith(f"_{doc_id}") or doc_id in _sk:
+                st.session_state.pop(_sk, None)
+        _log_usage("doc_scanner", "document_deleted", meta={
+            "filename":      filename,
+            "files_removed": res["ok"],
+        })
+        st.session_state["_scan_delete_done"] = (
+            f"«{filename}» удалён. Файлов удалено с диска: {res['ok']}"
+            + (f", не удалось: {res['err']}" if res.get("err") else "") + "."
+        )
+        st.rerun()
+    if c_no.button("Отмена", use_container_width=True, key=f"_dlg_del_no_{doc_id}"):
+        st.rerun()
+
+
+# =============================================================================
 # UI — главная страница сканера
 # =============================================================================
 def show_doc_scanner():
@@ -1109,6 +1190,11 @@ def show_doc_scanner():
                 status   = st.empty()
                 new_ids  = []
 
+                _log_usage("doc_scanner", "scan_started", meta={
+                    "file_count": len(uploaded),
+                    "filenames":  [f.name for f in uploaded[:5]],
+                })
+
                 for i, f in enumerate(uploaded):
                     status.text(f"⏳ Обрабатываю {f.name} ({i+1}/{len(uploaded)})...")
                     progress.progress((i) / len(uploaded))
@@ -1141,6 +1227,21 @@ def show_doc_scanner():
                 save_db(db)
                 st.session_state["scanner_db"] = db
                 st.session_state["last_scanned_ids"] = new_ids
+                _total_words = sum(
+                    sum(p.get("word_count", 0) for p in d.get("pages", []))
+                    for d in db.get("documents", [])
+                    if d.get("id") in new_ids
+                )
+                _total_pages = sum(
+                    len(d.get("pages", []))
+                    for d in db.get("documents", [])
+                    if d.get("id") in new_ids
+                )
+                _log_usage("doc_scanner", "scan_completed", meta={
+                    "file_count": len(uploaded),
+                    "total_pages": _total_pages,
+                    "total_words": _total_words,
+                })
 
         # ── Результаты последней обработки ──────────────────────────────
         _raw_ids = st.session_state.get("last_scanned_ids", [])
@@ -1341,6 +1442,11 @@ def show_doc_scanner():
                 if _orig_p:
                     save_summary_file(_orig_p, _gresult)
                     save_focus_file(_orig_p, st.session_state.get(_focus_key, ""))
+                _log_usage("doc_scanner", "summary_generated", meta={
+                    "filename":   _fname(doc),
+                    "pages":      len(doc.get("pages", [])),
+                    "summary_len": len(_gresult),
+                })
                 # Нет st.rerun() — результат показывается сразу ниже
 
             # ── Результат пересказа ───────────────────────────────────────
@@ -1390,14 +1496,17 @@ def show_doc_scanner():
             st.markdown("**Сохранить результат:**")
             exp_col1, exp_col2 = st.columns(2)
             with exp_col1:
-                st.download_button(
+                if st.download_button(
                     label="Скачать TXT",
                     data=export_txt(doc),
                     file_name=f"{os.path.splitext(_fname(doc))[0]}_распознан.txt",
                     mime="text/plain",
                     key=f"dl_txt_{doc['id']}",
                     use_container_width=True,
-                )
+                ):
+                    _log_usage("doc_scanner", "document_exported", meta={
+                        "filename": _fname(doc), "format": "txt",
+                    })
             with exp_col2:
                 try:
                     docx_buf = export_docx(doc, summary=st.session_state.get(summary_key))
@@ -1738,6 +1847,10 @@ def show_doc_scanner():
     with tab_docs:
         st.subheader("База распознанных документов")
 
+        _del_msg = st.session_state.pop("_scan_delete_done", None)
+        if _del_msg:
+            st.success(_del_msg)
+
         docs = db.get("documents", [])
         stats = db.get("stats", {})
 
@@ -1919,12 +2032,13 @@ def show_doc_scanner():
                 )
 
                 # Кнопки-действия в строке
-                _ca, _cb_btn, _cc, _cd = st.columns([2, 1, 1, 1])
+                _ca, _cb_btn, _cc, _cd, _ce_del = st.columns([3, 2, 2, 3, 1])
                 with _ca:
                     _btn_label = "Скрыть детали" if _is_open else "Показать детали"
                     if st.button(_btn_label, key=f"db_toggle_{_did}",
                                  use_container_width=True):
                         st.session_state[_open_key] = None if _is_open else _did
+                        st.session_state[_del_pending_key] = None
                         st.rerun()
                 with _cb_btn:
                     _file_label = "Открыть файл" if _orig_ok else "Файл недоступен"
@@ -1978,6 +2092,10 @@ def show_doc_scanner():
                             )
                         except Exception:
                             pass
+                with _ce_del:
+                    if st.button("✕", key=f"db_del_{_did}", use_container_width=True,
+                                 help="Удалить документ из базы"):
+                        _confirm_delete_dialog(_did, _dfn, _has_s)
 
                 # Развёрнутая карточка
                 if _is_open:

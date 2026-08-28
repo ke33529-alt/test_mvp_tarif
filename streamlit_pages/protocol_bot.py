@@ -19,6 +19,11 @@ from typing import Dict, List, Optional
 
 import streamlit as st
 
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
 # Принудительно переключаем stdout на UTF-8 для Windows PowerShell
 # (иначе эмодзи в print() вызывают UnicodeEncodeError на cp1251)
 if hasattr(sys.stdout, "buffer"):
@@ -882,6 +887,30 @@ def _render_attendees_widget() -> List[Dict]:
 
 
 # =============================================================================
+# Модалка подтверждения удаления протокола
+# =============================================================================
+@st.dialog("Удаление протокола")
+def _confirm_delete_proto_dialog(proto_id: str, proto_name: str):
+    """Модальное подтверждение удаления протокола из базы."""
+    st.markdown(f"Удалить протокол **{proto_name or 'Без названия'}**?")
+    st.caption("Будут удалены текст протокола и связанные файлы. Действие необратимо.")
+
+    c_yes, c_no = st.columns(2)
+    if c_yes.button("Удалить", type="primary", use_container_width=True,
+                    key=f"_dlg_proto_yes_{proto_id}"):
+        _db_delete(proto_id)
+        if st.session_state.get("pb_open_card") == proto_id:
+            st.session_state.pb_open_card = None
+        _log_usage("protocol", "protocol_deleted", meta={
+            "meeting_name": (proto_name or "")[:60],
+        })
+        st.session_state["_proto_delete_done"] = f"Протокол «{proto_name or 'Без названия'}» удалён."
+        st.rerun()
+    if c_no.button("Отмена", use_container_width=True, key=f"_dlg_proto_no_{proto_id}"):
+        st.rerun()
+
+
+# =============================================================================
 # Главная функция Streamlit
 # =============================================================================
 def show_protocol_bot():
@@ -1080,10 +1109,14 @@ def show_protocol_bot():
                     st.warning("⚠️ Идёт транскрибация аудио — не переключайте раздел и не закрывайте вкладку")
                     import time as _time
 
-                    # Используем закэшированные байты — НЕ читаем uploaded_audio
-                    # повторно (его курсор уже мог быть тронут виджетами выше).
                     audio_bytes = st.session_state.proto_audio_bytes
                     _mb = len(audio_bytes) / 1024 / 1024
+
+                    _log_usage("protocol", "transcription_started", meta={
+                        "filename":   uploaded_audio.name,
+                        "size_mb":    round(_mb, 2),
+                        "model":      _selected_key,
+                    })
 
                     _status = st.empty()
                     _status.info(f"⏳ Подготовка... файл {_mb:.2f} МБ, модель: {_selected_key}")
@@ -1105,6 +1138,11 @@ def show_protocol_bot():
                             + (f" · аудио: **{_dur}**" if _dur else "")
                             + f" · символов: **{len(tr['text']):,}**"
                         )
+                        _log_usage("protocol", "transcription_completed", meta={
+                            "elapsed_sec": _elapsed,
+                            "chars":       len(tr["text"]),
+                            "duration":    str(_dur),
+                        })
                         st.rerun()
                     else:
                         st.error(tr["error"])
@@ -1220,6 +1258,11 @@ def show_protocol_bot():
                         "source_filename": source_filename,
                     }
                     st.session_state.proto_saved_id = None
+                    _log_usage("protocol", "protocol_generated", meta={
+                        "source_type":    input_method.split()[0],
+                        "attendees":      len(attendees),
+                        "protocol_len":   len(res["protocol"]),
+                    })
                     st.success("✅ Протокол готов! Прокрутите вниз.")
                     st.rerun()
                 else:
@@ -1280,7 +1323,7 @@ def show_protocol_bot():
                 ).strip().replace(" ", "_")
                 fname = f"Protocol_{safe_name}_{proto['meeting_date'].replace('-','')}.docx"
 
-                st.download_button(
+                if st.download_button(
                     "📥 Скачать DOCX",
                     data=dl_bytes,
                     file_name=fname,
@@ -1288,7 +1331,11 @@ def show_protocol_bot():
                     use_container_width=True,
                     key="proto_dl_btn",
                     disabled=not bool(dl_bytes),
-                )
+                ):
+                    _log_usage("protocol", "protocol_exported", meta={
+                        "meeting_name": proto.get("meeting_name", "")[:60],
+                        "format": "docx",
+                    })
 
             with c_reset:
                 if st.button("🔄 Создать новый", use_container_width=True):
@@ -1508,6 +1555,10 @@ def show_protocol_bot():
         stats      = db.get("stats", {})
 
         st.subheader("База протоколов")
+
+        _proto_del_msg = st.session_state.pop("_proto_delete_done", None)
+        if _proto_del_msg:
+            st.success(_proto_del_msg)
 
         # ── Метрики ──────────────────────────────────────────────────────────
         m1, m2, m3, m4 = st.columns(4)
@@ -1750,10 +1801,7 @@ def show_protocol_bot():
 
             with ce:
                 if st.button("✕", key=f"pb_del_{pid}", help="Удалить протокол навсегда"):
-                    _db_delete(pid)
-                    if st.session_state.get("pb_open_card") == pid:
-                        st.session_state.pb_open_card = None
-                    st.rerun()
+                    _confirm_delete_proto_dialog(pid, proto.get("meeting_name", ""))
 
             # ── Детали карточки (раскрытая) ──────────────────────────────────
             if is_open:

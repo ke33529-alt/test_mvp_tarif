@@ -19,6 +19,11 @@ from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
 # Импорт всей бизнес-логики из core
 from core.claim_analyzer_logic import (
     REGULATION_SPHERES,
@@ -616,8 +621,7 @@ def _show_article_approval(readonly: bool = False):
     # ── Кнопки действий ──────────────────────────────────────────────────
     if not readonly:
         def _reset_editor():
-            for k in ["ca_ap_editor", "ca_ap_add_name", "ca_ap_add_value",
-                      "ca_ap_add_unit", "ca_ap_add_year", "ca_ap_add_pf"]:
+            for k in ["ca_ap_editor", "ca_ap_add_name"]:
                 ss.pop(k, None)
 
         # Вычисляем tf здесь чтобы передать в _in_filter
@@ -748,7 +752,8 @@ def _show_article_approval(readonly: bool = False):
             }
             for _yr in _year_cols:
                 _v = ts_by_yr.get(_yr)
-                row[_yr] = f'{_v:,.0f}' if _v is not None else '—'
+                # Числовые значения — None для пустых ячеек (NumberColumn)
+                row[_yr] = float(_v) if _v is not None else None
             row['Тип'] = TYPE_OPT_LBLS.get(a['type'], a['type'])
             rows.append(row)
         return pd.DataFrame(rows)
@@ -767,10 +772,16 @@ def _show_article_approval(readonly: bool = False):
             df_show.drop(columns=["_idx"]),
             column_config={
                 "Включить":    st.column_config.CheckboxColumn("Включить", width="small"),
-                "Наименование": st.column_config.TextColumn("Наименование", width="large", disabled=True),
+                "Наименование": st.column_config.TextColumn("Наименование", width="large"),
                 "Лист":        st.column_config.TextColumn("Лист", width="medium", disabled=True),
                 "Ед.изм.":     st.column_config.TextColumn("Ед.изм.", width="small"),
-                **{yr: st.column_config.TextColumn(yr, width='small', disabled=True) for yr in _year_cols},
+                **{
+                    yr: st.column_config.NumberColumn(
+                        yr, width="small", format="%.0f", step=1.0,
+                        help="Введите значение (или оставьте пустым)"
+                    )
+                    for yr in _year_cols
+                },
                 "Тип":         st.column_config.SelectboxColumn(
                     "Тип", width="medium",
                     options=list(TYPE_OPT_LBLS.values()),
@@ -781,6 +792,12 @@ def _show_article_approval(readonly: bool = False):
             key="ca_ap_editor",
         )
         n_sel_live = int(edited["Включить"].sum()) if edited is not None else 0
+        # Живой подсчёт отмеченных статей с пустым наименованием — блокирует анализ
+        _empty_named_live = 0
+        if edited is not None:
+            for _, _r in edited.iterrows():
+                if bool(_r["Включить"]) and not str(_r["Наименование"]).strip():
+                    _empty_named_live += 1
 
     elif readonly and not df_show.empty:
         st.dataframe(
@@ -788,61 +805,61 @@ def _show_article_approval(readonly: bool = False):
             use_container_width=True, hide_index=True,
         )
         n_sel_live = sum(1 for a in articles if a["checked"])
+        _empty_named_live = 0
     else:
         n_sel_live = 0
+        _empty_named_live = 0
 
-    # ── Ручное добавление статьи (вне expander — иначе кнопка не работает) ──
+    # ── Добавление статьи затрат ──────────────────────────────────────────
     if not readonly:
-        st.markdown("**➕ Добавить статью вручную**")
-        ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([3, 1, 1, 1, 1, 1])
-        add_name  = ac1.text_input("Наименование", key="ca_ap_add_name",
-                                   placeholder="Расходы на ремонт...")
-        add_year  = ac2.text_input("Год", key="ca_ap_add_year",
-                                   placeholder="2027")
-        add_pf    = ac3.selectbox("Тип", ["Принято", "Предложение", "Факт"],
-                                  key="ca_ap_add_pf")
-        add_value = ac4.text_input("Значение", key="ca_ap_add_value",
-                                   placeholder="12345.00")
-        if "ca_ap_add_unit" not in ss:
-            ss["ca_ap_add_unit"] = "тыс.руб."
-        add_unit = ac5.text_input("Ед.изм.", key="ca_ap_add_unit",
-                                  placeholder="тыс.руб.")
-        if ac6.button("Добавить", key="ca_ap_add_btn", type="primary",
-                      use_container_width=True):
-            if add_name.strip() and add_value.strip():
-                try:
-                    val  = float(add_value.replace(",", ".").replace(" ", ""))
-                    year = add_year.strip() or "2027"
-                    amounts = f"{year} ({add_pf}): {val:,.2f} {add_unit}"
-                    ss.ca_parsed_articles.append({
-                        "name":       add_name.strip(),
-                        "amounts":    amounts,
-                        "type":       "cost",
-                        "checked":    True,
-                        "sheet":      "вручную",
-                        "unit":       add_unit.strip(),
-                        "tech_sheet": False,
-                        "manual":     True,
-                    })
-                    for k in ["ca_ap_add_name", "ca_ap_add_value",
-                               "ca_ap_add_year", "ca_ap_editor"]:
-                        ss.pop(k, None)
-                    ss.pop("ca_ap_sheet", None)
-                    ss["_ap_added_msg"] = add_name.strip()
-                    st.rerun()
-                except ValueError:
-                    st.error("Некорректное значение — введите число")
+        st.divider()
+        _fa, _fb = st.columns([5, 1])
+        _add_name = _fa.text_input(
+            "Наименование",
+            key="ca_ap_add_name",
+            placeholder="Введите наименование статьи затрат или показателя...",
+            label_visibility="collapsed",
+        )
+        if _fb.button("➕ Добавить статью", key="ca_ap_add_blank",
+                      type="primary", use_container_width=True):
+            if _add_name.strip():
+                _blank_year = (
+                    _year_cols[-1]
+                    if _year_cols and _year_cols[0] != "Рег.год"
+                    else "2027"
+                )
+                ss.ca_parsed_articles.append({
+                    "name":       _add_name.strip(),
+                    "amounts":    f"{_blank_year} (Принято): 0.00 тыс.руб.",
+                    "type":       "cost",
+                    "checked":    True,
+                    "sheet":      "вручную",
+                    "unit":       "тыс.руб.",
+                    "tech_sheet": False,
+                    "manual":     True,
+                })
+                for k in ["ca_ap_editor", "ca_ap_add_name", "ca_ap_sheet",
+                          "ca_ap_search", "ca_ap_type", "ca_ap_only_checked"]:
+                    ss.pop(k, None)
+                ss["_ap_added_msg"] = _add_name.strip()
+                st.rerun()
             else:
-                st.warning("Заполните наименование и значение")
+                st.warning("Введите наименование статьи затрат")
 
     # ── Подтверждение ────────────────────────────────────────────────────
     st.divider()
     ap_c1, ap_c2 = st.columns([3, 1])
     ap_c1.caption(f"Отмечено к анализу: **{n_sel_live}** статей")
+    if _empty_named_live:
+        ap_c1.warning(
+            f"⚠️ {_empty_named_live} отмеченных "
+            f"{'статья' if _empty_named_live == 1 else 'статей'} без наименования — "
+            f"укажите наименование в таблице, чтобы продолжить."
+        )
     if not readonly and ap_c2.button(
         "Подтвердить и продолжить", type="primary",
         use_container_width=True, key="ca_ap_confirm",
-        disabled=(n_sel_live == 0),
+        disabled=(n_sel_live == 0 or _empty_named_live > 0),
     ):
         _lbl_to_type = {v: k for k, v in TYPE_OPT_LBLS.items()}
         if edited is not None:
@@ -852,6 +869,65 @@ def _show_article_approval(readonly: bool = False):
                 articles[orig_i]["type"]    = _lbl_to_type.get(row["Тип"], "cost")
                 # Сохраняем отредактированную единицу
                 articles[orig_i]["unit"] = str(row["Ед.изм."]).strip()
+
+                # Сохраняем отредактированное наименование (в т.ч. пустое —
+                # чтобы валидация ниже поймала незаполненные новые статьи)
+                articles[orig_i]["name"] = str(row["Наименование"]).strip()
+
+                # ── Пересобираем amounts из отредактированных годовых ячеек ──
+                # NumberColumn возвращает float или NaN/None для пустых ячеек.
+                import math as _math
+                _orig_ts = _parse_amounts_timeseries(articles[orig_i]["amounts"])
+                _period_by_yr = {str(t[0]): (t[1] if len(t) > 1 else "") for t in _orig_ts}
+                _val_by_yr    = {str(t[0]): t[2] for t in _orig_ts}
+                _unit_out = articles[orig_i].get("unit", "") or "тыс.руб."
+
+                _changed = False
+                for _yr in _year_cols:
+                    if _yr not in row.index:
+                        continue
+                    _cell = row[_yr]
+                    # Пустая ячейка (NaN/None) — убираем год если он был
+                    _is_empty = (
+                        _cell is None
+                        or (isinstance(_cell, float) and _math.isnan(_cell))
+                    )
+                    if _is_empty:
+                        if _yr in _val_by_yr:
+                            _val_by_yr.pop(_yr)
+                            _changed = True
+                        continue
+                    try:
+                        _num = float(_cell)
+                    except (ValueError, TypeError):
+                        continue
+                    _prev = _val_by_yr.get(_yr)
+                    if _prev is None or abs(_num - _prev) > 1e-6:
+                        _val_by_yr[_yr] = _num
+                        _changed = True
+
+                if _changed:
+                    _parts = []
+                    for _yr in sorted(_val_by_yr.keys()):
+                        _pt = _period_by_yr.get(_yr, "") or "Принято"
+                        _parts.append(
+                            f"{_yr} ({_pt}): {_val_by_yr[_yr]:,.2f} {_unit_out}"
+                        )
+                    articles[orig_i]["amounts"] = " | ".join(_parts)
+
+        # ── Валидация: у всех отмеченных статей должно быть наименование ──
+        _empty_named = [
+            a for a in articles
+            if a["checked"] and not (a.get("name") or "").strip()
+        ]
+        if _empty_named:
+            ss.ca_parsed_articles = articles  # сохраняем правки, чтобы не потерять
+            st.error(
+                f"Нельзя продолжить: {len(_empty_named)} отмеченных "
+                f"{'статья' if len(_empty_named) == 1 else 'статей'} без наименования. "
+                f"Укажите наименование в таблице или снимите отметку «Включить»."
+            )
+            st.stop()
 
         approved = [a for a in articles if a["checked"]]
         ss.ca_parsed_articles   = approved
@@ -863,8 +939,7 @@ def _show_article_approval(readonly: bool = False):
                 if part.strip():
                     lines.append(f"  {part.strip()}")
         ss.ca_calc_context = "\n".join(lines)
-        for k in ["ca_ap_editor", "ca_ap_add_name", "ca_ap_add_value",
-                  "ca_ap_add_unit", "ca_ap_add_year"]:
+        for k in ["ca_ap_editor", "ca_ap_add_name"]:
             ss.pop(k, None)
         st.rerun()
 
@@ -1222,6 +1297,12 @@ def show_claim_analyzer():
                 st.error("Не удалось извлечь данные из расчётного файла.")
                 st.stop()
 
+            _log_usage("claim_analyzer", "analysis_started", meta={
+                "mode":       "full",
+                "file_count": len(ss.ca_uploaded_meta or []),
+                "sphere":     str(ss.get("ca_spheres") or ""),
+            })
+
             # ── Чтение заголовков документов (первые 2 страницы каждого файла) ──
             n_doc_files = sum(
                 1 for name in ss.ca_uploaded_bytes
@@ -1297,6 +1378,21 @@ def show_claim_analyzer():
             _save_log(ss.ca_org, ss.ca_period, ss.ca_claim_summary, risks)
             pbar.progress(1.0)
 
+            # Считаем риски для метрики
+            try:
+                _rd = json.loads(risks)
+                _arts = _rd.get("articles", [])
+                _n_red    = sum(1 for a in _arts if a.get("risk") == "red")
+                _n_yellow = sum(1 for a in _arts if a.get("risk") == "yellow")
+            except Exception:
+                _n_red = _n_yellow = 0
+            _log_usage("claim_analyzer", "analysis_completed", meta={
+                "mode":       "full",
+                "n_articles": len(_arts) if "_arts" in dir() else 0,
+                "n_high":     _n_red,
+                "n_medium":   _n_yellow,
+            })
+
             # ── Автосохранение в реестр ───────────────────────────────────────
             status.text("Сохраняю в реестр...")
             try:
@@ -1325,6 +1421,11 @@ def show_claim_analyzer():
         if run_risks:
             pbar   = st.progress(0.0)
             status = st.empty()
+
+            _log_usage("claim_analyzer", "analysis_started", meta={
+                "mode":       "risks_only",
+                "file_count": len(ss.ca_uploaded_meta or []),
+            })
 
             # Всегда перечитываем байты — они доступны только при нажатии кнопки
             calc_names = ss.get("ca_calc_files_checked", [])
@@ -1448,6 +1549,19 @@ def show_claim_analyzer():
 
             pbar.progress(1.0)
             status.success("Риски обновлены!")
+            try:
+                _rd2 = json.loads(ss.ca_risks)
+                _arts2 = _rd2.get("articles", [])
+                _nr2 = sum(1 for a in _arts2 if a.get("risk") == "red")
+                _ny2 = sum(1 for a in _arts2 if a.get("risk") == "yellow")
+            except Exception:
+                _arts2, _nr2, _ny2 = [], 0, 0
+            _log_usage("claim_analyzer", "analysis_completed", meta={
+                "mode":       "risks_only",
+                "n_articles": len(_arts2),
+                "n_high":     _nr2,
+                "n_medium":   _ny2,
+            })
             st.rerun()
 
     # ── Баннер + кнопка «Сохранить в реестр» ─────────────────────────────────
@@ -1546,6 +1660,34 @@ def show_claim_analyzer():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Модалка подтверждения удаления проекта из реестра
+# ─────────────────────────────────────────────────────────────────────────────
+@st.dialog("Удаление заявки")
+def _confirm_delete_project_dialog(pid: str, org: str, period: str):
+    """Модальное подтверждение удаления проекта (заявки) из реестра."""
+    st.markdown(f"Удалить заявку **{org or '—'} · {period or '—'}** из реестра?")
+    st.caption("Будут удалены все файлы, расчёты и результаты анализа. Действие необратимо.")
+
+    c_yes, c_no = st.columns(2)
+    if c_yes.button("Удалить", type="primary", use_container_width=True,
+                    key=f"_dlg_reg_yes_{pid}"):
+        try:
+            from core.claim_registry import delete_project
+            delete_project(pid)
+        except Exception as _e:
+            st.error(f"Ошибка удаления: {_e}")
+            return
+        _log_usage("claim_analyzer", "project_deleted", meta={
+            "org":    (org or "")[:60],
+            "period": period or "",
+        })
+        st.session_state["_ca_delete_done"] = f"Заявка «{org or '—'} · {period or '—'}» удалена."
+        st.rerun()
+    if c_no.button("Отмена", use_container_width=True, key=f"_dlg_reg_no_{pid}"):
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UI Реестра
 # ─────────────────────────────────────────────────────────────────────────────
 def _show_registry():
@@ -1560,6 +1702,10 @@ def _show_registry():
         return
 
     st.subheader("Реестр тарифных заявок")
+
+    _ca_del_msg = st.session_state.pop("_ca_delete_done", None)
+    if _ca_del_msg:
+        st.success(_ca_del_msg)
 
     # ── Фильтры ───────────────────────────────────────────────────────────────
     fc1, fc2 = st.columns([3, 1])
@@ -1613,24 +1759,9 @@ def _show_registry():
                 update_status(pid, new_status)
                 st.rerun()
 
-            if hc3.button("Удалить", key=f"reg_del_{pid}",
+            if hc3.button("✕", key=f"reg_del_{pid}",
                           help="Удалить из реестра"):
-                ss = st.session_state
-                ss[f"reg_confirm_del_{pid}"] = True
-
-            if st.session_state.get(f"reg_confirm_del_{pid}"):
-                st.warning(f"Удалить **{org} · {period}**? Это действие необратимо.")
-                da, db = st.columns(2)
-                if da.button("Да, удалить", key=f"reg_del_yes_{pid}",
-                             type="primary", use_container_width=True):
-                    delete_project(pid)
-                    st.session_state.pop(f"reg_confirm_del_{pid}", None)
-                    st.success("Удалено.")
-                    st.rerun()
-                if db.button("← Отмена", key=f"reg_del_no_{pid}",
-                             use_container_width=True):
-                    st.session_state.pop(f"reg_confirm_del_{pid}", None)
-                    st.rerun()
+                _confirm_delete_project_dialog(pid, org, period)
 
             # ── Файлы ─────────────────────────────────────────────────────
             if files:
