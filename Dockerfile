@@ -1,8 +1,27 @@
 # =============================================================================
 # РЕГУЛА.AI — Dockerfile
 # =============================================================================
-# Базовый образ: Python 3.11 на Debian Slim (лёгкий, без лишнего)
-FROM python:3.11-slim
+# Multi-stage: два независимых образа из одного файла.
+#   docker build --target app      -t regula-app .       (по умолчанию)
+#   docker build --target watchdog -t regula-watchdog .
+#
+# ЗАЧЕМ ОБЪЕДИНЕНО. Ollama-watchdog (см. docker-compose.yml, сервис
+# ollama-watchdog) — крошечный скрипт на curl+sh, который следит за
+# зависаниями Ollama runner'а и рестартует контейнер ollama через Docker
+# API. Ему не нужен ни Python, ни зависимости основного приложения —
+# отдельный stage не тянет их в его образ, при этом всё лежит в одном
+# файле рядом, а не в отдельном Dockerfile.watchdog.
+#
+# docker-compose.yml должен указывать target на каждый сервис:
+#   regula:          build: {context: ., dockerfile: Dockerfile, target: app}
+#   ollama-watchdog: build: {context: ., dockerfile: Dockerfile, target: watchdog}
+# =============================================================================
+
+
+# =============================================================================
+# STAGE 1: app — основное приложение (Streamlit)
+# =============================================================================
+FROM python:3.11-slim AS app
 
 # Метаданные
 LABEL maintainer="REGULA.AI"
@@ -105,3 +124,23 @@ CMD ["streamlit", "run", "app.py", \
      "--server.headless=true", \
      "--server.fileWatcherType=none", \
      "--browser.gatherUsageStats=false"]
+
+
+# =============================================================================
+# STAGE 2: watchdog — сторож для зависаний Ollama runner'а
+# =============================================================================
+# Отдельный минимальный образ (alpine + curl), не связан с зависимостями
+# основного приложения. Логика скрипта — см. ollama_watchdog.sh:
+# раз в CHECK_INTERVAL секунд шлёт реальный /api/generate (не /api/tags,
+# который не ловит зависший runner — известное ограничение Ollama, демон
+# и runner конкретной модели это разные процессы) и после FAIL_THRESHOLD
+# подряд неудач рестартует контейнер ollama через Docker API.
+# =============================================================================
+FROM alpine:3.20 AS watchdog
+
+RUN apk add --no-cache curl
+
+COPY ollama_watchdog.sh /usr/local/bin/ollama_watchdog.sh
+RUN chmod +x /usr/local/bin/ollama_watchdog.sh
+
+ENTRYPOINT ["/usr/local/bin/ollama_watchdog.sh"]

@@ -16,3 +16,32 @@
 {"ts": "2026-08-28T20:06:07.821564", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 33, "answer_len": 1075, "sources": 30, "model": "qwen3.5:9b"}}
 {"ts": "2026-08-28T20:23:52.653885", "module": "claim_analyzer", "action": "analysis_started", "user_id": "superadmin", "org": "", "meta": {"mode": "full", "file_count": 2, "sphere": ""}}
 {"ts": "2026-08-28T20:24:31.883767", "module": "claim_analyzer", "action": "analysis_completed", "user_id": "superadmin", "org": "", "meta": {"mode": "full", "n_articles": 2, "n_high": 0, "n_medium": 2}}
+{"ts": "2026-08-29T11:24:27.571945", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 42, "sources": 30, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:24:35.862722", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 42, "answer_len": 2242, "sources": 30, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:25:06.375191", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 38, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:25:38.930990", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 38, "answer_len": 9856, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:25:44.988668", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 6, "new_sources": 21}}
+{"ts": "2026-08-29T11:27:03.944453", "module": "doc_scanner", "action": "scan_started", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "filenames": ["8  Устав полный.pdf"]}}
+{"ts": "2026-08-29T11:27:50.524056", "module": "doc_scanner", "action": "scan_completed", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "total_pages": 17, "total_words": 4600}}
+{"ts": "2026-08-29T11:28:57.136288", "module": "protocol", "action": "transcription_started", "user_id": "superadmin", "org": "", "meta": {"filename": "Часть 1.mp4", "size_mb": 72.24, "model": "medium"}}
+{"ts": "2026-08-29T11:29:13.600400", "module": "protocol", "action": "transcription_completed", "user_id": "superadmin", "org": "", "meta": {"elapsed_sec": 16, "chars": 4048, "duration": "5:19"}}
+{"ts": "2026-08-29T11:29:30.368657", "module": "protocol", "action": "protocol_generated", "user_id": "superadmin", "org": "", "meta": {"source_type": "🎤", "attendees": 0, "protocol_len": 2728}}
+{"ts": "2026-08-29T11:30:28.707974", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 142, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:30:50.057550", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 142, "answer_len": 8000, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:34:48.881342", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 38, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:35:07.660057", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 38, "answer_len": 6116, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:35:22.825529", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 43, "new_sources": 40}}
+{"ts": "2026-08-29T11:35:45.860705", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 9, "new_sources": 7}}
+{"ts": "2026-08-29T11:38:16.986438", "module": "protocol", "action": "transcription_started", "user_id": "superadmin", "org": "", "meta": {"filename": "06.08.2026, 16.26.21.mp3", "size_mb": 30.41, "model": "medium"}}
+{"ts": "2026-08-29T11:40:09.176356", "module": "protocol", "action": "transcription_completed", "user_id": "superadmin", "org": "", "meta": {"elapsed_sec": 112, "chars": 28852, "duration": "33:19"}}
+{"ts": "2026-08-29T11:40:28.646267", "module": "protocol", "action": "protocol_generated", "user_id": "superadmin", "org": "", "meta": {"source_type": "🎤", "attendees": 0, "protocol_len": 3581}}
+{"ts": "2026-08-29T11:42:46.509149", "module": "doc_scanner", "action": "scan_started", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "filenames": ["Инвест.программа (корректировка 23.09.2025) к приказу №545-А от 23.09.2025.pdf"]}}
+{"ts": "2026-08-29T11:44:55.632646", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 41, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:45:21.541710", "module": "advisor", "action": "answer_streamed", "user_id": "superadmin", "org": "", "meta": {"query_len": 41, "answer_len": 8731, "sources": 40, "model": "qwen3.5:9b"}}
+{"ts": "2026-08-29T11:50:38.894638", "module": "doc_scanner", "action": "scan_completed", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "total_pages": 336, "total_words": 88267}}
+{"ts": "2026-08-29T12:02:33.044907", "module": "doc_scanner", "action": "summary_generated", "user_id": "superadmin", "org": "", "meta": {"filename": "Инвест.программа (корректировка 23.09.2025) к приказу №545-А от 23.09.2025.pdf", "pages": 336, "summary_len": 3059}}
+{"ts": "2026-08-29T12:03:24.730767", "module": "doc_scanner", "action": "document_exported", "user_id": "superadmin", "org": "", "meta": {"filename": "Инвест.программа (корректировка 23.09.2025) к приказу №545-А от 23.09.2025.pdf", "format": "txt"}}
+{"ts": "2026-08-29T12:04:37.084747", "module": "doc_scanner", "action": "document_exported", "user_id": "superadmin", "org": "", "meta": {"filename": "Инвест.программа (корректировка 23.09.2025) к приказу №545-А от 23.09.2025.pdf", "format": "txt"}}
+{"ts": "2026-08-29T12:05:28.510494", "module": "doc_scanner", "action": "scan_started", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "filenames": ["4. Приложение №3 к УП БУ за 2025 (план счетов).pdf"]}}
+{"ts": "2026-08-29T12:06:06.576384", "module": "doc_scanner", "action": "scan_completed", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "total_pages": 11, "total_words": 4198}}
+{"ts": "2026-08-29T21:17:18.081865", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 38, "sources": 40, "model": "qwen3.5:9b"}}

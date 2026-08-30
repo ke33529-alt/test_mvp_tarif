@@ -4,6 +4,12 @@
 # Запуск:  docker compose up -d
 # Остановка: docker compose down
 # Логи:    docker compose logs -f regula
+# Логи вотчдога: docker compose logs -f ollama-watchdog
+#
+# Dockerfile теперь multi-stage: STAGE "app" (основное приложение) и
+# STAGE "watchdog" (сторож Ollama) собираются из одного файла Dockerfile
+# через --target. Отдельный Dockerfile.watchdog больше не нужен и может
+# быть удалён из проекта.
 #
 # Быстрая итерация разработки:
 #   Python-код смонтирован с хоста — изменения применяются через:
@@ -11,6 +17,34 @@
 #   Пересборка образа (docker compose build) нужна только когда меняется:
 #     - requirements.txt (новые библиотеки)
 #     - Dockerfile
+#
+# =============================================================================
+# ВАЖНОЕ ИЗМЕНЕНИЕ (2026-08-30): Ollama переведена под управление compose
+# =============================================================================
+# Раньше Ollama запускалась вручную (`docker run ...`) вне compose, и
+# .env указывал OLLAMA_BASE_URL=http://host.docker.internal:11434.
+#
+# ПРИЧИНА ПЕРЕНОСА. Обнаружены зависания Ollama runner'а (см. инцидент
+# 2026-08-29 21:17): модель перестаёт отвечать на запросы без единой строки
+# в логах, GPU простаивает (0% util), процесс жив, но не реагирует.
+# Это известный баг Ollama (github.com/ollama/ollama issues #9382, #7766,
+# #8200) без окончательного фикса на 0.31.1. Единственное надёжное
+# лечение — распознать зависание и перезапустить контейнер.
+#
+# Для автоматического рестарта нужен watchdog-контейнер (ollama-watchdog
+# ниже), который дёргает Ollama через Docker API по ИМЕНИ контейнера —
+# а значит, Ollama должна быть в той же docker-сети и управляться compose,
+# а не быть внешним процессом, о котором остальные сервисы ничего не знают.
+#
+# ЧТО НУЖНО СДЕЛАТЬ ПРИ ПЕРЕХОДЕ:
+#   1. Остановить старый ручной контейнер:  docker stop ollama && docker rm ollama
+#      (модели на диске не теряются, если они лежали в volume/bind mount —
+#       см. переменную OLLAMA_MODELS_PATH ниже, укажите тот же путь)
+#   2. В .env заменить:
+#        OLLAMA_BASE_URL=http://host.docker.internal:11434
+#      на:
+#        OLLAMA_BASE_URL=http://ollama:11434
+#   3. docker compose up -d
 # =============================================================================
 
 services:
@@ -22,6 +56,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: app            # см. Dockerfile — multi-stage, app = основное приложение
     container_name: regula_ai
     restart: unless-stopped          # автоматически перезапускается при падении
 
@@ -31,8 +66,9 @@ services:
     env_file:
       - .env                         # все секреты и настройки из .env файла
 
-    # Позволяет контейнеру достучаться до Ollama, запущенного в отдельном
-    # Docker-контейнере на хосте (порт 11434 опубликован на хосте)
+    # Ollama теперь в той же compose-сети — обращение по имени сервиса.
+    # host.docker.internal оставлен как фоллбэк на случай отката на ручной
+    # запуск Ollama вне compose.
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -79,10 +115,10 @@ services:
     #   memory: 8G
     #   cpus: '4'
 
-    # Запускать только после Ollama (если Ollama тоже в compose)
-    # depends_on:
-    #   ollama:
-    #     condition: service_healthy
+    depends_on:
+      ollama:
+        condition: service_started   # не блокируем старт Streamlit на здоровье Ollama —
+                                      # модели/RAG внутри regula грузятся своим потоком
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
@@ -93,35 +129,96 @@ services:
 
   # ---------------------------------------------------------------------------
   # Ollama — LLM сервис (Qwen3 и другие модели)
-  # Комментарий: сейчас Ollama уже запущен отдельным Docker-контейнером
-  # вручную (docker run ... ollama/ollama), поэтому этот блок остаётся
-  # закомментированным. В .env указан OLLAMA_BASE_URL=http://host.docker.internal:11434
   # ---------------------------------------------------------------------------
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: regula_ollama
-  #   restart: unless-stopped
-  #   ports:
-  #     - "11434:11434"
-  #   volumes:
-  #     - ollama_models:/root/.ollama
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 30s
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # ВАЖНО: healthcheck использует `ollama list`, а НЕ curl.
+    #
+    # Официальный образ ollama/ollama не содержит curl — это подтверждённый
+    # баг самого проекта (github.com/ollama/ollama issue #9781, открыт с
+    # версии 0.1.26, актуален и на 0.31.1). Healthcheck на curl бесконечно
+    # висит в статусе "starting"/"unhealthy", хотя сам сервис работает
+    # исправно — Docker просто не может выполнить команду проверки внутри
+    # контейнера ("executable file not found in $PATH").
+    #
+    # `ollama list` — это сам бинарник образа (гарантированно есть) и он
+    # обращается к тому же локальному API, так что по сути эквивалентен
+    # curl /api/tags, но без внешней зависимости.
+    #
+    # Этот healthcheck по-прежнему проверяет только что ДЕМОН отвечает —
+    # он НЕ обнаруживает зависший runner конкретной модели (известное
+    # ограничение, демон и runner — разные процессы). Настоящую проверку
+    # "генерация реально работает" делает ollama-watchdog ниже.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Watchdog — обнаруживает зависший Ollama runner и рестартует контейнер
+  # ---------------------------------------------------------------------------
+  # Раз в CHECK_INTERVAL секунд отправляет короткий /api/generate запрос
+  # (не /api/tags — тот не ловит зависший runner, см. комментарий выше).
+  # После FAIL_THRESHOLD подряд неудач вызывает Docker API для рестарта
+  # контейнера ollama. Требует доступ к /var/run/docker.sock — это даёт
+  # watchdog-контейнеру возможность управлять другими контейнерами хоста,
+  # держите образ минимальным и не открывайте наружу.
+  ollama-watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile     # тот же файл, что и у regula — см. STAGE 2: watchdog
+      target: watchdog
+    container_name: ollama_watchdog
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_CONTAINER=ollama
+      - CHECK_MODEL=qwen3.5:9b        # должна быть уже подтянута через ollama pull
+      - CHECK_INTERVAL=60             # сек между проверками
+      - REQUEST_TIMEOUT=90            # сек на один health-запрос — холодная
+                                       # загрузка модели в VRAM + warmup честно
+                                       # может занимать 25-60+ сек (наблюдалось
+                                       # 25.2с на прогреве qwen3.5:9b сразу
+                                       # после рестарта). 25с давали ложные
+                                       # срабатывания watchdog'а на старте.
+      - FAIL_THRESHOLD=2              # подряд неудач до рестарта
+      - STARTUP_GRACE=120             # сек паузы после старта скрипта, прежде
+                                       # чем начинать засчитывать неудачи —
+                                       # даёт Ollama время на холодный старт
+                                       # и загрузку модели без ложных рестартов
+    volumes:
+      # Доступ к Docker API хоста для перезапуска контейнера ollama.
+      # Скрипт обращается ТОЛЬКО к /containers/ollama/restart — ничего
+      # больше через этот сокет не делается.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 # -----------------------------------------------------------------------------
 # Именованные тома (Docker управляет ими сам)
 # -----------------------------------------------------------------------------
 volumes:
   model_cache:     # кэш EasyOCR, sentence-transformers, HuggingFace
-  # ollama_models: # модели Ollama (раскомментировать если Ollama в compose)
+  ollama_models:    # модели Ollama
+    external: true
+    name: ollama    # переиспользуем существующий volume "ollama" (уже содержит
+                     # скачанные модели — 6.1G, создан старым ручным контейнером
+                     # до перевода Ollama под compose). Без external:true
+                     # Docker создал бы новый пустой volume "regula_ollama_models"
+                     # и пришлось бы заново качать все модели.

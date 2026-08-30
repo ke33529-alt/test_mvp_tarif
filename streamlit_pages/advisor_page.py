@@ -55,6 +55,67 @@ from core import tasks as _tasks_core
 DEFAULT_ADVISOR_MODEL = "qwen/qwen3.5-9b"
 
 
+# =============================================================================
+# Буферизация потока токенов
+# =============================================================================
+# ЗАЧЕМ. st.write_stream отправляет в браузер отдельное сообщение на КАЖДЫЙ
+# элемент генератора, а фронтенд на каждое сообщение перерисовывает markdown
+# целиком и заново прогоняет весь накопленный текст через KaTeX. На длинном
+# ответе с таблицами и формулами это тысячи перерисовок: главный поток
+# браузера уходит в непрерывный Scripting на десятки секунд (замерено:
+# 29 488 мс при генерации 31.85 сек), клиентский код Streamlit перестаёт
+# успевать обрабатывать WebSocket-события, соединение рвётся, и сессия
+# остаётся мёртвой — сервер потом пишет "Discarding BackMsg for disconnected
+# session" на каждый клик, а в браузере навсегда крутится индикатор.
+#
+# Диагностика, которая привела сюда: сервер в этот момент полностью свободен
+# (py-spy — ни одного потока со скриптом, /_stcore/health отвечает ok),
+# соединение при бездействии живёт минутами, короткие ответы проходят без
+# единого сбоя (15+ запросов подряд), а длинные с таблицами вешают стабильно.
+#
+# ЧТО ДЕЛАЕТ. Копит токены и отдаёт их пачкой не чаще раза в FLUSH_INTERVAL.
+# Стриминг для пользователя выглядит так же — текст идёт живым потоком, — но
+# перерисовок становится в десятки раз меньше, и главный поток успевает
+# обслуживать сокет.
+_STREAM_FLUSH_INTERVAL = 0.25   # сек между обновлениями UI
+_STREAM_FLUSH_CHARS    = 400    # либо когда накопилось столько символов
+
+
+def _buffered_stream(token_iter, flush_interval: float = _STREAM_FLUSH_INTERVAL,
+                     flush_chars: int = _STREAM_FLUSH_CHARS):
+    """
+    Оборачивает генератор токенов, отдавая их склеенными пачками.
+
+    Пачка уходит в UI, когда с прошлой отдачи прошло flush_interval секунд
+    или накопилось flush_chars символов — что наступит раньше. Остаток
+    обязательно отдаётся в конце, иначе потерялся бы хвост ответа.
+
+    Итоговый текст, который вернёт st.write_stream, не меняется: это та же
+    последовательность символов, просто нарезанная крупнее.
+    """
+    import time as _time
+
+    buf: list[str] = []
+    buf_len = 0
+    last_flush = _time.monotonic()
+
+    for chunk in token_iter:
+        if not chunk:
+            continue
+        buf.append(chunk)
+        buf_len += len(chunk)
+
+        now = _time.monotonic()
+        if buf_len >= flush_chars or (now - last_flush) >= flush_interval:
+            yield "".join(buf)
+            buf.clear()
+            buf_len = 0
+            last_flush = now
+
+    if buf:
+        yield "".join(buf)
+
+
 def _resolve_advisor_default(model_names: list) -> str:
     """
     Возвращает имя модели из доступного списка, наиболее близкое к Qwen 3.5 9B.
@@ -623,7 +684,11 @@ def show_advisor():
                             with st.spinner("Модель формирует ответ..."):
                                 first_token = next(gen, None)
                             if first_token is not None:
-                                raw_answer = st.write_stream(itertools.chain([first_token], gen))
+                                raw_answer = st.write_stream(
+                                    _buffered_stream(
+                                        itertools.chain([first_token], gen)
+                                    )
+                                )
                             else:
                                 raw_answer = ""
                             answer = strip_thinking_blocks(raw_answer)
@@ -876,7 +941,9 @@ def show_advisor():
                                 )
                                 with st.spinner("Модель формирует ответ..."):
                                     _first = next(_gen, None)
-                                _raw = st.write_stream(_it.chain([_first], _gen)) if _first is not None else ""
+                                _raw = st.write_stream(
+                                    _buffered_stream(_it.chain([_first], _gen))
+                                ) if _first is not None else ""
                                 _clar_answer = _strip(_raw) if _raw else "❌ Не найдено релевантных документов."
 
                                 st.session_state.clarifications.append({
@@ -1122,7 +1189,20 @@ def show_advisor():
                     if (_ah_q or _ah_date_from or _ah_date_to or _ah_sphere_filter)
                     else "История пуста — ответы сохраняются сюда автоматически.")
         else:
-            _AH_PAGE_SIZE   = 20
+            # ВАЖНО: 5, а не 20.
+            # st.expander(expanded=False) в Streamlit НЕ ленивый — содержимое
+            # рендерится и уходит в DOM всегда, свёрнутость это только CSS.
+            # Каждая запись здесь тяжёлая: полный текст ответа с markdown-
+            # таблицами + до нескольких десятков источников + уточнения с их
+            # полными ответами. При 20 записях браузер получал разом сотни
+            # килобайт разметки, KaTeX проходил по всем формулам (сотни
+            # предупреждений в консоли), главный поток надолго блокировался,
+            # переставал обрабатывать сообщения WebSocket — включая финальное
+            # "скрипт завершён". Из-за этого индикатор навсегда оставался в
+            # состоянии выполнения, а страница не реагировала на клики, хотя
+            # сервер был уже полностью свободен (проверено py-spy: ни одного
+            # активного потока; /_stcore/health отвечал ok).
+            _AH_PAGE_SIZE   = 5
             _ah_total_pages = max(1, (_total_found + _AH_PAGE_SIZE - 1) // _AH_PAGE_SIZE)
             _ah_page = st.number_input("Страница", min_value=1,
                                        max_value=_ah_total_pages, value=1, key="ah_page")
@@ -1168,33 +1248,79 @@ def show_advisor():
                         f'<div style="{_FS2}"><p><strong>Вопрос:</strong> {_rec["query"]}</p></div>',
                         unsafe_allow_html=True,
                     )
-                    st.markdown(f'<div style="{_FS2}">{_rec["answer"]}</div>',
-                                unsafe_allow_html=True)
+
+                    # ── Ответ: превью по умолчанию, полный текст по клику ──────
+                    # Раньше здесь безусловно рендерился ПОЛНЫЙ текст ответа для
+                    # каждой записи страницы. Поскольку expander не ленивый, это
+                    # означало сотни килобайт разметки в DOM при одном открытии
+                    # вкладки — браузер вставал колом (см. комментарий у
+                    # _AH_PAGE_SIZE). Теперь по умолчанию показываем короткое
+                    # превью как обычный текст (без unsafe_allow_html — незачем
+                    # разбирать HTML/формулы в куске, который всё равно обрезан),
+                    # а полный ответ разворачивается только для той записи, по
+                    # которой пользователь явно нажал кнопку.
+                    _ah_full_key = f"ah_full_{_rec['id']}"
+                    _ah_answer   = _rec.get("answer", "") or ""
+                    _AH_PREVIEW_LEN = 600
+
+                    if st.session_state.get(_ah_full_key):
+                        st.markdown(f'<div style="{_FS2}">{_ah_answer}</div>',
+                                    unsafe_allow_html=True)
+                        if st.button("Свернуть ответ",
+                                     key=f"ah_hide_{_rec['id']}_{_ahi}_{_ah_page}"):
+                            st.session_state[_ah_full_key] = False
+                            st.rerun()
+                    else:
+                        _ah_preview = _ah_answer[:_AH_PREVIEW_LEN]
+                        st.text(_ah_preview + ("…" if len(_ah_answer) > _AH_PREVIEW_LEN else ""))
+                        if len(_ah_answer) > _AH_PREVIEW_LEN:
+                            if st.button("Показать ответ полностью",
+                                         key=f"ah_show_{_rec['id']}_{_ahi}_{_ah_page}"):
+                                st.session_state[_ah_full_key] = True
+                                st.rerun()
 
                     if _rec.get("sources"):
-                        with st.expander(f"Источники ({len(_rec['sources'])})", expanded=False):
-                            for _si, _src in enumerate(_rec["sources"], 1):
-                                _km = " · 📁 локальная база" \
-                                      if _src.get("source_kind") == "local" else ""
-                                st.markdown(
-                                    f'<div style="{_FS2}"><b>{_si}. {_src.get("file","?")}</b>'
-                                    + (f' (стр. {_src["page"]})' if _src.get("page") else "")
-                                    + _km + "</div>",
-                                    unsafe_allow_html=True,
-                                )
-                                if _src.get("sphere"):
-                                    st.caption("Сферы: " + _src["sphere"])
+                        # Источников бывает несколько десятков на запись, и каждый
+                        # это отдельный markdown-элемент. Вложенный expander их не
+                        # экономит — он тоже не ленивый. Поэтому список источников
+                        # выводим только когда запись развёрнута кнопкой выше.
+                        if st.session_state.get(_ah_full_key):
+                            with st.expander(f"Источники ({len(_rec['sources'])})",
+                                             expanded=False):
+                                for _si, _src in enumerate(_rec["sources"], 1):
+                                    _km = " · 📁 локальная база" \
+                                          if _src.get("source_kind") == "local" else ""
+                                    st.markdown(
+                                        f'<div style="{_FS2}"><b>{_si}. {_src.get("file","?")}</b>'
+                                        + (f' (стр. {_src["page"]})' if _src.get("page") else "")
+                                        + _km + "</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                    if _src.get("sphere"):
+                                        st.caption("Сферы: " + _src["sphere"])
+                        else:
+                            st.caption(f"Источников: {len(_rec['sources'])} "
+                                       f"(показать — раскройте ответ полностью)")
 
                     if _rec_clars:
                         st.divider()
+                        # Ответы уточнений — такие же тяжёлые, как основной, и их
+                        # может быть несколько на запись. Показываем их полностью
+                        # только когда запись развёрнута кнопкой выше; иначе —
+                        # лишь текст самого уточняющего вопроса.
+                        _ah_show_full = bool(st.session_state.get(_ah_full_key))
                         for _ci, _clar in enumerate(_rec_clars, 1):
                             st.markdown(
                                 f'<div style="{_FS2} color:#555;">'
                                 f'<strong>Уточнение №{_ci}:</strong> {_clar["query"]}</div>',
                                 unsafe_allow_html=True,
                             )
-                            st.markdown(f'<div style="{_FS2}">{_clar["answer"]}</div>',
-                                        unsafe_allow_html=True)
+                            if _ah_show_full:
+                                st.markdown(f'<div style="{_FS2}">{_clar["answer"]}</div>',
+                                            unsafe_allow_html=True)
+                            else:
+                                _clar_ans = _clar.get("answer", "") or ""
+                                st.text(_clar_ans[:300] + ("…" if len(_clar_ans) > 300 else ""))
                             if _ci < len(_rec_clars):
                                 st.divider()
 

@@ -1367,6 +1367,408 @@ def _tab_help():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Вкладка «Лендинг» — промпты умного поиска + карточки RAG (landing_marketing)
+#
+# Всё управление лендингом (главная страница, строка поиска) сосредоточено
+# ЗДЕСЬ и только здесь — единый экран для суперадмина: и системный/
+# пользовательский промпт LLM, и содержимое мини-RAG (маркетинговые карточки
+# модулей и сценариев использования из core/landing_search.py).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LANDING_PROMPTS_AVAILABLE = True
+try:
+    from core.landing_search import (
+        DEFAULT_LANDING_PROMPTS as _LANDING_DEFAULT_PROMPTS,
+        get_landing_collection as _get_landing_collection,
+        invalidate_landing_collection as _invalidate_landing_collection,
+        COLLECTION_NAME as _LANDING_COLLECTION_NAME,
+    )
+except Exception:
+    _LANDING_PROMPTS_AVAILABLE = False
+    _LANDING_DEFAULT_PROMPTS = {
+        "landing_system": "",
+        "landing_user": "Запрос: {query}\n\nКонтекст:\n{context}",
+    }
+
+_LANDING_PROMPTS_FILE = _BASE_DIR / "config" / "prompts.json"
+
+
+def _load_landing_prompts_raw() -> Dict:
+    """Читает landing_system/landing_user из config/prompts.json (сырое, без
+    подмешивания дефолтов Советчика — только то, что реально сохранено)."""
+    if not _LANDING_PROMPTS_FILE.exists():
+        return {}
+    try:
+        return json.loads(_LANDING_PROMPTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_landing_prompts(system_prompt: str, user_prompt: str) -> None:
+    """Сохраняет landing_system/landing_user в общий config/prompts.json,
+    не трогая промпты остальных модулей (advisor_system, claim_map_system и т.д.)."""
+    current = _load_landing_prompts_raw()
+    current["landing_system"] = system_prompt
+    current["landing_user"]   = user_prompt
+    current["landing_updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _LANDING_PROMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _LANDING_PROMPTS_FILE.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _reset_landing_prompts() -> None:
+    """Удаляет landing_system/landing_user из config/prompts.json — модуль
+    откатится на DEFAULT_LANDING_PROMPTS при следующем запросе."""
+    current = _load_landing_prompts_raw()
+    current.pop("landing_system", None)
+    current.pop("landing_user", None)
+    _LANDING_PROMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _LANDING_PROMPTS_FILE.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _get_landing_cards() -> List[Dict]:
+    """
+    Возвращает все карточки коллекции landing_marketing в виде списка
+    {id, title, module, kind, text}, отсортированного по module/kind.
+    Пустой список, если коллекция недоступна или ещё не засеяна.
+    """
+    if not _LANDING_PROMPTS_AVAILABLE:
+        return []
+    collection = _get_landing_collection()
+    if collection is None or collection.count() == 0:
+        return []
+    try:
+        data = collection.get(include=["documents", "metadatas"])
+    except Exception:
+        return []
+
+    cards = []
+    for doc_id, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+        meta = meta or {}
+        cards.append({
+            "id":     doc_id,
+            "title":  meta.get("title", doc_id),
+            "module": meta.get("module", ""),
+            "kind":   meta.get("kind", "module"),
+            "text":   doc,
+        })
+    cards.sort(key=lambda c: (c["module"], c["kind"], c["title"]))
+    return cards
+
+
+def _save_landing_card(doc_id: str, title: str, module: str, kind: str, text: str) -> bool:
+    """
+    Создаёт или обновляет одну карточку в коллекции landing_marketing.
+    upsert — работает и для новой карточки (doc_id ещё не существует),
+    и для редактирования существующей (тот же doc_id перезаписывается).
+    """
+    if not _LANDING_PROMPTS_AVAILABLE:
+        return False
+    collection = _get_landing_collection()
+    if collection is None:
+        return False
+    try:
+        collection.upsert(
+            ids=[doc_id],
+            documents=[text],
+            metadatas=[{
+                "title":  title,
+                "module": module,
+                "kind":   kind,
+                "indexed_at": datetime.now().isoformat(),
+            }],
+        )
+        return True
+    except Exception as e:
+        print(f"[SUPERADMIN/LANDING] Ошибка сохранения карточки {doc_id}: {e}")
+        return False
+
+
+def _delete_landing_card(doc_id: str) -> bool:
+    """Удаляет одну карточку из коллекции landing_marketing по id."""
+    if not _LANDING_PROMPTS_AVAILABLE:
+        return False
+    collection = _get_landing_collection()
+    if collection is None:
+        return False
+    try:
+        collection.delete(ids=[doc_id])
+        return True
+    except Exception as e:
+        print(f"[SUPERADMIN/LANDING] Ошибка удаления карточки {doc_id}: {e}")
+        return False
+
+
+def _slugify_module_key(text: str) -> str:
+    """Простой транслит-slug для генерации id новой карточки из заголовка."""
+    import re as _re
+    table = str.maketrans(
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+        "abvgdeejzijklmnoprstufhccss_y_eua",
+    )
+    slug = text.lower().translate(table)
+    slug = _re.sub(r"[^a-z0-9]+", "_", slug).strip("_")
+    return slug[:40] or "card"
+
+
+@st.dialog("Удалить карточку")
+def _confirm_delete_landing_card_dialog(doc_id: str, title: str):
+    st.markdown(f"Удалить карточку **«{title}»** из базы лендинга?")
+    st.caption("Карточка перестанет попадать в ответы умного поиска на главной странице. Действие необратимо.")
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        if st.button("🗑️ Да, удалить", type="primary", use_container_width=True, key="ld_confirm_del_yes"):
+            if _delete_landing_card(doc_id):
+                st.session_state["_ld_notif"] = f"Карточка «{title}» удалена."
+            else:
+                st.session_state["_ld_notif_err"] = f"Не удалось удалить «{title}»."
+            st.session_state.pop("_ld_confirm_delete", None)
+            st.rerun()
+    with dc2:
+        if st.button("← Отмена", use_container_width=True, key="ld_confirm_del_no"):
+            st.session_state.pop("_ld_confirm_delete", None)
+            st.rerun()
+
+
+def _tab_landing():
+    """
+    Вкладка «Лендинг»: единый экран управления главной страницей —
+    промпты умного поиска (system/user) и содержимое его мини-RAG
+    (карточки модулей и сценариев использования, коллекция landing_marketing).
+    """
+    if not _LANDING_PROMPTS_AVAILABLE:
+        st.error(
+            "Модуль core/landing_search.py не найден или не импортируется. "
+            "Проверьте, что файл добавлен в проект и контейнер пересобран/перезапущен."
+        )
+        return
+
+    _notif = st.session_state.pop("_ld_notif", "")
+    _notif_err = st.session_state.pop("_ld_notif_err", "")
+    if _notif:
+        st.success(_notif)
+    if _notif_err:
+        st.error(_notif_err)
+
+    st.caption(
+        "Здесь и только здесь настраивается умный поиск на главной странице: "
+        "какой промпт получает модель и какие карточки модулей/сценариев она "
+        "видит перед ответом. Изменения применяются к следующему запросу — "
+        "перезапуск не требуется."
+    )
+
+    sub_prompts, sub_cards = st.tabs(["Промпт", "База знаний (RAG)"])
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Подвкладка «Промпт»
+    # ═════════════════════════════════════════════════════════════════════
+    with sub_prompts:
+        saved = _load_landing_prompts_raw()
+        cur_system = saved.get("landing_system", _LANDING_DEFAULT_PROMPTS["landing_system"])
+        cur_user   = saved.get("landing_user",   _LANDING_DEFAULT_PROMPTS["landing_user"])
+
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.caption(
+                "Загружен из: " + ("📁 config/prompts.json" if "landing_system" in saved else "⚙️ дефолт")
+            )
+        with pc2:
+            is_modified = (
+                cur_system != _LANDING_DEFAULT_PROMPTS["landing_system"]
+                or cur_user != _LANDING_DEFAULT_PROMPTS["landing_user"]
+            )
+            if is_modified:
+                st.warning("✏️ Промпт изменён")
+            else:
+                st.success("✅ Дефолтный промпт")
+
+        st.divider()
+
+        with st.expander("ℹ️ Переменные шаблона"):
+            st.markdown(
+                "**Пользовательский промпт** обязан содержать `{query}` — то, что "
+                "пользователь написал в строку поиска, и `{context}` — карточки, "
+                "которые нашёл RAG (см. подвкладку «База знаний»)."
+            )
+
+        new_system = st.text_area(
+            "Системный промпт", value=cur_system, height=280, key="ld_prompt_system",
+        )
+        new_user = st.text_area(
+            "Пользовательский промпт", value=cur_user, height=120, key="ld_prompt_user",
+        )
+
+        if "{query}" not in new_user or "{context}" not in new_user:
+            st.error("⚠️ Пользовательский промпт должен содержать {query} и {context}")
+            _prompt_valid = False
+        else:
+            st.caption("✅ Переменные присутствуют")
+            _prompt_valid = True
+
+        st.divider()
+        bp1, bp2, bp3 = st.columns([2, 2, 1])
+        with bp1:
+            if st.button("💾 Сохранить промпт", type="primary",
+                         use_container_width=True, key="ld_save_prompt_btn", disabled=not _prompt_valid):
+                _save_landing_prompts(new_system, new_user)
+                st.session_state["_ld_notif"] = "Промпт лендинга сохранён. Применится к следующему запросу."
+                st.rerun()
+        with bp2:
+            if st.button("🔄 Сбросить к дефолтным", use_container_width=True, key="ld_reset_prompt_btn"):
+                st.session_state["_ld_confirm_reset_prompt"] = True
+
+            @st.dialog("Сброс промпта лендинга")
+            def _confirm_reset_landing_prompt_dialog():
+                st.warning("Промпт лендинга вернётся к дефолтным значениям.")
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    if st.button("🗑️ Да, сбросить", type="primary",
+                                 use_container_width=True, key="ld_confirm_reset_yes"):
+                        _reset_landing_prompts()
+                        st.session_state.pop("_ld_confirm_reset_prompt", None)
+                        st.session_state["_ld_notif"] = "Промпт лендинга сброшен к дефолтным значениям."
+                        st.rerun()
+                with rc2:
+                    if st.button("← Отмена", use_container_width=True, key="ld_confirm_reset_no"):
+                        st.session_state.pop("_ld_confirm_reset_prompt", None)
+                        st.rerun()
+
+            if st.session_state.get("_ld_confirm_reset_prompt"):
+                _confirm_reset_landing_prompt_dialog()
+        with bp3:
+            backup_json = json.dumps(
+                {"landing_system": new_system, "landing_user": new_user},
+                ensure_ascii=False, indent=2,
+            )
+            st.download_button(
+                "📥 Скачать", data=backup_json.encode("utf-8"),
+                file_name="landing_prompt_backup.json", mime="application/json",
+                use_container_width=True, key="ld_download_prompt_btn",
+            )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Подвкладка «База знаний (RAG)» — карточки модулей/сценариев
+    # ═════════════════════════════════════════════════════════════════════
+    with sub_cards:
+        cards = _get_landing_cards()
+
+        st.caption(
+            f"Коллекция «{_LANDING_COLLECTION_NAME}» · карточек: {len(cards)}. "
+            "Каждая карточка — описание модуля или готовый сценарий использования, "
+            "который умный поиск подмешивает в контекст ответа. Пишите развёрнуто "
+            "и по-человечески — этот текст читает LLM, а не пользователь напрямую."
+        )
+
+        # ── Добавление новой карточки ───────────────────────────────────
+        with st.expander("➕ Добавить карточку", expanded=(len(cards) == 0)):
+            with st.form("ld_new_card_form", clear_on_submit=True):
+                nc1, nc2, nc3 = st.columns([2, 2, 1])
+                with nc1:
+                    new_title = st.text_input("Заголовок карточки", key="ld_new_title")
+                with nc2:
+                    new_module = st.text_input(
+                        "Модуль (точное имя раздела в меню)",
+                        placeholder="Например: Советчик",
+                        key="ld_new_module",
+                    )
+                with nc3:
+                    new_kind = st.selectbox(
+                        "Тип", ["module", "usecase"],
+                        format_func=lambda x: "Описание модуля" if x == "module" else "Сценарий использования",
+                        key="ld_new_kind",
+                    )
+                new_text = st.text_area(
+                    "Текст карточки",
+                    height=160,
+                    placeholder="Развёрнутое описание того, что умеет модуль и когда его использовать...",
+                    key="ld_new_text",
+                )
+                submitted = st.form_submit_button("💾 Создать карточку", type="primary")
+                if submitted:
+                    if not new_title.strip() or not new_module.strip() or not new_text.strip():
+                        st.error("Заполните заголовок, модуль и текст карточки.")
+                    else:
+                        new_id = f"landing__manual__{_slugify_module_key(new_title)}__{int(datetime.now().timestamp())}"
+                        ok = _save_landing_card(
+                            new_id, new_title.strip(), new_module.strip(), new_kind, new_text.strip()
+                        )
+                        if ok:
+                            st.session_state["_ld_notif"] = f"Карточка «{new_title.strip()}» добавлена."
+                        else:
+                            st.session_state["_ld_notif_err"] = "Не удалось сохранить карточку."
+                        st.rerun()
+
+        st.divider()
+
+        if not cards:
+            st.info(
+                "Карточек пока нет. Либо добавьте первую вручную выше, либо запустите "
+                "начальный сидинг командой `python -m core.landing_search` на сервере."
+            )
+            return
+
+        # ── Фильтр по модулю ────────────────────────────────────────────
+        modules_present = sorted({c["module"] for c in cards if c["module"]})
+        f_module = st.selectbox(
+            "Фильтр по модулю", ["— Все —"] + modules_present, key="ld_filter_module",
+        )
+        view_cards = cards if f_module == "— Все —" else [c for c in cards if c["module"] == f_module]
+
+        # ── Список карточек с редактированием на месте ──────────────────
+        for card in view_cards:
+            kind_label = "📦 Модуль" if card["kind"] == "module" else "🧭 Сценарий"
+            with st.expander(f"{kind_label} · **{card['title']}** — {card['module'] or '—'}"):
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    edit_title = st.text_input(
+                        "Заголовок", value=card["title"], key=f"ld_edit_title_{card['id']}",
+                    )
+                    edit_module = st.text_input(
+                        "Модуль", value=card["module"], key=f"ld_edit_module_{card['id']}",
+                    )
+                with ec2:
+                    edit_kind = st.selectbox(
+                        "Тип", ["module", "usecase"],
+                        index=0 if card["kind"] == "module" else 1,
+                        format_func=lambda x: "Описание модуля" if x == "module" else "Сценарий использования",
+                        key=f"ld_edit_kind_{card['id']}",
+                    )
+                    st.caption(f"id: `{card['id']}`")
+
+                edit_text = st.text_area(
+                    "Текст карточки", value=card["text"], height=160,
+                    key=f"ld_edit_text_{card['id']}",
+                )
+
+                bc1, bc2 = st.columns([3, 1])
+                with bc1:
+                    if st.button("💾 Сохранить изменения", type="primary",
+                                 use_container_width=True, key=f"ld_save_card_{card['id']}"):
+                        if not edit_title.strip() or not edit_module.strip() or not edit_text.strip():
+                            st.error("Заголовок, модуль и текст не могут быть пустыми.")
+                        else:
+                            ok = _save_landing_card(
+                                card["id"], edit_title.strip(), edit_module.strip(),
+                                edit_kind, edit_text.strip(),
+                            )
+                            if ok:
+                                st.session_state["_ld_notif"] = f"Карточка «{edit_title.strip()}» обновлена."
+                            else:
+                                st.session_state["_ld_notif_err"] = "Не удалось сохранить изменения."
+                            st.rerun()
+                with bc2:
+                    if st.button("🗑️ Удалить", use_container_width=True, key=f"ld_del_card_{card['id']}"):
+                        st.session_state["_ld_confirm_delete"] = (card["id"], card["title"])
+
+        if st.session_state.get("_ld_confirm_delete"):
+            _doc_id, _title = st.session_state["_ld_confirm_delete"]
+            _confirm_delete_landing_card_dialog(_doc_id, _title)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Главная функция страницы
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1405,12 +1807,13 @@ def show_superadmin():
     st.divider()
 
     # Вкладки
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Сегменты",
         "Пользователи",
         "Статистика",
         "Лог действий",
         "Помощь",
+        "Лендинг",
     ])
 
     with tab1:
@@ -1427,3 +1830,6 @@ def show_superadmin():
 
     with tab5:
         _tab_help()
+
+    with tab6:
+        _tab_landing()

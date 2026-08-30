@@ -3,20 +3,20 @@ import os
 import sys
 from datetime import datetime
 import json
-
+ 
 # Подавляем баг телеметрии ChromaDB
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_TELEMETRY", "False")
-
+ 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+ 
 from core.feedback import submit_feedback, get_feedback, get_answer_stats
 from core import admin
-
+ 
 from streamlit_pages.advisor_page import show_advisor
 from streamlit_pages.admin_panel import show_admin_panel, get_live_answer_stats
 from streamlit_pages.tasks_page import show_tasks
-
+ 
 # Аутентификация и модули
 from core.auth import get_current_user, logout, _show_login_page
 from core.audit import log_event
@@ -25,12 +25,12 @@ from core.modules import (
     is_module_accessible, ALL_MODULES, MODULE_STATUS_LABELS,
 )
 from core.help_requests import submit_request as submit_help, count_new as count_help_new, has_unread_replies, has_unseen_done, mark_read_by_user
-
+ 
 # =============================================================================
 # 🎨 Настройка страницы
 # =============================================================================
 st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚙")
-
+ 
 # =============================================================================
 # 🧪 ВРЕМЕННО: диагностика зависания загрузки файлов
 # =============================================================================
@@ -38,7 +38,7 @@ if st.query_params.get("debug") == "upload_test":
     from streamlit_pages.debug_upload_test import show_debug_upload_test
     show_debug_upload_test()
     st.stop()
-
+ 
 # =============================================================================
 # 🔐 Session state
 # =============================================================================
@@ -46,7 +46,7 @@ if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
 if "show_landing" not in st.session_state:
     st.session_state.show_landing = True
-
+ 
 # =============================================================================
 # 🎨 CSS
 # =============================================================================
@@ -286,7 +286,7 @@ div.element-container div[data-baseweb="notification"][kind="info"] {
 }
 </style>
 """, unsafe_allow_html=True)
-
+ 
 # =============================================================================
 # 📋 Реестр активных продуктов
 # =============================================================================
@@ -295,7 +295,7 @@ _ACTIVE_PRODUCTS = [
     "Советчик", "Сканер документов", "Анализатор заявок",
     "Прогноз решения регулятора", "Протокольщик", "Задачи", "Админка",
 ]
-
+ 
 # Соответствие названия продукта → module_id в core/modules.py
 _CHOICE_TO_MODULE = {
     "Советчик":                   "advisor",
@@ -305,7 +305,7 @@ _CHOICE_TO_MODULE = {
     "Протокольщик":               "protocol",
     "Задачи":                     "tasks",
 }
-
+ 
 _DEV_PRODUCTS = [
     "Позиция ФАС", "Поиск прецедентов", "Сверка численности",
     "Проверка амортизации", "Экспорт ФГИС", "Пояснительная записка",
@@ -344,10 +344,10 @@ _PRODUCT_DESCRIPTIONS = {
         "<li>Статус, приоритет и срок исполнения с цветовой подсветкой</li>"
         "<li>Быстрая загрузка задачи прямо в Советчик</li></ul>",
 }
-
+ 
 if "main_choice" not in st.session_state:
     st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
-
+ 
 # =============================================================================
 # 🔐 Проверка авторизации
 # =============================================================================
@@ -355,9 +355,9 @@ _current_user = get_current_user()
 if not _current_user:
     _show_login_page()
     st.stop()
-
+ 
 _is_superadmin = _current_user.get("role") == "superadmin"
-
+ 
 # Heartbeat — метка активности для индикатора онлайн в управлении
 try:
     import threading as _threading
@@ -379,7 +379,7 @@ try:
         )
 except Exception:
     pass
-
+ 
 # =============================================================================
 # 💬 Диалог помощи
 # =============================================================================
@@ -414,7 +414,7 @@ def _show_help_dialog():
                         _seg_name = _segs.get(_current_user["org_id"], {}).get("name", "")
                     except Exception:
                         pass
-
+ 
                 submit_help(
                     user_id=_current_user["user_id"],
                     user_name=_current_user.get("name", ""),
@@ -424,7 +424,7 @@ def _show_help_dialog():
                 )
                 st.success("Сообщение отправлено. Мы свяжемся с вами.")
                 st.rerun()
-
+ 
 # Показываем диалог если флаг установлен
 if st.session_state.get("_show_help_dialog"):
     st.session_state._show_help_dialog = False
@@ -433,7 +433,7 @@ if st.session_state.get("_show_help_dialog"):
 # get_visible_modules() возвращает список module_id в правильном порядке.
 # Суперадмин всегда видит все модули.
 _visible_module_ids = get_visible_modules(_current_user)
-
+ 
 # Строим список отображаемых продуктов из видимых module_id
 _MODULE_TO_CHOICE = {v: k for k, v in _CHOICE_TO_MODULE.items()}
 _visible_products = [
@@ -441,11 +441,11 @@ _visible_products = [
     for mid in _visible_module_ids
     if mid in _MODULE_TO_CHOICE
 ]
-
+ 
 # Добавляем Админку для segment_admin и superadmin
 if _current_user.get("role") in ("segment_admin", "superadmin") and "Админка" not in _visible_products:
     _visible_products.append("Админка")
-
+ 
 with st.sidebar:
     st.markdown('<div class="sidebar-logo">', unsafe_allow_html=True)
     if st.button("РЕГУЛА.AI — Главная", key="sidebar_home_btn"):
@@ -453,9 +453,9 @@ with st.sidebar:
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.divider()
-
+ 
     _on_product_page = not st.session_state.get("show_landing", True)
-
+ 
     for _product in _ACTIVE_PRODUCTS:
         # Админка выносится в отдельный блок внизу — пропускаем здесь
         if _product == "Админка":
@@ -463,13 +463,13 @@ with st.sidebar:
         # Скрываем модуль если он не в списке видимых для этого пользователя
         if _product not in _visible_products:
             continue
-
+ 
         _is_active = _on_product_page and st.session_state.main_choice == _product
-
+ 
         # Проверяем статус модуля — если на обслуживании, показываем иначе
         _mid    = _CHOICE_TO_MODULE.get(_product)
         _status = get_module_status(_current_user, _mid) if _mid else "active"
-
+ 
         if _status == "maintenance":
             # Показываем модуль серым с иконкой обслуживания — не кнопка
             st.markdown(
@@ -489,11 +489,11 @@ with st.sidebar:
                 st.session_state.main_choice = _product
                 st.session_state.show_landing = False
                 st.rerun()
-
+ 
     # ── Задачи попадают сюда автоматически как часть _ACTIVE_PRODUCTS —
     # отдельного блока больше нет, гейтинг (видимость/обслуживание) для
     # них общий с остальными модулями, через _visible_products/get_module_status.
-
+ 
     st.divider()
     _dev_expanded = st.session_state.main_choice in _DEV_PRODUCTS
     with st.expander("Наши планы", expanded=_dev_expanded):
@@ -509,7 +509,7 @@ with st.sidebar:
                 st.session_state.main_choice = _product
                 st.session_state.show_landing = False
                 st.rerun()
-
+ 
     # ── Служебные разделы после "Наши планы" ──────────────────────────────────
     # Админка — для segment_admin и superadmin
     # Локальная база знаний — для segment_admin и superadmin
@@ -517,10 +517,10 @@ with st.sidebar:
     _has_admin = "Админка" in _visible_products
     _can_manage_local_kb = _current_user.get("role") in ("segment_admin", "superadmin")
     _show_service_block = _has_admin or _can_manage_local_kb or _is_superadmin
-
+ 
     if _show_service_block:
         st.divider()
-
+ 
         # Админка
         if _has_admin:
             _admin_active = _on_product_page and st.session_state.main_choice == "Админка"
@@ -533,7 +533,7 @@ with st.sidebar:
                 st.session_state.main_choice = "Админка"
                 st.session_state.show_landing = False
                 st.rerun()
-
+ 
         # Локальная база знаний — доступна segment_admin и суперадмину
         if _can_manage_local_kb:
             _local_kb_active = _on_product_page and st.session_state.main_choice == "Локальная база знаний"
@@ -546,7 +546,7 @@ with st.sidebar:
                 st.session_state.main_choice = "Локальная база знаний"
                 st.session_state.show_landing = False
                 st.rerun()
-
+ 
         # Управление — только суперадмин
         if _is_superadmin:
             _mgmt_active = _on_product_page and st.session_state.main_choice == "Управление"
@@ -559,32 +559,32 @@ with st.sidebar:
                 st.session_state.main_choice = "Управление"
                 st.session_state.show_landing = False
                 st.rerun()
-
+ 
     st.divider()
     # Кнопка помощи — видна всем пользователям
     if st.button("Помощь", key="sidebar_help_btn", use_container_width=True):
         st.session_state._show_help_dialog = True
         st.rerun()
-
+ 
     # Кнопка "Мои обращения" с индикатором:
     # 🔴 новые ответы     — есть непрочитанные ответы (приоритет выше)
     # 🟢 обращение отработано — есть отработанные которые пользователь не видел
     # без индикатора      — всё просмотрено
     _has_unread  = has_unread_replies(_current_user["user_id"])
     _has_done    = has_unseen_done(_current_user["user_id"])
-
+ 
     if _has_unread:
         _my_label = "Мои обращения 🔴 новые ответы"
     elif _has_done:
         _my_label = "Мои обращения 🟢 обращение отработано"
     else:
         _my_label = "Мои обращения"
-
+ 
     if st.button(_my_label, key="sidebar_myhelp_btn", use_container_width=True):
         st.session_state.main_choice   = "Мои обращения"
         st.session_state.show_landing  = False
         st.rerun()
-
+ 
     st.caption(f"{_current_user.get('name', '')} · {_current_user.get('role', '')}")
     if st.button("Выйти", key="sidebar_logout_btn"):
         log_event(
@@ -596,9 +596,9 @@ with st.sidebar:
         )
         logout()
         st.rerun()
-
+ 
 main_choice = st.session_state.main_choice
-
+ 
 # =============================================================================
 # 🏠 Лендинг
 # =============================================================================
@@ -609,7 +609,7 @@ if st.session_state.show_landing:
     .block-container { padding-top: 2rem !important; max-width: 1100px !important; }
     </style>
     """, unsafe_allow_html=True)
-
+ 
     # Шапка лендинга: имя+сегмент слева, выход справа
     _landing_seg_name = ""
     if _current_user.get("org_id"):
@@ -621,7 +621,7 @@ if st.session_state.show_landing:
             _landing_seg_name = _lsegs.get(_current_user["org_id"], {}).get("name", "")
         except Exception:
             pass
-
+ 
     _lhc1, _lhc2 = st.columns([3, 1])
     with _lhc1:
         _user_label = _current_user.get("name", "")
@@ -648,7 +648,7 @@ if st.session_state.show_landing:
                 )
                 logout()
                 st.rerun()
-
+ 
     st.markdown("""
     <div style="text-align:center; padding: 2rem 0 1rem;">
         <div style="font-size:2.6rem; font-weight:900; letter-spacing:0.02em;
@@ -659,28 +659,54 @@ if st.session_state.show_landing:
         </div>
     </div>
     """, unsafe_allow_html=True)
-
-    # Поле поиска — заглушка, LLM будет подключён позднее
-    _sc1, _sc2, _sc3 = st.columns([1, 4, 1])
-    with _sc2:
+ 
+    # Поле поиска — мини-RAG по маркетинговым карточкам модулей (core/landing_search.py).
+    # Промпт и содержимое базы редактируются суперадмином на вкладке «Лендинг»
+    # (streamlit_pages/superadmin.py) — здесь только вызов уже готового пайплайна.
+    # Без узкой st.columns([1,4,1])-обёртки: строка поиска и блок ответа занимают
+    # всю ширину контента, совпадая по краям с сеткой плашек модулей ниже.
+    _sic1, _sic2 = st.columns([5, 1])
+    with _sic1:
         _search_val = st.text_input(
             "Поиск",
             key="landing_search",
             placeholder="Задайте вопрос и я найду как помочь...",
             label_visibility="collapsed",
         )
-        if _search_val.strip():
-            st.caption("Умный поиск по модулям — в разработке. Воспользуйтесь Советчиком.")
-
+    with _sic2:
+        _search_go = st.button("Найти", key="landing_search_btn", use_container_width=True)
+ 
+    if _search_go and _search_val.strip():
+        try:
+            from core.landing_search import search_landing_content, stream_landing_answer
+            # advisor_model заполняется только при первом открытии Советчика
+            # (streamlit_pages/advisor_page.py) — на лендинге его может ещё
+            # не быть в session_state, тогда stream_landing_answer сама
+            # возьмёт default_model из config/advisor_config.json.
+            _landing_model = st.session_state.get("advisor_model")
+            with st.spinner("Ищу подходящий раздел..."):
+                _lsources = search_landing_content(_search_val.strip())
+            if _lsources:
+                _lgen = stream_landing_answer(_search_val.strip(), _lsources, model=_landing_model)
+                with st.container(border=True):
+                    st.write_stream(_lgen)
+            else:
+                st.info(
+                    "Не нашлось точного совпадения по модулям. "
+                    "Попробуйте переформулировать запрос или откройте Советчика в меню слева."
+                )
+        except Exception as _ld_e:
+            st.warning(f"Умный поиск временно недоступен: {_ld_e}. Воспользуйтесь Советчиком.")
+ 
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     st.markdown("<hr style='border:none;border-top:1px solid #dce3ec;margin:1.5rem 0 1rem;'>", unsafe_allow_html=True)
     st.markdown("#### Функции")
     st.markdown("<div style='height:0.3rem'></div>", unsafe_allow_html=True)
-
+ 
     # На лендинге показываем продуктовые модули (без Админки), включая «Задачи» —
     # теперь это обычный гейтируемый модуль, как и остальные.
     _landing_products = [p for p in _ACTIVE_PRODUCTS if p != "Админка"]
-
+ 
     _cols_per_row = 3
     for _row_start in range(0, len(_landing_products), _cols_per_row):
         _row_items = _landing_products[_row_start:_row_start + _cols_per_row]
@@ -689,7 +715,7 @@ if st.session_state.show_landing:
             with _cols[_ci]:
                 _desc = _PRODUCT_DESCRIPTIONS.get(_product, "")
                 _available = _product in _visible_products
-
+ 
                 if _available:
                     st.markdown('<div class="landing-tile">', unsafe_allow_html=True)
                     if st.button(_product, key=f"landing_tile_{_product}", use_container_width=True):
@@ -710,7 +736,7 @@ if st.session_state.show_landing:
                         unsafe_allow_html=True,
                     )
     st.stop()
-
+ 
 # =============================================================================
 # 🚧 Диалог "В разработке"
 # =============================================================================
@@ -733,13 +759,13 @@ def show_dev_dialog(product_name: str):
             st.session_state.main_choice = _ACTIVE_PRODUCTS[0]
             st.session_state._dev_dialog_confirmed = None
             st.rerun()
-
+ 
 if main_choice in _DEV_PRODUCTS:
     if st.session_state.get("_dev_dialog_confirmed") != main_choice:
         show_dev_dialog(main_choice)
 else:
     st.session_state._dev_dialog_confirmed = None
-
+ 
 # =============================================================================
 # 🏷️ Бренд-бар
 # =============================================================================
@@ -754,7 +780,7 @@ st.markdown("""
     </span>
 </div>
 """, unsafe_allow_html=True)
-
+ 
 # =============================================================================
 # 🛡️ Защита модулей от прямого доступа
 # =============================================================================
@@ -787,19 +813,19 @@ def _check_module(choice: str) -> bool:
         """, unsafe_allow_html=True)
         return False
     return True
-
+ 
 # =============================================================================
 # 🗂️ Роутинг
 # =============================================================================
-
+ 
 if main_choice == "Управление":
     from streamlit_pages.superadmin import show_superadmin
     show_superadmin()
-
+ 
 elif main_choice == "Локальная база знаний":
     from streamlit_pages.local_kb_admin import show_local_kb_admin
     show_local_kb_admin()
-
+ 
 elif main_choice == "Анализатор заявок":
     if _check_module("Анализатор заявок"):
         try:
@@ -807,15 +833,15 @@ elif main_choice == "Анализатор заявок":
             show_claim_analyzer()
         except ImportError as e:
             st.error(f"Ошибка загрузки анализатора: {e}")
-
+ 
 elif main_choice == "Советчик":
     if _check_module("Советчик"):
         show_advisor()
-
+ 
 elif main_choice == "Задачи":
     if _check_module("Задачи"):
         show_tasks()
-
+ 
 elif main_choice == "Сканер документов":
     if _check_module("Сканер документов"):
         try:
@@ -823,7 +849,7 @@ elif main_choice == "Сканер документов":
             show_doc_scanner()
         except ImportError as e:
             st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Прогноз решения регулятора":
     if _check_module("Прогноз решения регулятора"):
         try:
@@ -831,7 +857,7 @@ elif main_choice == "Прогноз решения регулятора":
             show_predictor()
         except ImportError as e:
             st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Протокольщик":
     if _check_module("Протокольщик"):
         try:
@@ -839,131 +865,131 @@ elif main_choice == "Протокольщик":
             show_protocol_bot()
         except ImportError as e:
             st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Позиция ФАС":
     try:
         from streamlit_pages.fas_position import show_fas_position
         show_fas_position()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Поиск прецедентов":
     try:
         from streamlit_pages.court_precedents import show_court_precedents
         show_court_precedents()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Сверка численности":
     try:
         from streamlit_pages.numeracy_check import show_numeracy_check
         show_numeracy_check()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Проверка амортизации":
     try:
         from streamlit_pages.amortization_check import show_amortization_check
         show_amortization_check()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Экспорт ФГИС":
     try:
         from streamlit_pages.fgis_export import show_fgis_export
         show_fgis_export()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Пояснительная записка":
     try:
         from streamlit_pages.explanatory_note import show_explanatory_note
         show_explanatory_note()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Калькулятор рисков":
     try:
         from streamlit_pages.risk_calculator import show_risk_calculator
         show_risk_calculator()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Жалобщик":
     try:
         from streamlit_pages.complaint_bot import show_complaint_bot
         show_complaint_bot()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Трекер изменений законов":
     try:
         from streamlit_pages.law_tracker import show_law_tracker
         show_law_tracker()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Расчетный лист":
     try:
         from streamlit_pages.calc_sheet import show_calc_sheet
         show_calc_sheet()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Прогнозист тарифов":
     try:
         from streamlit_pages.tariff_forecaster import show_tariff_forecaster
         show_tariff_forecaster()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Сравнение с аналогами":
     try:
         from streamlit_pages.peer_comparison import show_peer_comparison
         show_peer_comparison()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Режим обучения":
     try:
         from streamlit_pages.training_mode import show_training_mode
         show_training_mode()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Наведение порядка в документах":
     try:
         from streamlit_pages.document_organizer import show_document_organizer
         show_document_organizer()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Планировщик кампании":
     try:
         from streamlit_pages.tariff_planner import show_tariff_planner
         show_tariff_planner()
     except ImportError as e:
         st.error(f"Ошибка: {e}")
-
+ 
 elif main_choice == "Прогноз потребления":
     try:
         from streamlit_pages.consumption_forecast import show_consumption_forecast
         show_consumption_forecast()
     except ImportError as e:
         st.error(f"❌ {e}")
-
+ 
 elif main_choice == "Мои обращения":
     # При открытии помечаем все ответы как прочитанные — кнопка в сайдбаре гаснет.
     # Это намеренное решение: факт открытия раздела = пользователь увидел ответы.
     mark_read_by_user(_current_user["user_id"])
-
+ 
     st.markdown("### Мои обращения")
     st.caption("История ваших запросов в поддержку и ответы на них.")
-
+ 
     try:
         from core.help_requests import get_requests as _get_help
         _my_requests = _get_help(user_id=_current_user["user_id"], limit=100)
-
+ 
         if not _my_requests:
             st.info("У вас пока нет обращений. Используйте кнопку «Помощь» чтобы задать вопрос.")
         else:
@@ -973,7 +999,7 @@ elif main_choice == "Мои обращения":
                 _reply  = _req.get("reply")
                 _status = _req.get("status", "new")
                 _rat    = (_req.get("replied_at") or "")[:10]
-
+ 
                 with st.container(border=True):
                     _rc1, _rc2 = st.columns([4, 1])
                     with _rc1:
@@ -989,12 +1015,12 @@ elif main_choice == "Мои обращения":
                                 "<small style='color:#E24B4A'>● Открыто</small>",
                                 unsafe_allow_html=True,
                             )
-
+ 
                     st.markdown(
                         f"<div style='color:#1a2a3a;padding:0.3rem 0'>{_text}</div>",
                         unsafe_allow_html=True,
                     )
-
+ 
                     if _reply:
                         st.markdown(
                             f"<div style='background:#e8f4f8;border-left:3px solid #1B5C74;"
@@ -1008,6 +1034,6 @@ elif main_choice == "Мои обращения":
                         st.caption("Ответ ожидается...")
     except Exception as _e:
         st.error(f"Ошибка загрузки обращений: {_e}")
-
+ 
 elif main_choice == "Админка":
     show_admin_panel()

@@ -8,12 +8,6 @@ from datetime import datetime
 import threading
 from typing import Optional, List, Dict
 from openai import OpenAI
-
-# Usage tracker — с защитой: если модуль недоступен, трекинг отключается молча
-try:
-    from core.usage_tracker import log_event as _log_usage
-except Exception:
-    def _log_usage(*a, **kw): pass  # noqa: E731
  
 # =============================================================================
 # Исправление кодировки консоли на Windows (cp1252 → utf-8)
@@ -336,9 +330,42 @@ def _ollama_native_options(temperature: float, max_tokens: int) -> dict:
     }
 
 
-def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout):
+# =============================================================================
+# Сторожевой дедлайн для стрима Ollama
+#
+# ПОЧЕМУ ЭТОГО НЕДОСТАТОЧНО БЕЗ ЭТОГО БЛОКА. requests timeout=N при
+# stream=True — это НЕ общий лимит на всю операцию. Это (connect_timeout,
+# read_timeout), где read_timeout — время ожидания МЕЖДУ последовательными
+# чтениями сокета. Если TCP-соединение остаётся технически открытым (сервер
+# не рвёт сокет, ОС не шлёт RST/FIN), а llama-server внутри Ollama завис
+# (deadlock на GPU, застрял в очереди, упал в busy-loop) — requests может
+# зависнуть на iter_lines() надолго дольше заявленного timeout, потому что
+# read-вызов формально не блокируется бесконечно на одном чтении, а просто
+# следующая итерация начинается заново. Наблюдалось на проде: [LLM stream]
+# залогирован, дальше тишина до docker restart (инцидент 2026-08-29 21:17 —
+# зависание сразу после hybrid_search, на самом вызове к Ollama).
+#
+# РЕШЕНИЕ. Два независимых жёстких лимита поверх requests timeout:
+#   1) hard_deadline   — абсолютное время на весь стрим от первого байта
+#                        до последнего токена.
+#   2) chunk_timeout   — максимальная пауза МЕЖДУ двумя последовательными
+#                        чанками. Если Ollama замолчала посреди генерации —
+#                        не ждём hard_deadline целиком, обрываем раньше.
+# Оба кидают TimeoutError с понятным сообщением, которое выше по стеку
+# (stream_ai_answer / generate_ai_answer) превращается в текст для
+# пользователя, а не в бесконечную загрузку Streamlit.
+# =============================================================================
+def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout,
+                                chunk_timeout: float = 60.0):
     """
     Генератор токенов через нативный Ollama /api/chat с think:false.
+
+    timeout        — таймаут requests (connect + per-read), передаётся как есть.
+    chunk_timeout  — сторожевой лимит: если между двумя чанками от Ollama
+                     проходит больше этого времени, генератор кидает
+                     TimeoutError и не виснет бесконечно. По умолчанию 60 сек —
+                     для нормальной генерации токен приходит намного чаще;
+                     если пауза дольше — что-то у Ollama застряло.
     """
     import requests
     url = _ollama_native_base_url() + "/api/chat"
@@ -349,24 +376,65 @@ def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout
         "think": False,
         "options": _ollama_native_options(temperature, max_tokens),
     }
+
+    t_start = time.monotonic()
+    hard_deadline = t_start + max(timeout, 60)  # не короче явного timeout
+
     resp = requests.post(url, json=payload, stream=True, timeout=timeout)
     resp.raise_for_status()
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        data = json.loads(line)
-        msg = data.get("message") or {}
-        content = msg.get("content", "")
-        if content:
-            yield content
-        if data.get("done"):
-            break
+
+    line_iter = resp.iter_lines()
+    last_chunk_at = time.monotonic()
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now > hard_deadline:
+                # Текст намеренно содержит "timeout" — выше по стеку
+                # (stream_ai_answer/generate_ai_answer/stream_clarification_answer)
+                # обработчик ловит по подстроке "timeout" in err.lower()
+                # и превращает это в понятное сообщение пользователю.
+                raise TimeoutError(
+                    f"Ollama stream timeout: превышен общий лимит {timeout} сек "
+                    f"(модель: {model})"
+                )
+            if now - last_chunk_at > chunk_timeout:
+                raise TimeoutError(
+                    f"Ollama stream timeout: нет данных от сервера {chunk_timeout:.0f} сек "
+                    f"подряд (модель: {model}, похоже сервер завис)"
+                )
+
+            try:
+                line = next(line_iter)
+            except StopIteration:
+                break
+            except requests.exceptions.ChunkedEncodingError as e:
+                raise TimeoutError(f"Ollama stream timeout: соединение оборвано ({e})")
+
+            last_chunk_at = time.monotonic()
+
+            if not line:
+                continue
+            data = json.loads(line)
+            msg = data.get("message") or {}
+            content = msg.get("content", "")
+            if content:
+                yield content
+            if data.get("done"):
+                break
+    finally:
+        resp.close()
 
 
 def _ollama_chat_native(model, messages, temperature, max_tokens, timeout) -> dict:
     """
     Нестриминговый вызов нативного Ollama /api/chat с think:false.
     Возвращает {"content": str, "done_reason": str}.
+
+    Здесь достаточно обычного requests timeout: при stream=False requests
+    ждёт единственный полный ответ одним блоком, поэтому read_timeout
+    действительно покрывает всё время ожидания — доп. дедлайн не нужен,
+    в отличие от стримингового варианта выше.
     """
     import requests
     url = _ollama_native_base_url() + "/api/chat"
@@ -1969,21 +2037,13 @@ def stream_ai_answer(
     if _SOURCES_ONLY_MODE:
         yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
         return
-
-    # Событие: запрос отправлен в советчик
-    _log_usage("advisor", "query_submitted", meta={
-        "query_len": len(query),
-        "sources":   len(sources),
-        "model":     model,
-    })
-
+ 
     # Кэш — возвращаем сразу без стриминга (неймспейс вшит в хэш ключа →
     # чужой сегмент физически не может попасть в выдачу)
     cache_key = get_cache_key(query, sources, model, namespace=namespace)
     cached_answer = _cache_get(cache_key)
     if cached_answer is not None:
         print(f"[CACHE HIT stream] {model} | ns={namespace}")
-        _log_usage("advisor", "cache_hit", meta={"query_len": len(query)})
         yield cached_answer
         return
  
@@ -2139,12 +2199,6 @@ def stream_ai_answer(
         )
         if not is_broken:
             _cache_put(cache_key, answer, query, model, namespace)
-            _log_usage("advisor", "answer_streamed", meta={
-                "query_len":  len(query),
-                "answer_len": len(answer),
-                "sources":    len(sources),
-                "model":      model,
-            })
  
     except Exception as e:
         err = str(e)
@@ -2198,12 +2252,6 @@ def stream_clarification_answer(
     if _SOURCES_ONLY_MODE:
         yield "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
         return
-
-    # Событие: уточняющий вопрос
-    _log_usage("advisor", "clarification_submitted", meta={
-        "query_len":   len(clarify_q),
-        "new_sources": len(new_sources),
-    })
 
     try:
         prompts       = load_prompts()
@@ -2515,7 +2563,6 @@ def ask_question(
                 result["redirect"]        = sec
                 result["redirect_reason"] = f"Для деталей рекомендуем раздел «{sec}»"
             print(f"[ASK] FAQ за {time.perf_counter()-t_start:.2f} сек")
-            _log_usage("advisor", "faq_matched", meta={"query_len": len(query)})
             return result
  
     # Гибридный поиск (BM25 + vector + reranking)
@@ -2539,14 +2586,7 @@ def ask_question(
     if sec:
         result["redirect"]        = sec
         result["redirect_reason"] = f"💡 Ваш вопрос относится к разделу «{sec}»."
-
-    _log_usage("advisor", "answer_generated", meta={
-        "query_len":  len(query),
-        "sources":    len(result.get("sources", [])),
-        "from_cache": result.get("from_cache", False),
-        "has_answer": bool((result.get("answer") or "").strip()),
-    })
-
+ 
     print(f"[ASK] Итого: {time.perf_counter()-t_start:.2f} сек\n")
     return result
 
