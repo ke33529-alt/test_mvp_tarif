@@ -339,33 +339,133 @@ def _ollama_native_options(temperature: float, max_tokens: int) -> dict:
 # чтениями сокета. Если TCP-соединение остаётся технически открытым (сервер
 # не рвёт сокет, ОС не шлёт RST/FIN), а llama-server внутри Ollama завис
 # (deadlock на GPU, застрял в очереди, упал в busy-loop) — requests может
-# зависнуть на iter_lines() надолго дольше заявленного timeout, потому что
-# read-вызов формально не блокируется бесконечно на одном чтении, а просто
-# следующая итерация начинается заново. Наблюдалось на проде: [LLM stream]
-# залогирован, дальше тишина до docker restart (инцидент 2026-08-29 21:17 —
-# зависание сразу после hybrid_search, на самом вызове к Ollama).
+# зависнуть надолго дольше заявленного timeout. Это ПОДТВЕРЖДЕНО на проде:
+# первая версия этого фикса (с кооперативной проверкой дедлайна ВНУТРИ
+# цикла iter_lines()) не сработала — зависание длилось больше 300 сек
+# при timeout=300, потому что блокировка происходила уже на самом вызове
+# requests.post(..., stream=True, timeout=timeout) — то есть ДО входа в
+# цикл, где стояли проверки. Кооперативные проверки бесполезны, если
+# поток не доходит до них.
 #
-# РЕШЕНИЕ. Два независимых жёстких лимита поверх requests timeout:
-#   1) hard_deadline   — абсолютное время на весь стрим от первого байта
-#                        до последнего токена.
-#   2) chunk_timeout   — максимальная пауза МЕЖДУ двумя последовательными
-#                        чанками. Если Ollama замолчала посреди генерации —
-#                        не ждём hard_deadline целиком, обрываем раньше.
-# Оба кидают TimeoutError с понятным сообщением, которое выше по стеку
-# (stream_ai_answer / generate_ai_answer) превращается в текст для
-# пользователя, а не в бесконечную загрузку Streamlit.
+# РЕШЕНИЕ. Независимый поток-таймер (не кооперативная проверка, а
+# принудительное вмешательство извне): _StreamWatchdog запускается ДО
+# requests.post и параллельно с чтением стрима. Если за hard_deadline
+# секунд стрим не завершился — таймер сам дёргает resp.close() у ответа
+# requests, что обрывает сокет на уровне urllib3/http.client и заставляет
+# блокирующий read/iter_lines() выбросить исключение НЕЗАВИСИМО от того,
+# сработал ли внутренний timeout requests. Это работает даже если
+# requests.post() сама застряла в ожидании заголовков ответа — close()
+# на объекте Response, доступном сразу после успешного connect, разрывает
+# нижележащее соединение.
+#
+# Дополнительно chunk_timeout переопределяет дедлайн таймера при каждом
+# полученном чанке — так долгая, но ЖИВАЯ генерация не обрывается
+# hard_deadline'ом раньше времени, а тихое зависание ловится быстро.
 # =============================================================================
+class _StreamWatchdog:
+    """
+    Независимый поток-таймер для принудительного обрыва зависшего
+    HTTP-стрима. В отличие от кооперативных проверок внутри цикла чтения,
+    это единственный способ гарантированно прервать операцию, которая
+    зависла ДО того, как код дошёл до цикла (например, на самом
+    requests.post() в ожидании заголовков ответа).
+
+    Использование:
+        watchdog = _StreamWatchdog(hard_deadline=300, chunk_timeout=60)
+        watchdog.start()
+        resp = requests.post(..., stream=True, timeout=...)
+        watchdog.attach(resp)          # с этого момента таймер может resp.close()
+        for line in resp.iter_lines():
+            watchdog.touch()           # сдвигает дедлайн chunk_timeout
+            ...
+        watchdog.stop()                # обязательно — иначе поток продолжит жить
+    """
+
+    def __init__(self, hard_deadline: float, chunk_timeout: float, label: str = ""):
+        self._hard_deadline_s  = max(hard_deadline, 10)
+        self._chunk_timeout_s  = max(chunk_timeout, 5)
+        self._label            = label
+        self._resp             = None
+        self._resp_lock        = threading.Lock()
+        self._last_activity    = time.monotonic()
+        self._stop_event       = threading.Event()
+        self._fired            = threading.Event()
+        self._thread           = threading.Thread(
+            target=self._run, daemon=True,
+            name=f"stream-watchdog-{label}" if label else "stream-watchdog",
+        )
+        self._start_time       = time.monotonic()
+
+    def start(self):
+        self._thread.start()
+
+    def attach(self, resp):
+        """Регистрирует объект requests.Response, который таймер сможет закрыть."""
+        with self._resp_lock:
+            self._resp = resp
+
+    def touch(self):
+        """Сдвигает окно chunk_timeout — вызывать при получении каждого чанка."""
+        self._last_activity = time.monotonic()
+
+    def fired(self) -> bool:
+        """True, если таймер уже сработал (можно отличить свой обрыв от чужого)."""
+        return self._fired.is_set()
+
+    def stop(self):
+        """Останавливает поток-таймер. ОБЯЗАТЕЛЬНО вызывать в finally."""
+        self._stop_event.set()
+
+    def _run(self):
+        while not self._stop_event.wait(timeout=1.0):
+            now = time.monotonic()
+            elapsed_total = now - self._start_time
+            elapsed_since_chunk = now - self._last_activity
+
+            if elapsed_total > self._hard_deadline_s:
+                reason = (f"общий лимит {self._hard_deadline_s:.0f} сек "
+                          f"(прошло {elapsed_total:.0f} сек)")
+            elif elapsed_since_chunk > self._chunk_timeout_s:
+                reason = (f"нет данных {self._chunk_timeout_s:.0f} сек подряд "
+                          f"(модель, похоже, зависла)")
+            else:
+                continue
+
+            self._fired.set()
+            print(f"[STREAM WATCHDOG{' ' + self._label if self._label else ''}] "
+                  f"Принудительный обрыв: {reason}")
+            with self._resp_lock:
+                if self._resp is not None:
+                    try:
+                        self._resp.close()
+                    except Exception as e:
+                        print(f"[STREAM WATCHDOG] Ошибка при resp.close(): {e}")
+                    # Дополнительно рвём низкоуровневое соединение urllib3 —
+                    # resp.close() иногда не хватает, если поток застрял
+                    # внутри http.client на уровне сокета, а не на уровне
+                    # буфера requests.
+                    try:
+                        raw = getattr(self._resp, "raw", None)
+                        if raw is not None:
+                            sock = getattr(raw, "_fp", None)
+                            sock = getattr(sock, "fp", None) or sock
+                            if sock is not None and hasattr(sock, "close"):
+                                sock.close()
+                    except Exception:
+                        pass
+            return  # таймер сработал один раз — дальше делать нечего
+
+
 def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout,
                                 chunk_timeout: float = 60.0):
     """
     Генератор токенов через нативный Ollama /api/chat с think:false.
 
-    timeout        — таймаут requests (connect + per-read), передаётся как есть.
-    chunk_timeout  — сторожевой лимит: если между двумя чанками от Ollama
-                     проходит больше этого времени, генератор кидает
-                     TimeoutError и не виснет бесконечно. По умолчанию 60 сек —
-                     для нормальной генерации токен приходит намного чаще;
-                     если пауза дольше — что-то у Ollama застряло.
+    timeout        — общий жёсткий лимит на весь стрим (секунд). Обеспечивается
+                     НЕ через requests timeout= (ненадёжно при зависшем сервере,
+                     см. комментарий выше _StreamWatchdog), а через независимый
+                     поток-таймер, который принудительно рвёт соединение.
+    chunk_timeout  — сторожевой лимит паузы между чанками. По умолчанию 60 сек.
     """
     import requests
     url = _ollama_native_base_url() + "/api/chat"
@@ -377,41 +477,28 @@ def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout
         "options": _ollama_native_options(temperature, max_tokens),
     }
 
-    t_start = time.monotonic()
-    hard_deadline = t_start + max(timeout, 60)  # не короче явного timeout
+    watchdog = _StreamWatchdog(hard_deadline=timeout, chunk_timeout=chunk_timeout,
+                                label=model)
+    watchdog.start()
 
-    resp = requests.post(url, json=payload, stream=True, timeout=timeout)
-    resp.raise_for_status()
-
-    line_iter = resp.iter_lines()
-    last_chunk_at = time.monotonic()
-
+    resp = None
     try:
-        while True:
-            now = time.monotonic()
-            if now > hard_deadline:
-                # Текст намеренно содержит "timeout" — выше по стеку
-                # (stream_ai_answer/generate_ai_answer/stream_clarification_answer)
-                # обработчик ловит по подстроке "timeout" in err.lower()
-                # и превращает это в понятное сообщение пользователю.
-                raise TimeoutError(
-                    f"Ollama stream timeout: превышен общий лимит {timeout} сек "
-                    f"(модель: {model})"
-                )
-            if now - last_chunk_at > chunk_timeout:
-                raise TimeoutError(
-                    f"Ollama stream timeout: нет данных от сервера {chunk_timeout:.0f} сек "
-                    f"подряд (модель: {model}, похоже сервер завис)"
-                )
+        # requests timeout= оставлен как первая (но не единственная) линия
+        # защиты — сработает в типичных случаях сама. watchdog — вторая,
+        # надёжная линия защиты на случай, когда requests timeout не
+        # срабатывает (подтверждённый на проде сценарий).
+        resp = requests.post(url, json=payload, stream=True, timeout=timeout)
+        watchdog.attach(resp)
+        resp.raise_for_status()
 
-            try:
-                line = next(line_iter)
-            except StopIteration:
-                break
-            except requests.exceptions.ChunkedEncodingError as e:
-                raise TimeoutError(f"Ollama stream timeout: соединение оборвано ({e})")
+        for line in resp.iter_lines():
+            watchdog.touch()
 
-            last_chunk_at = time.monotonic()
+            if watchdog.fired():
+                raise TimeoutError(
+                    f"Ollama stream timeout: соединение принудительно оборвано "
+                    f"сторожевым таймером (модель: {model})"
+                )
 
             if not line:
                 continue
@@ -422,8 +509,27 @@ def _ollama_chat_native_stream(model, messages, temperature, max_tokens, timeout
                 yield content
             if data.get("done"):
                 break
+
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout) as e:
+        # Если это watchdog оборвал соединение — даём понятное сообщение.
+        # Если оборвалось само по другой причине — тоже сообщаем как timeout,
+        # чтобы обработчик выше по стеку (ловит по "timeout" in err.lower())
+        # показал пользователю осмысленный текст, а не голый traceback.
+        if watchdog.fired():
+            raise TimeoutError(
+                f"Ollama stream timeout: сервер завис и соединение было "
+                f"принудительно оборвано (модель: {model}): {e}"
+            )
+        raise TimeoutError(f"Ollama stream timeout: соединение оборвано ({e})")
     finally:
-        resp.close()
+        watchdog.stop()
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 def _ollama_chat_native(model, messages, temperature, max_tokens, timeout) -> dict:
@@ -431,10 +537,9 @@ def _ollama_chat_native(model, messages, temperature, max_tokens, timeout) -> di
     Нестриминговый вызов нативного Ollama /api/chat с think:false.
     Возвращает {"content": str, "done_reason": str}.
 
-    Здесь достаточно обычного requests timeout: при stream=False requests
-    ждёт единственный полный ответ одним блоком, поэтому read_timeout
-    действительно покрывает всё время ожидания — доп. дедлайн не нужен,
-    в отличие от стримингового варианта выше.
+    Тот же риск зависания, что и в стриминговом варианте (см. комментарий
+    выше _StreamWatchdog) — requests timeout= здесь тоже ненадёжен как
+    единственная защита, поэтому используем тот же сторожевой таймер.
     """
     import requests
     url = _ollama_native_base_url() + "/api/chat"
@@ -445,14 +550,37 @@ def _ollama_chat_native(model, messages, temperature, max_tokens, timeout) -> di
         "think": False,
         "options": _ollama_native_options(temperature, max_tokens),
     }
-    resp = requests.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    msg = data.get("message") or {}
-    return {
-        "content": msg.get("content", ""),
-        "done_reason": data.get("done_reason", "stop"),
-    }
+
+    watchdog = _StreamWatchdog(hard_deadline=timeout, chunk_timeout=timeout,
+                                label=model)
+    watchdog.start()
+    resp = None
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        watchdog.attach(resp)
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data.get("message") or {}
+        return {
+            "content": msg.get("content", ""),
+            "done_reason": data.get("done_reason", "stop"),
+        }
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout) as e:
+        if watchdog.fired():
+            raise TimeoutError(
+                f"Ollama timeout: сервер завис и соединение было "
+                f"принудительно оборвано (модель: {model}): {e}"
+            )
+        raise TimeoutError(f"Ollama timeout: соединение оборвано ({e})")
+    finally:
+        watchdog.stop()
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -467,7 +595,17 @@ def _reload_lm_studio_context():
     """
     Сбрасывает KV-кэш LM Studio перезагрузкой модели через REST API.
     Совместимо с LM Studio 0.3.x (api/v0) и более ранними версиями (фоллбэк).
+
+    При бэкенде Ollama не делает ничего: Ollama управляет KV-кэшем сама,
+    у неё нет ни /v1/models в этом смысле, ни api/v0/models/reload. Без
+    этой проверки функция после КАЖДОГО запроса стучалась на порт LM Studio
+    (127.0.0.1:1234), которого в конфигурации с Ollama просто нет, висела
+    там до истечения таймаута и писала в лог бесполезное
+    "[KV-RESET] Не удалось получить список моделей: ...".
     """
+    if _is_ollama_backend():
+        return
+
     if not CONFIG.get("reset_context_after_request", True):
         return
 
@@ -2185,8 +2323,11 @@ def stream_ai_answer(
  
         print(f"[LLM stream] готово за {time.perf_counter()-t0:.2f} сек")
 
-        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI
-        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
+        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI.
+        # При Ollama поток не создаём вовсе: сбрасывать нечего (Ollama ведёт
+        # KV-кэш сама), а лишний поток на каждый запрос — только мусор.
+        if not _is_ollama_backend():
+            threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
 
         answer = strip_thinking_blocks(full_text)
  
@@ -2388,7 +2529,8 @@ def stream_clarification_answer(
                         break
 
         print(f"[CLARIFY stream] готово за {time.perf_counter()-t0:.2f} сек")
-        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset-clar").start()
+        if not _is_ollama_backend():
+            threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset-clar").start()
 
     except Exception as e:
         err = str(e)
@@ -2482,8 +2624,11 @@ def generate_ai_answer(
         print(f"[LLM] ответ за {time.perf_counter()-t0:.2f} сек | "
               f"finish={finish_reason} | len={len(raw_content or '')}")
 
-        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI
-        threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
+        # Сбрасываем KV-кэш LM Studio в фоне — не блокируем UI.
+        # При Ollama поток не создаём вовсе: сбрасывать нечего (Ollama ведёт
+        # KV-кэш сама), а лишний поток на каждый запрос — только мусор.
+        if not _is_ollama_backend():
+            threading.Thread(target=_reload_lm_studio_context, daemon=True, name="kv-reset").start()
 
         if finish_reason == "length":
             return ("⚠️ Превышен лимит токенов. "

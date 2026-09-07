@@ -49,8 +49,9 @@ ALL_MODULES = {
     "tasks":     "Задачи",
 }
 
-# Модули которые не управляются через segments.json
-# Админка — только для segment_admin и выше, всегда
+# Модули которые не управляются через общий блок segments.json["modules"]
+# Админка — для segment_admin, но её можно выключить суперадмином на уровне
+# сегмента (см. is_admin_panel_enabled) через segments.json["admin_panel_enabled"]
 # Управление — только для superadmin, всегда
 SYSTEM_MODULES = {
     "admin":      "Админка",
@@ -94,6 +95,23 @@ def get_segment_modules(org_id: str) -> Dict[str, Dict]:
     if not seg:
         return DEFAULT_MODULE_CONFIG.copy()
     return seg.get("modules", DEFAULT_MODULE_CONFIG.copy())
+
+
+def is_admin_panel_enabled(org_id: str) -> bool:
+    """
+    Проверяет, включена ли Админка для сегмента.
+
+    Управляется суперадмином отдельным полем segments.json["admin_panel_enabled"]
+    (не через общий блок "modules" — Админка системный, а не обычный раздел).
+    Если поле отсутствует (все сегменты, созданные до этой правки) — считается
+    включённой, чтобы не поменять поведение по умолчанию задним числом.
+    """
+    if not org_id:
+        return False
+    seg = _load_segment(org_id)
+    if not seg:
+        return False
+    return seg.get("admin_panel_enabled", True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,7 +191,7 @@ def is_module_accessible(user: Dict, module_id: str) -> bool:
 
     # Системные модули
     if module_id == "admin":
-        return role == "segment_admin"
+        return role == "segment_admin" and is_admin_panel_enabled(user.get("org_id", ""))
     if module_id == "superadmin":
         return False
 

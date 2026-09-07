@@ -289,6 +289,20 @@ def _save_segment_modules(org_id: str, modules: Dict) -> bool:
     return True
 
 
+def _set_admin_panel_enabled(org_id: str, enabled: bool) -> bool:
+    """
+    Включает/выключает доступ к разделу «Админка» для роли «Админ сегмента»
+    в этом сегменте. Хранится отдельным полем, не внутри "modules" —
+    Админка системный раздел, а не обычный модуль.
+    """
+    segments = _load_segments()
+    if org_id not in segments:
+        return False
+    segments[org_id]["admin_panel_enabled"] = enabled
+    _save_segments(segments)
+    return True
+
+
 def _get_allowed_modules(user: Dict) -> list:
     """
     Возвращает список module_id доступных текущему пользователю.
@@ -542,6 +556,27 @@ def _tab_segments():
                         if _save_segment_modules(org_id, new_modules):
                             st.success("Настройки модулей сохранены")
                             st.rerun()
+
+                    st.divider()
+
+                    # ── Админка сегмента ────────────────────────────────────
+                    st.markdown("**Админ-панель сегмента**")
+                    admin_panel_now = seg.get("admin_panel_enabled", True)
+                    new_admin_panel = st.checkbox(
+                        "Доступна для роли «Админ сегмента»",
+                        value=admin_panel_now,
+                        key=f"admin_panel_{org_id}",
+                        help="При выключении раздел «Админка» пропадёт из сайдбара "
+                             "и станет недоступен по прямой ссылке для segment_admin "
+                             "этого сегмента.",
+                    )
+                    if st.button("Сохранить", key=f"save_admin_panel_{org_id}"):
+                        if new_admin_panel != admin_panel_now:
+                            if _set_admin_panel_enabled(org_id, new_admin_panel):
+                                st.success("Настройка сохранена")
+                                st.rerun()
+                        else:
+                            st.info("Изменений нет")
 
                     st.divider()
 
