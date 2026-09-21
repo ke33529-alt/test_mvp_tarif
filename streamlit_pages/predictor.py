@@ -10,7 +10,11 @@
   5. LLM классифицирует каждый чанк: положительное / отрицательное / нейтральное
   6. Агрегация по файлам (1 файл = 1 голос, по большинству чанков)
   7. Результат: счётчик за/против/нейтр + цитаты со свёрнутыми источниками
-  8. Сохранение в реестр прогнозов (data/predictor/registry_NNNN.jsonl)
+  8. Итоговое резюме (опционально): поиск применимых НПА по статье и выбранной
+     сфере (та же гибридная инфраструктура, что у Советчика, core/advisor.py)
+     + LLM-сводка, опирающаяся одновременно на найденные НПА и на практику
+     регуляторов (за/против из уже классифицированных прецедентов)
+  9. Сохранение в реестр прогнозов (data/predictor/registry_NNNN.jsonl)
 ──────────────────────────────────────────────────────────────────────────────
 """
 import io
@@ -69,6 +73,16 @@ _PRED_CFG_DEFAULTS = {
     # Можно отключить здесь или переключателем в интерфейсе прогнозиста,
     # чтобы сравнить результат с выключенной верификацией.
     "enable_verification": True,
+    # ── Итоговое резюме (НПА + практика) ─────────────────────────────────
+    # Отдельный шаг после классификации: поиск применимых НПА по статье и
+    # выбранной сфере через ту же инфраструктуру, что у Советчика
+    # (core.advisor.search_vector_db), плюс LLM-сводка НПА + найденной
+    # практики. Сбой здесь мягкий — не роняет уже посчитанный прогноз
+    # (см. generate_prediction_summary).
+    "enable_summary":      True,
+    "summary_npa_top_k":   6,
+    "summary_max_sources": 6,   # источников с каждой стороны (за/против) в промпте резюме
+    "summary_max_tokens":  900,
 }
 
 
@@ -228,6 +242,50 @@ _PRED_PROMPT_DEFAULTS = {
         "Ответь СРАЗУ готовым JSON без рассуждений, без вопросов самому "
         "себе, без цитирования этой инструкции в ответе:\n"
         'JSON: {{"decision":"positive|negative|neutral","quote":"цитата, какой вариант выбрал регулятор, до 120 симв.","reason":"краткий итоговый вывод одним предложением: совпадают варианты или нет, до 120 симв."}}'
+    ),
+    # ── Прогнозист решений: итоговое резюме (НПА + практика) ─────────────
+    "predictor_summary_system": (
+        "Ты — тарифный эксперт РФ. Твоя задача — по уже готовым материалам "
+        "подготовить краткое итоговое резюме для специалиста, работающего "
+        "над обоснованием статьи затрат в тарифной заявке.\n\n"
+        "У тебя есть два независимых источника, оба уже собраны и "
+        "предоставлены ниже — сам поиск не твоя задача:\n"
+        "1. ПРИМЕНИМЫЕ НПА — нормативные акты и методические документы по "
+        "данной статье затрат и сфере регулирования, найденные в базе.\n"
+        "2. ПРАКТИКА РЕГУЛЯТОРОВ — прецеденты (протоколы/экспертные "
+        "заключения РЭК), уже классифицированные как «за» или «против» той "
+        "же логики обоснования, которую заявляет пользователь.\n\n"
+        "ПРАВИЛА:\n"
+        "- Отвечай только на русском языке, связным текстом (не JSON, без "
+        "списков-буллетов), 3–5 предложений.\n"
+        "- Сначала кратко скажи, что требует НПА по этой статье. Если НПА "
+        "не найдены — прямо укажи это одним предложением и не выдумывай "
+        "нормы.\n"
+        "- Затем скажи, что показывает практика регуляторов: согласуется "
+        "ли она с требованиями НПА, преобладает «за» или «против», и по "
+        "какой причине (опирайся на quote/reason источников практики).\n"
+        "- Если НПА и практика расходятся — явно укажи это как отдельный "
+        "риск для заявителя.\n"
+        "- Не повторяй источники дословно — обобщай.\n"
+        "- Не упоминай процент вероятности одобрения — он уже показан "
+        "пользователю отдельно, дублировать не нужно.\n"
+        "- Если оба источника пусты — сообщи об этом одним предложением и "
+        "не придумывай содержание.\n"
+        "Ответь сразу текстом резюме, без вступления и без цитирования "
+        "этой инструкции."
+    ),
+    "predictor_summary_user": (
+        "СТАТЬЯ ЗАТРАТ: {article_name}\n"
+        "{justification_line}\n"
+        "=== ПРИМЕНИМЫЕ НПА ===\n"
+        "{npa_context}\n"
+        "=== КОНЕЦ НПА ===\n\n"
+        "=== ПРАКТИКА РЕГУЛЯТОРОВ (найденные прецеденты) ===\n"
+        "За: {n_positive} · Против: {n_negative} · Нейтрально (не "
+        "учитываются в оценке): {n_neutral}\n"
+        "{expertise_context}\n"
+        "=== КОНЕЦ ПРАКТИКИ ===\n\n"
+        "Составь итоговое резюме по правилам из системного промпта."
     ),
 }
 
@@ -1575,6 +1633,189 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
 
 
 # =============================================================================
+# Итоговое резюме: НПА (по сфере) + практика регуляторов
+# =============================================================================
+#
+# ВАЖНО: сферы экспертных заключений (см. streamlit_pages/expertise_panel.py
+# SPHERES: "Теплоснабжение", "Водоснабжение", "Водоотведение", "ТКО",
+# "Электроэнергетика", "Газоснабжение", "Иное") и сферы НПА (metadata
+# tariff_docs, назначаются в Админке через config/doc_spheres.json —
+# ЭМОДЗИ-ПРЕФИКСНЫЕ комбинированные значения вида "🔥 Теплоснабжение",
+# "💧 Водоснабжение/водоотведение", см. core.indexer._get_sphere_str и
+# streamlit_pages/advisor_page.py _ADV_SPHERES) — ДВЕ РАЗНЫЕ, независимо
+# развивавшиеся системы обозначений одной предметной области. Простой
+# передачей выбранной сферы Прогнозиста напрямую в search_vector_db()
+# ничего не найдётся почти никогда (см. core.advisor._sphere_match —
+# подстрочное сравнение, а строки в принципе разные). Поэтому перед
+# поиском по НПА сферу нужно явно перевести в словарь Советчика.
+_EXPERTISE_TO_ADVISOR_SPHERE = {
+    "Теплоснабжение":               "🔥 Теплоснабжение",
+    "Водоснабжение/водоотведение":  "💧 Водоснабжение/водоотведение",
+    "ТКО":                          "🗑️ Обращение с ТКО",
+    "Электроэнергетика":            "⚡ Электрика",
+    "Газоснабжение":                "🔵 Газ",
+    "Иное":                         "📁 Иные сферы",
+}
+
+
+def _to_advisor_spheres(expertise_spheres: Optional[List[str]]) -> Optional[List[str]]:
+    """Переводит выбранные сферы Прогнозиста (канонические, см. выше) в
+    словарь сфер Советчика/НПА — для поиска применимых НПА по той же сфере.
+    Значения без соответствия (не должно случаться при штатном списке
+    _EXPERTISE_TO_ADVISOR_SPHERE, но на всякий случай) отбрасываются, а не
+    ломают поиск."""
+    if not expertise_spheres:
+        return None
+    mapped = [_EXPERTISE_TO_ADVISOR_SPHERE[s] for s in expertise_spheres
+              if s in _EXPERTISE_TO_ADVISOR_SPHERE]
+    return mapped or None
+
+
+def fetch_npa_context(article_name: str, justification_summary: str,
+                      spheres: Optional[List[str]] = None,
+                      top_k: int = None) -> List[Dict]:
+    """
+    Ищет применимые НПА по статье затрат (и обоснованию), уточняя по
+    выбранной сфере регулирования — через ту же гибридную инфраструктуру,
+    что использует Советчик (core.advisor.search_vector_db: BM25 + вектор +
+    CrossEncoder reranking). Отдельного диалога с Советчиком не открываем —
+    берём его поисковый слой напрямую, это быстрее и не тянет за собой
+    кэш/сессионные допущения диалогового режима.
+
+    doc_types ограничены НПА-видами (npa/fas/methodics) — "court" (судебная
+    практика) и "local" (закрытая база сегмента) сюда намеренно не входят:
+    итоговое резюме прогноза не должно зависеть от того, что видно только
+    одному сегменту.
+
+    Мягкий отказ: при любой ошибке (Советчик/база недоступны) возвращает
+    [] — резюме в этом случае строится только по найденной практике
+    регуляторов, с явной пометкой об отсутствии НПА (см.
+    _format_npa_context).
+    """
+    if top_k is None:
+        top_k = int(load_predictor_config().get("summary_npa_top_k", 6))
+
+    _query_chars = 400
+    query = article_name
+    if justification_summary:
+        query = f"{article_name} {justification_summary[:_query_chars]}"
+
+    try:
+        from core.advisor import search_vector_db
+        sources = search_vector_db(
+            query, top_k=top_k, spheres=spheres or None,
+            doc_types=["npa", "fas", "methodics"],
+        )
+        return sources or []
+    except Exception as e:
+        print(f"[PREDICTOR SUMMARY] Поиск по НПА не удался: {e}")
+        return []
+
+
+def _format_npa_context(npa_sources: List[Dict], max_chars: int = 6000) -> str:
+    """Форматирует найденные НПА-источники в текстовый блок для промпта резюме."""
+    if not npa_sources:
+        return "(по данной статье и выбранной сфере в базе НПА ничего не найдено)"
+    parts = []
+    budget = max_chars
+    for i, src in enumerate(npa_sources, 1):
+        art     = f", п. {src['article']}" if src.get("article") else ""
+        header  = f"[{i}] {src.get('file', 'Неизвестно')}{art}:\n"
+        snippet = src.get("snippet", "")
+        available = budget - len(header)
+        if available <= 100:
+            break
+        if len(snippet) > available:
+            snippet = snippet[:available] + "…"
+        parts.append(header + snippet)
+        budget -= len(header) + len(snippet)
+        if budget <= 0:
+            break
+    return "\n\n---\n\n".join(parts) if parts else "(по данной статье и выбранной сфере в базе НПА ничего не найдено)"
+
+
+def _format_expertise_context(agg: Dict, max_per_side: int = 6, max_chars: int = 6000) -> str:
+    """
+    Форматирует уже найденную практику (positive/negative из aggregate_by_file,
+    топ max_per_side с каждой стороны) в текстовый блок для промпта резюме.
+    Нейтральные источники не включаются — как и в compute_approval_score, они
+    не содержат решения регулятора по заявленной пользователем логике и
+    только размыли бы резюме.
+    """
+    lines = []
+    budget = max_chars
+    for label, key in (("ЗА", "positive"), ("ПРОТИВ", "negative")):
+        all_records = agg.get(key, [])
+        if not all_records:
+            continue
+        lines.append(f"— {label} ({len(all_records)} источник(ов) всего, показаны релевантные):")
+        for rec in all_records[:max_per_side]:
+            quote  = (rec.get("quote") or "").strip()
+            reason = (rec.get("reason") or "").strip()
+            entry  = f"  · {rec.get('file', '—')}: {quote}"
+            if reason:
+                entry += f" ({reason})"
+            if budget - len(entry) <= 0:
+                break
+            lines.append(entry)
+            budget -= len(entry)
+    if not lines:
+        return "(источников практики «за» или «против» не найдено — только нейтральные упоминания либо ничего)"
+    return "\n".join(lines)
+
+
+def generate_prediction_summary(
+    article_name: str,
+    justification_summary: str,
+    agg: Dict,
+    npa_sources: List[Dict],
+    client,
+    model: str,
+) -> Dict:
+    """
+    Формирует краткое итоговое резюме прогноза, опирающееся ОДНОВРЕМЕННО на
+    применимые НПА (fetch_npa_context, уже отфильтрованные по выбранной
+    сфере) и на практику регуляторов (агрегированные за/против из уже
+    классифицированных прецедентов). Сбой LLM здесь не должен ронять уже
+    посчитанный прогноз — см. вызов в run_prediction.
+
+    Возвращает {"text": str} при успехе или {"text": "", "error": str} при
+    сбое.
+    """
+    cfg          = load_predictor_config()
+    prompts      = load_predictor_prompts()
+    max_tokens   = int(cfg.get("summary_max_tokens", 900))
+    max_per_side = int(cfg.get("summary_max_sources", 6))
+
+    npa_context        = _format_npa_context(npa_sources)
+    expertise_context   = _format_expertise_context(agg, max_per_side=max_per_side)
+
+    n_positive = len(agg.get("positive", []))
+    n_negative = len(agg.get("negative", []))
+    n_neutral  = len(agg.get("neutral", []))
+
+    _justify      = (justification_summary or "")[:600]
+    _justify_line = f"Обоснование пользователя: {_justify}\n" if _justify else ""
+
+    system_prompt = prompts["predictor_summary_system"]
+    user_prompt = (
+        prompts["predictor_summary_user"]
+        .replace("{article_name}",       article_name)
+        .replace("{justification_line}", _justify_line)
+        .replace("{npa_context}",        npa_context)
+        .replace("{n_positive}",         str(n_positive))
+        .replace("{n_negative}",         str(n_negative))
+        .replace("{n_neutral}",          str(n_neutral))
+        .replace("{expertise_context}",  expertise_context)
+    )
+
+    raw = _lm_call(client, model, system_prompt, user_prompt, max_tokens=max_tokens)
+    if raw.startswith("[Ошибка LM:"):
+        return {"text": "", "error": raw}
+    return {"text": raw.strip()}
+
+
+# =============================================================================
 # Основная функция прогноза
 # =============================================================================
 def run_prediction(
@@ -1585,12 +1826,17 @@ def run_prediction(
     sources: Optional[List[str]] = None,
     _progress_cb=None,
     force_verification: Optional[bool] = None,
+    with_summary: bool = True,
 ) -> Optional[Dict]:
     """
     Запускает полный цикл прогноза. Возвращает dict с результатами или None при ошибке.
     `sources` — список из {"protocols", "expertise"}; по умолчанию ["expertise"].
     `force_verification` — переключатель второй ("верификационной") ступени
     классификации; см. classify_chunk. None — берётся из конфига.
+    `with_summary` — строить ли итоговое резюме (НПА + практика) после
+    классификации; см. generate_prediction_summary. Управляется чекбоксом в
+    интерфейсе и общим выключателем "enable_summary" в конфиге (оба должны
+    разрешать резюме).
     """
     if not article_name.strip():
         return None
@@ -1695,6 +1941,30 @@ def run_prediction(
         _progress_cb(0.92, "Агрегация результатов…")
     aggregated = aggregate_by_file(classified)
 
+    # 6. Итоговое резюме (НПА по выбранной сфере + практика) — необязательный
+    # шаг, сбой здесь не должен ронять уже посчитанный прогноз (см.
+    # generate_prediction_summary — при ошибке LLM возвращает {"error": ...},
+    # а не бросает исключение).
+    npa_sources    = []
+    summary_result = None
+    _summary_cfg_on = bool(load_predictor_config().get("enable_summary", True))
+    if with_summary and _summary_cfg_on:
+        try:
+            if _progress_cb:
+                _progress_cb(0.94, "Поиск применимых НПА по выбранной сфере…")
+            _summary_spheres = _to_advisor_spheres((filters or {}).get("spheres"))
+            npa_sources = fetch_npa_context(
+                article_name, justification_summary, spheres=_summary_spheres,
+            )
+            if _progress_cb:
+                _progress_cb(0.97, "Формирование краткого резюме…")
+            summary_result = generate_prediction_summary(
+                article_name, justification_summary, aggregated, npa_sources,
+                client, model,
+            )
+        except Exception as e:
+            summary_result = {"text": "", "error": f"[Резюме не сформировано: {e}]"}
+
     return {
         "article":              article_name,
         "query":                search_query,
@@ -1706,6 +1976,8 @@ def run_prediction(
         "top_k":                top_k,
         "filters":              filters or {},
         "sources":              sources,
+        "npa_sources":          npa_sources,
+        "summary":              summary_result,
     }
 
 
@@ -2329,14 +2601,37 @@ def _show_predict_tab():
 
     _PRED_YEARS = _collect_available_years()
 
-    _PRED_SPHERES = [
-        "🔥 Теплоснабжение",
-        "💧 Водоснабжение/водоотведение",
-        "🗑️ Обращение с ТКО",
-        "🔵 Газ",
-        "⚡ Электрика",
-        "📁 Иные сферы",
-    ]
+    # ── Список сфер: берём ДОСЛОВНО из streamlit_pages.expertise_panel.SPHERES
+    # (а не отдельный список меток Советчика/НПА).
+    #
+    # БЫЛО (баг): здесь был свой список меток ("Обращение с ТКО", "Электрика",
+    # "Водоснабжение/водоотведение" и т.п.) — он визуально копировал список
+    # Советчика (_ADV_SPHERES в advisor_page.py), но НЕ совпадал со
+    # значениями, которые реально сохраняются в metadata экспертных
+    # документов (see expertise_panel.SPHERES: "ТКО", "Электроэнергетика",
+    # "Водоснабжение"/"Водоотведение" раздельно). Фильтрация чанков
+    # экспертных заключений — точное совпадение строк
+    # (_filter_candidates_by_where в этом файле), поэтому из шести пунктов
+    # реально совпадало дословно только "Теплоснабжение" — остальные пять
+    # не находили ничего, сколько бы документов этой сферы ни было
+    # загружено. Используя тот же список, что и при индексации, гарантируем
+    # точное совпадение всегда.
+    try:
+        from streamlit_pages.expertise_panel import SPHERES as _EXPERTISE_SPHERES
+    except Exception:
+        _EXPERTISE_SPHERES = [
+            "Теплоснабжение", "Водоснабжение/водоотведение", "ТКО",
+            "Электроэнергетика", "Газоснабжение", "Иное",
+        ]
+    _SPHERE_ICONS = {
+        "Теплоснабжение": "🔥", "Водоснабжение/водоотведение": "💧",
+        "ТКО": "🗑️", "Электроэнергетика": "⚡", "Газоснабжение": "🔵", "Иное": "📁",
+    }
+    # label (с иконкой, для UI) → каноническое значение (как в metadata)
+    _sphere_label_to_canonical = {
+        f"{_SPHERE_ICONS.get(s, '📁')} {s}": s for s in _EXPERTISE_SPHERES
+    }
+    _PRED_SPHERES = list(_sphere_label_to_canonical.keys())
 
     filter_spheres_raw = st.multiselect(
         "Сфера регулирования",
@@ -2345,17 +2640,14 @@ def _show_predict_tab():
         key="pred_filter_spheres",
         placeholder="Все сферы — фильтр не применяется",
         help=(
-            "Ограничивает поиск протоколами выбранных сфер. "
-            "Если не выбрано — поиск по всем протоколам."
+            "Ограничивает поиск экспертными заключениями выбранных сфер "
+            "(точное совпадение со значением, сохранённым при загрузке "
+            "документа — см. вкладку «Протоколы/Экспертные» в Админке). "
+            "Если не выбрано — поиск по всем сферам, включая документы, "
+            "где сфера не была распознана при загрузке."
         ),
     )
-    # Убираем эмодзи для сравнения с метаданными ChromaDB
-    # (в базе хранится "Теплоснабжение", а не "🔥 Теплоснабжение")
-    import re as _re
-    def _strip_emoji(s: str) -> str:
-        return _re.sub(r"^[𐀀-􏿿☀-➿︀-️‍]+\s*", "", s).strip()
-
-    filter_spheres = [_strip_emoji(s) for s in filter_spheres_raw]
+    filter_spheres = [_sphere_label_to_canonical[s] for s in filter_spheres_raw]
     if filter_spheres:
         st.caption(f"Фильтр: **{'  ·  '.join(filter_spheres_raw)}**")
 
@@ -2484,6 +2776,18 @@ def _show_predict_tab():
                 "⚠️ Вторая проверка отключена — positive/negative от первого "
                 "этапа не будут понижаться до нейтральных."
             )
+        enable_summary = st.checkbox(
+            "Формировать краткое резюме (НПА + практика)",
+            value=bool(load_predictor_config().get("enable_summary", True)),
+            key="pred_enable_summary",
+            help=(
+                "После расчёта прогноза дополнительно ищутся применимые НПА "
+                "по выбранной сфере регулирования и формируется краткое "
+                "резюме, опирающееся одновременно на найденные нормы и на "
+                "практику регуляторов (источники «за»/«против» из "
+                "результатов ниже). Увеличивает время расчёта на 15–40 сек."
+            ),
+        )
 
     # ── Кнопка запуска ────────────────────────────────────────────────────────
     st.divider()
@@ -2508,6 +2812,7 @@ def _show_predict_tab():
                 "top_k":         top_k,
                 "sources":       selected_sources,
                 "enable_verification": enable_verification,
+                "enable_summary": enable_summary,
                 "filters": {
                     k: v for k, v in {
                         "spheres":  filter_spheres,   # список без эмодзи
@@ -2553,6 +2858,7 @@ def _show_predict_tab():
                 sources           = params.get("sources", ["expertise"]),
                 _progress_cb      = _progress,
                 force_verification= params.get("enable_verification"),
+                with_summary      = params.get("enable_summary", True),
             )
 
         progress_bar.progress(1.0, text="Готово")
@@ -2734,6 +3040,35 @@ def _show_predict_tab():
         )
 
     st.markdown("")
+
+    # ── Краткое резюме (НПА по выбранной сфере + практика) ──────────────────
+    _summary = result.get("summary")
+    if _summary is not None:
+        st.divider()
+        st.markdown("#### Краткое резюме")
+        if _summary.get("error"):
+            st.caption(f"⚠️ Резюме не сформировано: {_summary['error']}")
+        elif _summary.get("text"):
+            st.markdown(_summary["text"])
+            _npa_srcs = result.get("npa_sources") or []
+            with st.expander(
+                f"На чём основано резюме ({len(_npa_srcs)} НПА · "
+                f"{len(pos)} «за» · {len(neg)} «против»)",
+                expanded=False,
+            ):
+                if _npa_srcs:
+                    st.markdown("**Применимые НПА:**")
+                    for src in _npa_srcs:
+                        _art = f", п. {src['article']}" if src.get("article") else ""
+                        st.caption(f"· {src.get('file', '—')}{_art}")
+                else:
+                    st.caption(
+                        "По данной статье и выбранной сфере в базе НПА "
+                        "ничего не найдено — резюме опирается только на "
+                        "практику регуляторов."
+                    )
+        else:
+            st.caption("Резюме получилось пустым — попробуйте пересчитать прогноз.")
 
     st.divider()
 

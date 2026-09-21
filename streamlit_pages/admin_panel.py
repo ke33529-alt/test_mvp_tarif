@@ -9,6 +9,10 @@
   Поиск и реранкинг
   📝 Промпты
   Прогнозист        — управление протоколами и коллекцией
+  Служебный слой    — пояснения и внутренняя терминология, которые
+                      учитываются в ответах Советчика, но не показываются
+                      пользователю как источник (см. streamlit_pages/
+                      hidden_layer_panel.py и core/advisor.py)
 """
 from __future__ import annotations
 import os
@@ -22,6 +26,7 @@ from core.feedback import get_feedback
 from streamlit_pages.admin_predictor_tab import show_predictor_tab
 from streamlit_pages.expertise_panel import show_documents_panel
 from streamlit_pages.expertise_chunking_panel import show_expertise_chunking_panel
+from streamlit_pages.hidden_layer_panel import show_hidden_layer_panel
 
 
 # ── Общие константы, доступные всем вкладкам ──────────────────────────────
@@ -119,8 +124,8 @@ def show_admin_panel():
         # Загружаем общий словарь сфер один раз для всех вкладок
         spheres_map = _load_spheres_map()
 
-        tab_analytics, tab_docs, tab_chunking, tab_search, tab_prompts, tab_predictor, tab_claim_rag, tab_expertise, tab_expertise_chunking = st.tabs(
-            ["📈 Аналитика ИИ", "📚 НПА", "⚙️ Чанкование НПА", "Поиск и реранкинг", "📝 Промпты", "Прогнозист", "📋 Анализатор заявок", "📑 Протоколы/Экспертные", "⚙️ Чанкование экспертных"],
+        tab_analytics, tab_docs, tab_chunking, tab_search, tab_prompts, tab_predictor, tab_claim_rag, tab_expertise, tab_expertise_chunking, tab_hidden = st.tabs(
+            ["📈 Аналитика ИИ", "📚 НПА", "⚙️ Чанкование НПА", "Поиск и реранкинг", "📝 Промпты", "Прогнозист", "📋 Анализатор заявок", "📑 Протоколы/Экспертные", "⚙️ Чанкование экспертных", "🔒 Служебный слой"],
             on_change="rerun",
         )
 
@@ -1268,6 +1273,54 @@ def show_admin_panel():
                         "positive=включена, negative=снижена/отклонена, neutral=без решения/не по теме\n"
                         'JSON: {{"decision":"?","quote":"до 100 симв.","reason":"до 80 симв."}}'
                     ),
+                    # ── Прогнозист решений: итоговое резюме (НПА + практика) ─────
+                    "predictor_summary_system": (
+                        "Ты — тарифный эксперт РФ. Твоя задача — по уже готовым "
+                        "материалам подготовить краткое итоговое резюме для "
+                        "специалиста, работающего над обоснованием статьи затрат "
+                        "в тарифной заявке.\n\n"
+                        "У тебя есть два независимых источника, оба уже собраны и "
+                        "предоставлены ниже — сам поиск не твоя задача:\n"
+                        "1. ПРИМЕНИМЫЕ НПА — нормативные акты и методические "
+                        "документы по данной статье затрат и сфере регулирования, "
+                        "найденные в базе.\n"
+                        "2. ПРАКТИКА РЕГУЛЯТОРОВ — прецеденты (протоколы/экспертные "
+                        "заключения РЭК), уже классифицированные как «за» или "
+                        "«против» той же логики обоснования, которую заявляет "
+                        "пользователь.\n\n"
+                        "ПРАВИЛА:\n"
+                        "- Отвечай только на русском языке, связным текстом (не "
+                        "JSON, без списков-буллетов), 3–5 предложений.\n"
+                        "- Сначала кратко скажи, что требует НПА по этой статье. "
+                        "Если НПА не найдены — прямо укажи это одним предложением "
+                        "и не выдумывай нормы.\n"
+                        "- Затем скажи, что показывает практика регуляторов: "
+                        "согласуется ли она с требованиями НПА, преобладает «за» "
+                        "или «против», и по какой причине (опирайся на "
+                        "quote/reason источников практики).\n"
+                        "- Если НПА и практика расходятся — явно укажи это как "
+                        "отдельный риск для заявителя.\n"
+                        "- Не повторяй источники дословно — обобщай.\n"
+                        "- Не упоминай процент вероятности одобрения — он уже "
+                        "показан пользователю отдельно, дублировать не нужно.\n"
+                        "- Если оба источника пусты — сообщи об этом одним "
+                        "предложением и не придумывай содержание.\n"
+                        "Ответь сразу текстом резюме, без вступления и без "
+                        "цитирования этой инструкции."
+                    ),
+                    "predictor_summary_user": (
+                        "СТАТЬЯ ЗАТРАТ: {article_name}\n"
+                        "{justification_line}\n"
+                        "=== ПРИМЕНИМЫЕ НПА ===\n"
+                        "{npa_context}\n"
+                        "=== КОНЕЦ НПА ===\n\n"
+                        "=== ПРАКТИКА РЕГУЛЯТОРОВ (найденные прецеденты) ===\n"
+                        "За: {n_positive} · Против: {n_negative} · Нейтрально (не "
+                        "учитываются в оценке): {n_neutral}\n"
+                        "{expertise_context}\n"
+                        "=== КОНЕЦ ПРАКТИКИ ===\n\n"
+                        "Составь итоговое резюме по правилам из системного промпта."
+                    ),
                 }
                 if os.path.exists(PROMPTS_FILE_ADMIN):
                     try:
@@ -1439,10 +1492,14 @@ def show_admin_panel():
                     st.caption("Промпты классификации чанков протоколов регулятора")
                     with st.expander("ℹ️ Переменные прогнозиста"):
                         st.markdown(
-                            "**Системный:** без переменных — короткий системный контекст для модели\n\n"
-                            "**Пользовательский:** `{article_name}` — статья затрат, "
+                            "**Классификация — системный:** без переменных — короткий системный контекст для модели\n\n"
+                            "**Классификация — пользовательский:** `{article_name}` — статья затрат, "
                             "`{justification_line}` — строка обоснования (пустая если не указано), "
-                            "`{chunk}` — фрагмент протокола"
+                            "`{chunk}` — фрагмент протокола\n\n"
+                            "**Резюме — пользовательский:** `{article_name}`, `{justification_line}`, "
+                            "`{npa_context}` — найденные НПА по статье и сфере, "
+                            "`{expertise_context}` — найденная практика за/против, "
+                            "`{n_positive}` / `{n_negative}` / `{n_neutral}` — счётчики источников"
                         )
 
                     st.markdown("**Системный промпт классификации**")
@@ -1463,16 +1520,43 @@ def show_admin_panel():
                             st.error(f"⚠️ {name} промпт должен содержать {v}")
 
                     st.divider()
+                    st.markdown("**Итоговое резюме — системный промпт (НПА + практика)**")
+                    new_pred_sum_sys = st.text_area(
+                        "", value=current_prompts.get("predictor_summary_system",
+                            DEFAULT_PROMPTS_ADMIN["predictor_summary_system"]),
+                        height=220, key="prompt_pred_sum_sys", label_visibility="collapsed",
+                    )
+
+                    st.markdown("**Итоговое резюме — пользовательский промпт**")
+                    new_pred_sum_usr = st.text_area(
+                        "", value=current_prompts.get("predictor_summary_user",
+                            DEFAULT_PROMPTS_ADMIN["predictor_summary_user"]),
+                        height=220, key="prompt_pred_sum_usr", label_visibility="collapsed",
+                    )
+                    for v, name in [("{article_name}", "Резюме User"), ("{npa_context}", "Резюме User"),
+                                     ("{expertise_context}", "Резюме User")]:
+                        if v not in new_pred_sum_usr:
+                            st.error(f"⚠️ {name} промпт должен содержать {v}")
+
+                    st.divider()
                     _pp1, _pp2 = st.columns([2, 1])
                     with _pp1:
                         if st.button("💾 Сохранить промпты прогнозиста", type="primary",
                                      use_container_width=True, key="save_pred_prompts_btn"):
-                            if "{article_name}" in new_pred_cls_usr and "{chunk}" in new_pred_cls_usr:
+                            _pred_prompts_valid = (
+                                "{article_name}" in new_pred_cls_usr and "{chunk}" in new_pred_cls_usr
+                                and "{article_name}" in new_pred_sum_usr
+                                and "{npa_context}" in new_pred_sum_usr
+                                and "{expertise_context}" in new_pred_sum_usr
+                            )
+                            if _pred_prompts_valid:
                                 os.makedirs(os.path.dirname(PROMPTS_FILE_ADMIN), exist_ok=True)
                                 updated = {
                                     **current_prompts,
                                     "predictor_classify_system": new_pred_cls_sys,
                                     "predictor_classify_user":   new_pred_cls_usr,
+                                    "predictor_summary_system":  new_pred_sum_sys,
+                                    "predictor_summary_user":    new_pred_sum_usr,
                                     "updated_at": datetime.now().isoformat(),
                                 }
                                 with open(PROMPTS_FILE_ADMIN, "w", encoding="utf-8") as f:
@@ -1480,11 +1564,13 @@ def show_admin_panel():
                                 st.success("✅ Промпты прогнозиста сохранены.")
                                 st.rerun()
                             else:
-                                st.error("❌ Исправьте ошибки в промпте")
+                                st.error("❌ Исправьте ошибки в промптах")
                     with _pp2:
                         pred_prompts_json = json.dumps({
                             "predictor_classify_system": new_pred_cls_sys,
                             "predictor_classify_user":   new_pred_cls_usr,
+                            "predictor_summary_system":  new_pred_sum_sys,
+                            "predictor_summary_user":    new_pred_sum_usr,
                         }, ensure_ascii=False, indent=2)
                         st.download_button("📥 Скачать", data=pred_prompts_json.encode("utf-8"),
                                            file_name="predictor_prompts_backup.json",
@@ -1833,6 +1919,13 @@ def show_admin_panel():
         if tab_expertise_chunking.open:
             with tab_expertise_chunking:
                 show_expertise_chunking_panel()
+
+        # Служебный слой знаний: загрузка пояснений, настройки поведения слоя
+        # и проверка того, что подхватывается по конкретному вопросу.
+        # Вся логика — в streamlit_pages/hidden_layer_panel.py.
+        if tab_hidden.open:
+            with tab_hidden:
+                show_hidden_layer_panel()
 
 if __name__ == "__main__":
     pass

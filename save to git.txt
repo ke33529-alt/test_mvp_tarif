@@ -83,3 +83,5 @@ git commit -m "fix: сделан предсказатель"
 
 # 3. Отправить изменения на GitHub
 git push origin main
+
+docker compose restart regula

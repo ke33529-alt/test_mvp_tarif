@@ -63,6 +63,77 @@ def _get_sphere_str(filename: str) -> str:
         pass
     return ""
 
+
+# =============================================================================
+# ПЕРЕОПРЕДЕЛЕНИЕ ВИДА ДОКУМЕНТА (config/doc_types_override.json)
+# ─────────────────────────────────────────────────────────────────────────────
+# ЗАЧЕМ. detect_doc_type() из core/chunker.py определяет вид документа по
+# ключевым словам в ИМЕНИ ФАЙЛА ('приказ' → npa, 'фас' → fas и т.д.) и может
+# вернуть только один из четырёх известных ему типов или 'unknown'. Новый вид
+# — служебный слой знаний ('hidden') — она вернуть не может в принципе, и
+# дописывать его туда нельзя: на detect_doc_type завязаны также Прогнозист
+# и Анализатор заявок, а имена файлов слоя произвольны.
+#
+# РЕШЕНИЕ. Отдельный конфиг-карта {"имя_файла.txt": "hidden"}, который имеет
+# приоритет над автоопределением. Заполняется из Админки (вкладка «Служебный
+# слой»), формат такой же, как у config/doc_spheres.json — по имени файла.
+#
+# ВАЖНО: переиндексация всей базы не нужна. Достаточно переиндексировать
+# только те файлы, для которых вид переопределён.
+# =============================================================================
+_DOC_TYPES_OVERRIDE_CFG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "doc_types_override.json"
+)
+
+# Служебный слой — тот же тип, что и в core/advisor.py (HIDDEN_DOC_TYPE).
+# Дублируется константой, а не импортируется, чтобы не создавать циклический
+# импорт advisor ↔ indexer (advisor уже импортирует _get_chroma_client отсюда).
+HIDDEN_DOC_TYPE = "hidden"
+
+# Папка для файлов служебного слоя. Намеренно НЕ входит в CATEGORY_FOLDERS
+# админки — файлы слоя не должны появляться в общем списке НПА.
+HIDDEN_RAW_FOLDER = "hidden"
+
+
+def load_doc_types_override() -> dict:
+    """Возвращает карту {имя_файла: вид_документа} или {}."""
+    try:
+        cfg = os.path.normpath(_DOC_TYPES_OVERRIDE_CFG)
+        if os.path.exists(cfg):
+            with open(cfg, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            return m if isinstance(m, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_doc_types_override(m: dict) -> None:
+    """Сохраняет карту переопределений видов документов."""
+    cfg = os.path.normpath(_DOC_TYPES_OVERRIDE_CFG)
+    os.makedirs(os.path.dirname(cfg), exist_ok=True)
+    with open(cfg, "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+
+
+def _get_doc_type_override(filename: str) -> str:
+    """Вид документа из конфига переопределений или "" если не задан."""
+    try:
+        return str(load_doc_types_override().get(os.path.basename(filename), "") or "")
+    except Exception:
+        return ""
+
+
+def resolve_doc_type(filepath: str) -> str:
+    """
+    Итоговый вид документа: переопределение из конфига имеет приоритет
+    над автоопределением по имени файла.
+    """
+    override = _get_doc_type_override(os.path.basename(filepath))
+    if override:
+        return override
+    return detect_doc_type(filepath, CONFIG_FILE)
+
 # =============================================================================
 # Импорты с обработкой ошибок
 # =============================================================================
@@ -578,6 +649,11 @@ def index_file(file_path, category="npa", extra_metadata: dict = None):
       extra_metadata = {"sphere": "Теплоснабжение", "region": "Тамбовская область",
                         "organization": "ООО ТеплоСеть", "date": "2024-11-15",
                         "file": "Протокол_2024-11-15.pdf"}
+
+    ВИД ДОКУМЕНТА берётся через resolve_doc_type(): переопределение из
+    config/doc_types_override.json имеет приоритет над автоопределением по
+    имени файла. Так файл попадает в СЛУЖЕБНЫЙ СЛОЙ (doc_type="hidden") —
+    см. комментарий к _DOC_TYPES_OVERRIDE_CFG выше.
     """
     try:
         if not LANGCHAIN_AVAILABLE:
@@ -606,13 +682,19 @@ def index_file(file_path, category="npa", extra_metadata: dict = None):
         print(f"[DIAG] mode={settings.get('chunking_mode','structural')} | max={settings.get('max_chunk_length',900)} | min={settings.get('min_chunk_length',50)} | overlap={settings.get('chunk_overlap',0)}")
         print(f"[DIAG] no_cut_word={settings.get('no_cut_word',True)} | no_cut_sentence={settings.get('no_cut_sentence',True)} | no_cut_paragraph={settings.get('no_cut_paragraph',False)}")
         print(f"[DIAG] Документов от загрузчика: {len(docs)}")
+
+        _resolved_type = resolve_doc_type(file_path)
+        if _resolved_type == HIDDEN_DOC_TYPE:
+            print(f"[HIDDEN] {os.path.basename(file_path)} индексируется как "
+                  f"СЛУЖЕБНЫЙ СЛОЙ (в источниках показываться не будет)")
+
         chunks = []
         for doc in docs:
             base_metadata = {
                 'filename': os.path.basename(doc.metadata.get('source', '')),
                 'filepath': doc.metadata.get('source', ''),
                 'category': category,
-                'doc_type': detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
+                'doc_type': _resolved_type,
                 'indexed_at': datetime.now().isoformat()
             }
             file_metadata = extract_metadata_from_filename(doc.metadata.get('source', ''), CONFIG_FILE)
@@ -666,9 +748,14 @@ def index_file(file_path, category="npa", extra_metadata: dict = None):
                 # Поле "file" — читаемое имя источника для советчика и прогнозиста
                 "file":          _file_label,
             }
-            # Накладываем extra_metadata поверх стандартных полей
+            # Накладываем extra_metadata поверх стандартных полей.
+            # ВАЖНО: doc_type служебного слоя перетирать нельзя — иначе файл
+            # выпадет из слоя и начнёт показываться в обычных источниках.
             if _extra:
-                chunk_meta.update(_extra)
+                _extra_safe = dict(_extra)
+                if chunk_meta.get("doc_type") == HIDDEN_DOC_TYPE:
+                    _extra_safe.pop("doc_type", None)
+                chunk_meta.update(_extra_safe)
             metadatas.append(chunk_meta)
 
         BATCH = 100
@@ -679,7 +766,7 @@ def index_file(file_path, category="npa", extra_metadata: dict = None):
                 metadatas=metadatas[start:start+BATCH]
             )
 
-        return {"status": "success", "chunks": len(chunks)}
+        return {"status": "success", "chunks": len(chunks), "doc_type": _resolved_type}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -735,7 +822,7 @@ def index_file_to_collection(
                 'filename':   os.path.basename(doc.metadata.get('source', '')),
                 'filepath':   doc.metadata.get('source', ''),
                 'category':   collection_name,
-                'doc_type':   detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
+                'doc_type':   resolve_doc_type(doc.metadata.get('source', '')),
                 'indexed_at': datetime.now().isoformat(),
             }
             file_metadata = extract_metadata_from_filename(doc.metadata.get('source', ''), CONFIG_FILE)
@@ -935,6 +1022,57 @@ def remove_file_from_index(filename: str):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+# =============================================================================
+# СЛУЖЕБНЫЙ СЛОЙ: помощники для Админки
+# =============================================================================
+def hidden_layer_dir() -> str:
+    """Папка с исходными файлами служебного слоя (создаётся при первом вызове)."""
+    p = os.path.join(RAW_DIR, HIDDEN_RAW_FOLDER)
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def mark_as_hidden(filename: str) -> None:
+    """Помечает файл как относящийся к служебному слою."""
+    m = load_doc_types_override()
+    m[os.path.basename(filename)] = HIDDEN_DOC_TYPE
+    save_doc_types_override(m)
+
+
+def unmark_hidden(filename: str) -> None:
+    """Снимает пометку служебного слоя с файла."""
+    m = load_doc_types_override()
+    if m.pop(os.path.basename(filename), None) is not None:
+        save_doc_types_override(m)
+
+
+def get_hidden_chunk_index() -> dict:
+    """
+    {имя_файла: {"chunks": N, "indexed_at": "YYYY-MM-DD"}} по чанкам слоя.
+    Пустой словарь — слой ещё не проиндексирован.
+    """
+    out = {}
+    try:
+        client = _get_chroma_client()
+        try:
+            collection = client.get_collection(name="tariff_docs")
+        except Exception:
+            return out
+        res = collection.get(where={"doc_type": HIDDEN_DOC_TYPE},
+                             include=["metadatas"])
+        for meta in res.get("metadatas", []) or []:
+            fn = (meta or {}).get("filename", "")
+            if not fn:
+                continue
+            if fn not in out:
+                _ia = (meta or {}).get("indexed_at", "")
+                out[fn] = {"chunks": 0, "indexed_at": _ia[:10] if _ia else "—"}
+            out[fn]["chunks"] += 1
+    except Exception as e:
+        print(f"[HIDDEN] Не удалось получить индекс слоя: {e}")
+    return out
+
 # =============================================================================
 # ОРИГИНАЛЬНАЯ ФУНКЦИЯ REBUILD_INDEX (ОБНОВЛЕНА С УМНЫМ ЧАНКОВАНИЕМ)
 # =============================================================================
@@ -1024,7 +1162,7 @@ def rebuild_index():
         base_metadata = {
             'filename':   os.path.basename(doc.metadata.get('source', '')),
             'filepath':   doc.metadata.get('source', ''),
-            'doc_type':   detect_doc_type(doc.metadata.get('source', ''), CONFIG_FILE),
+            'doc_type':   resolve_doc_type(doc.metadata.get('source', '')),
             'sphere':     _get_sphere_str(os.path.basename(doc.metadata.get('source', ''))),
             'indexed_at': datetime.now().isoformat(),
         }

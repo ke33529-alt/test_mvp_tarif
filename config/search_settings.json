@@ -3,5 +3,11 @@
   "candidates_per_var": 40,
   "context_max_chars": 30000,
   "reranker_enabled": true,
-  "reranker_model": "DiTy/cross-encoder-russian-msmarco"
+  "reranker_model": "DiTy/cross-encoder-russian-msmarco",
+  "hidden_layer_enabled": true,
+  "hidden_top_k": 8,
+  "hidden_min_score": -1.5,
+  "hidden_neighbor_radius": 0,
+  "hidden_max_chars": 2000,
+  "hidden_query_expansion": true
 }

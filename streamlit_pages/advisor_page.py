@@ -28,6 +28,34 @@ UI Советчика по нормативной базе
   local_kb_{org_id} (см. core/local_kb.py). Обрабатывается внутри
   core.advisor.search_vector_db по значению "local" в doc_types.
 
+СЛУЖЕБНЫЙ СЛОЙ И ВНУТРЕННИЙ РЕЖИМ
+──────────────────────────────────
+Служебный слой — пояснения и внутренняя терминология организации. Они
+влияют на ответ, но НИКОГДА не показываются пользователю как источник:
+здесь они вообще не попадают в список sources — core.advisor отдаёт их
+отдельным значением (search_hidden_layer), а страница только показывает
+нейтральную пометку «учтены служебные пояснения». Полная архитектура и
+причины — большой комментарий в начале core/advisor.py.
+
+Внутренний режим — пункт «🔒 Только служебный слой (без источников)» в
+мультиселекте «Вид документа». Поиск по НПА и по локальной базе не
+выполняется вообще: модель отвечает на своих знаниях плюс служебный
+слой, источники не показываются. Нужен специалистам для внутренних
+вопросов, где ссылки на нормативку не требуются.
+
+УТОЧНЕНИЕ ПЕРЕЧНЯ НПА
+──────────────────────
+Кнопка «Уточнить перечень НПА» под фильтрами открывает диалог с таблицей
+документов, подходящих под выбранную сферу/вид/статус. Пользователь снимает
+галки с ненужных, и ответ строится ТОЛЬКО по чанкам оставшихся документов.
+UI вынесен в core/npa_filter_ui.py, фильтр уходит в поиск параметром
+filenames (см. core.advisor.search_vector_db — он применяется ВНУТРИ поиска,
+до ранжирования, а не постфактум).
+
+Кнопка неактивна, пока не выбрана сфера: без неё список документов — это вся
+база целиком. Во внутреннем режиме («Только служебный слой») уточнение не
+показывается вовсе: поиск по документам там не выполняется.
+
 Быстрый выбор из задач:
   Кнопка «Выбрать из задач» над полем запроса открывает модалку со списком
   личных задач (core/tasks.py). Выбранная задача подставляет свой текст в
@@ -560,6 +588,10 @@ def show_advisor():
             "🏛️ Судебная практика":      "court",
             "📋 Методички и разъяснения": "methodics",
             "📁 Локальная база сегмента": "local",
+            # Внутренний режим: выбирается ТОЛЬКО он (см. ниже _internal_mode).
+            # Поиск по документам не выполняется вообще, источники не
+            # показываются — обрабатывается в core.advisor._split_doc_types.
+            "🔒 Только служебный слой (без источников)": "hidden_only",
         }
 
         _flt_col1, _flt_col2 = st.columns(2)
@@ -580,15 +612,40 @@ def show_advisor():
                 default=["📜 Общие НПА"],
                 key="advisor_doc_types_filter",
                 placeholder="Все виды",
-                help="Ограничьте поиск конкретными видами документов. "
+                help="Ограничьте поиск конкретными видами документов.\n\n"
                      "«Локальная база сегмента» — ваши внутренние документы, "
-                     "видимые только вашей организации.",
+                     "видимые только вашей организации.\n\n"
+                     "«Только служебный слой» — внутренний режим для "
+                     "специалистов: поиск по нормативной базе не выполняется, "
+                     "ответ строится на знаниях модели и служебных пояснениях. "
+                     "Источники в таком ответе не показываются.",
             )
             adv_doc_types = [_ADV_DOC_TYPES[lbl] for lbl in adv_doc_type_labels]
 
         if "local" in adv_doc_types and not _user_org_id:
             st.warning(
                 "«Локальная база сегмента» недоступна: у вашего аккаунта не назначен сегмент."
+            )
+
+        # ── Внутренний режим ─────────────────────────────────────────────────
+        # Включается, только когда «Только служебный слой» выбран ОДИН, без
+        # других видов документов. Если пользователь выбрал его вместе с НПА —
+        # это противоречивый запрос (одновременно «искать в базе» и «не
+        # искать»), поэтому явно предупреждаем и работаем в обычном режиме.
+        _internal_mode = adv_doc_types == ["hidden_only"]
+        if "hidden_only" in adv_doc_types and not _internal_mode:
+            st.warning(
+                "«Только служебный слой» работает лишь когда выбран один, без "
+                "других видов документов. Сейчас он не действует — снимите "
+                "остальные галочки, чтобы включить внутренний режим."
+            )
+            adv_doc_types = [dt for dt in adv_doc_types if dt != "hidden_only"]
+        elif _internal_mode:
+            st.info(
+                "**Внутренний режим.** Поиск по нормативной базе отключён: "
+                "ответ строится на знаниях модели и служебных пояснениях. "
+                "Источники показываться не будут — конкретные нормы "
+                "перепроверяйте в обычном режиме."
             )
 
         # ── Статус документа ─────────────────────────────────────────────────
@@ -615,6 +672,29 @@ def show_advisor():
             _active_filters.append("виды: " + "  \xb7  ".join(adv_doc_type_labels))
         if _active_filters:
             st.caption("Активен фильтр: **" + "   |   ".join(_active_filters) + "**")
+
+        # ── Уточнение перечня НПА ────────────────────────────────────────────
+        # Кнопка + диалог с таблицей документов. Во внутреннем режиме не
+        # показывается: поиск по документам там не выполняется вообще, и
+        # уточнять нечего.
+        #
+        # Импорт локальный — как и остальные обращения к core в этом файле:
+        # core.npa_filter_ui тянет за собой core.advisor, а тот при импорте
+        # стартует фоновую предзагрузку моделей. Держим это внутри рендера
+        # страницы, а не на уровне модуля.
+        _npa_filenames = None
+        if not _internal_mode:
+            from core.npa_filter_ui import render_npa_filter, get_selected_filenames
+            render_npa_filter(
+                spheres=adv_spheres if adv_spheres else None,
+                doc_types=adv_doc_types if adv_doc_types else None,
+                doc_status=adv_doc_status,
+            )
+            _npa_filenames = get_selected_filenames(
+                spheres=adv_spheres if adv_spheres else None,
+                doc_types=adv_doc_types if adv_doc_types else None,
+                doc_status=adv_doc_status,
+            )
 
         # ── Быстрый выбор из задач ───────────────────────────────────────────
         # Кнопка открывает модалку со списком личных задач; выбранная задача
@@ -646,11 +726,21 @@ def show_advisor():
                     from core.advisor import (
                         search_faq, search_vector_db, stream_ai_answer,
                         strip_thinking_blocks, set_sources_only_mode,
+                        search_hidden_layer,
                     )
                     set_sources_only_mode(st.session_state.sources_only_mode)
                     start_time = datetime.now()
 
-                    faq_results = search_faq(query)
+                    # Во внутреннем режиме FAQ не используем: он отвечает
+                    # готовыми текстами по нормативке, а здесь запрошен ответ
+                    # специалисту без опоры на базу документов.
+                    #
+                    # При активном уточнении перечня НПА FAQ тоже пропускаем:
+                    # пользователь явно потребовал ответ по конкретным
+                    # документам, а готовый текст из FAQ к ним отношения не
+                    # имеет и выглядел бы как игнорирование фильтра.
+                    faq_results = ([] if (_internal_mode or _npa_filenames)
+                                   else search_faq(query))
                     if faq_results:
                         answer  = faq_results[0]["answer"]
                         sources = [{"snippet": faq_results[0]["question"],
@@ -658,19 +748,39 @@ def show_advisor():
                         st.success("Ответ из базы частых вопросов")
                         st.markdown(f"### Ответ:\n{answer}")
                         from_faq = True
+                        _hidden_sources = []
                     else:
                         with st.spinner("Ищем в базе знаний..."):
                             _effective_top_k = st.session_state.get("_adv_top_k", top_k)
+                            # Служебный слой ищется ОТДЕЛЬНО и в sources не
+                            # попадает никогда — ни в обычном режиме, ни во
+                            # внутреннем. Дальше он уходит только в промпт.
+                            _hidden_sources = search_hidden_layer(query)
                             sources = search_vector_db(
                                 query,
                                 top_k=_effective_top_k,
                                 spheres=adv_spheres if adv_spheres else None,
                                 doc_types=adv_doc_types if adv_doc_types else None,
                                 doc_status=adv_doc_status,
+                                filenames=_npa_filenames,
                                 org_id=_user_org_id,
+                                hidden_sources=_hidden_sources,
                             )
 
-                        if sources and not st.session_state.sources_only_mode:
+                        # Пустая выдача при активном уточнении почти всегда
+                        # означает не «нет ответа в базе», а «не в этих
+                        # документах» — говорим об этом прямо, иначе
+                        # пользователь решит, что база пуста.
+                        if not sources and _npa_filenames:
+                            st.warning(
+                                f"В выбранных документах ({len(_npa_filenames)} шт.) "
+                                "ничего не найдено. Расширьте перечень в уточнении "
+                                "или переформулируйте вопрос."
+                            )
+
+                        # Во внутреннем режиме sources пуст по определению —
+                        # это не ошибка, генерировать ответ всё равно нужно.
+                        if (sources or _internal_mode) and not st.session_state.sources_only_mode:
                             st.success(f"Ответ сгенерирован ИИ · модель: {st.session_state.advisor_model}")
                             import itertools
                             gen = stream_ai_answer(
@@ -680,6 +790,8 @@ def show_advisor():
                                 user_context=st.session_state.get("_adv_user_context", ""),
                                 answer_length=st.session_state.get("_adv_answer_length", "short"),
                                 org_id=_user_org_id,
+                                hidden_sources=_hidden_sources,
+                                internal_mode=_internal_mode,
                             )
                             with st.spinner("Модель формирует ответ..."):
                                 first_token = next(gen, None)
@@ -706,6 +818,13 @@ def show_advisor():
                                         "model":       st.session_state.advisor_model,
                                         "num_sources": len(sources),
                                         "local_kb":    "local" in adv_doc_types,
+                                        # Сам текст пояснений в аудит не пишем —
+                                        # только факт и количество фрагментов.
+                                        "hidden_used":   len(_hidden_sources),
+                                        "internal_mode": _internal_mode,
+                                        # Только количество: имена документов
+                                        # в аудит не пишем.
+                                        "npa_filter":    len(_npa_filenames or []),
                                     },
                                 )
                             except Exception:
@@ -730,6 +849,12 @@ def show_advisor():
                         "from_faq":   from_faq,
                         "from_cache": False,
                         "model":      st.session_state.advisor_model,
+                        # Только КОЛИЧЕСТВО фрагментов слоя — сам текст сюда
+                        # не кладём: last_result уходит в историю, а слой не
+                        # должен становиться видимым ни там, ни где-либо ещё.
+                        "hidden_used":   len(_hidden_sources),
+                        "internal_mode": _internal_mode,
+                        "npa_filter":    len(_npa_filenames or []),
                     }
                     st.session_state.last_query       = query
                     st.session_state.search_triggered = True
@@ -815,8 +940,34 @@ def show_advisor():
                     elif st.session_state.sources_only_mode:
                         st.info("В режиме тестов LLM отключён.")
 
+                # ── Пометка об учёте служебных пояснений ─────────────────────
+                # Нейтральная строка БЕЗ имён файлов и текста: пользователь
+                # видит, что ответ опирался не только на нормативку, но не
+                # получает доступа к содержимому слоя. Содержимое видно только
+                # администратору на вкладке «Служебный слой» в Админке.
+                if result.get("hidden_used"):
+                    st.caption("Учтены служебные пояснения организации.")
+
+                # ── Пометка об уточнённом перечне НПА ────────────────────────
+                # Без неё ответ, построенный по трём документам, внешне не
+                # отличается от ответа по всей базе — и пользователь не
+                # поймёт, почему знакомая ему норма не попала в источники.
+                if result.get("npa_filter"):
+                    st.caption(
+                        f"Ответ построен по уточнённому перечню: "
+                        f"{result['npa_filter']} документ(ов)."
+                    )
+
                 # ── Источники ────────────────────────────────────────────────
-                if sources:
+                # Во внутреннем режиме источников нет по определению — вместо
+                # пустого блока даём понятное объяснение, иначе выглядит как
+                # будто система «ничего не нашла».
+                if result.get("internal_mode") and not sources:
+                    st.caption(
+                        "Внутренний режим: ответ дан без обращения к базе "
+                        "документов, поэтому источники не приводятся."
+                    )
+                elif sources:
                     with st.expander(f"Источники ({len(sources)})", expanded=False):
                         for i, src in enumerate(sources, 1):
                             _kind_mark = " · 📁 локальная база" \
@@ -912,6 +1063,7 @@ def show_advisor():
                                     stream_clarification_answer as _stream_clar,
                                     strip_thinking_blocks as _strip,
                                     set_sources_only_mode as _set_som,
+                                    search_hidden_layer as _search_hidden,
                                 )
                                 _set_som(False)
 
@@ -919,13 +1071,24 @@ def show_advisor():
                                 _prev_a = _clars[-1]["answer"] if _clars else result.get("answer", "")
 
                                 with st.spinner("Ищем в базе знаний..."):
+                                    # Слой ищем заново по тексту уточнения —
+                                    # тема могла сместиться, и пояснения,
+                                    # подходившие к исходному вопросу, здесь
+                                    # уже могут быть ни при чём.
+                                    _clar_hidden = _search_hidden(clarify_q)
                                     _new_sources = _svdb(
                                         clarify_q,
                                         top_k=st.session_state.get("_adv_top_k", 20),
                                         spheres=adv_spheres if adv_spheres else None,
                                         doc_types=adv_doc_types if adv_doc_types else None,
                                         doc_status=adv_doc_status,
+                                        # Уточняющий вопрос наследует перечень
+                                        # документов: пользователь ограничил
+                                        # консультацию ими, и расширять её
+                                        # молча на всю базу нельзя.
+                                        filenames=_npa_filenames,
                                         org_id=_user_org_id,
+                                        hidden_sources=_clar_hidden,
                                     )
 
                                 st.success(f"Уточнение · модель: {st.session_state.advisor_model}")
@@ -938,6 +1101,8 @@ def show_advisor():
                                     st.session_state.get("_adv_temperature", 0.3),
                                     user_context=st.session_state.get("_adv_user_context", ""),
                                     answer_length=st.session_state.get("_adv_answer_length", "short"),
+                                    hidden_sources=_clar_hidden,
+                                    internal_mode=_internal_mode,
                                 )
                                 with st.spinner("Модель формирует ответ..."):
                                     _first = next(_gen, None)
@@ -949,6 +1114,9 @@ def show_advisor():
                                 st.session_state.clarifications.append({
                                     "query":   clarify_q,
                                     "answer":  _clar_answer,
+                                    # Фрагменты слоя сюда НЕ кладём: уточнения
+                                    # уходят в персистентную историю, а слой
+                                    # нигде не должен становиться видимым.
                                     "sources": _new_sources,
                                 })
 

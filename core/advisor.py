@@ -74,6 +74,47 @@ CACHE_PATH      = os.path.join("data", "cache", "llm_cache.json")
 CONFIG_FILE     = os.path.join("config", "advisor_config.json")
 PROMPTS_FILE    = os.path.join("config", "prompts.json")
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+
+
+# =============================================================================
+# СЛУЖЕБНЫЙ СЛОЙ ЗНАНИЙ («невидимый слой»)
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ЭТО. Документы с пояснениями, внутренней терминологией («птичьим языком»)
+# и общими сведениями, которые ДОЛЖНЫ влиять на ответ, но НИКОГДА не должны
+# показываться пользователю как источник и не должны цитироваться моделью.
+#
+# КАК УСТРОЕНО. Физически чанки лежат в той же коллекции ChromaDB
+# «tariff_docs», отличаются значением метаданного поля doc_type == "hidden"
+# (проставляется при индексации, см. core/indexer.py и
+# config/doc_types_override.json).
+#
+# ПОЧЕМУ НУЖЕН ЖЁСТКИЙ ГЕЙТ, А НЕ ОБЫЧНЫЙ ФИЛЬТР ПО doc_type.
+# Функция _doc_type_match() намеренно пропускает чанки с пустым или "unknown"
+# типом — это обратная совместимость со старыми документами. Кроме того,
+# фильтр по видам документов применяется ТОЛЬКО когда пользователь явно выбрал
+# виды. То есть при выключенном фильтре скрытые чанки прошли бы в обычную
+# выдачу и попали бы в список источников. Поэтому служебный слой вырезается из
+# основного потока кандидатов ОТДЕЛЬНО и БЕЗУСЛОВНО (см. _is_hidden_chunk и
+# места его вызова), независимо от всех остальных фильтров.
+#
+# КАК ПОПАДАЕТ В ОТВЕТ. Отдельным поиском search_hidden_layer() — прямым
+# запросом к ChromaDB с where={"doc_type": "hidden"}. Почему не берём скрытые
+# чанки из общего пула кандидатов: скрытых чанков в базе на порядки меньше, чем
+# обычных, и в топ-60 общего поиска они просто не попадают, даже когда идеально
+# релевантны. Отдельный запрос гарантирует, что мы получим лучшие чанки ИМЕННО
+# среди служебного слоя.
+#
+# Результат уходит в промпт отдельным блоком (см. _build_hidden_context) и
+# НЕ попадает в result["sources"].
+# =============================================================================
+HIDDEN_DOC_TYPE = "hidden"
+
+# Псевдо-значение для мультиселекта «Вид документа» в Советчике: выбран только
+# он — значит включён ВНУТРЕННИЙ РЕЖИМ. Поиск по базе НПА и по локальной базе
+# сегмента не выполняется вообще, модель отвечает на своих знаниях плюс
+# служебный слой. Нужен специалистам для внутренних вопросов, где ссылки на
+# нормативку не требуются и только мешают.
+HIDDEN_ONLY_DOC_TYPE = "hidden_only"
  
 # =============================================================================
 # Промпты
@@ -98,8 +139,39 @@ DEFAULT_PROMPTS = {
         "Фрагменты нормативных документов:\n{context}\n\n"
         "Дай ответ со ссылками на конкретные пункты документов из контекста выше."
     ),
+    # ── Внутренний режим (только служебный слой, без источников) ─────────────
+    # ЗАЧЕМ ОТДЕЛЬНЫЙ ПРОМПТ. Обычный advisor_system требует «опирайся
+    # ИСКЛЮЧИТЕЛЬНО на предоставленный контекст, если ответа нет — сообщи об
+    # этом». Во внутреннем режиме контекста из НПА нет вовсе, и с обычным
+    # промптом модель будет отказываться отвечать на любой вопрос.
+    "advisor_internal_system": (
+        "Ты — эксперт-консультант по тарифному регулированию в Российской Федерации. "
+        "Сейчас ты работаешь во внутреннем режиме: отвечаешь специалисту организации, "
+        "поиск по базе нормативных документов отключён.\n\n"
+        "ПРАВИЛА ОТВЕТА:\n"
+        "1. Отвечай ТОЛЬКО на русском языке.\n"
+        "2. Опирайся на свои профессиональные знания и на служебные пояснения, "
+        "если они приведены ниже. При расхождении служебные пояснения имеют приоритет.\n"
+        "3. НЕ приводи ссылки на конкретные пункты и номера нормативных актов, "
+        "если не уверен в них полностью: база НПА сейчас не подключена, "
+        "и выдуманная ссылка хуже её отсутствия. Лучше опиши суть требования словами.\n"
+        "4. Если вопрос требует точной нормы — прямо скажи, что её нужно проверить "
+        "в обычном режиме Советчика с подключённой базой НПА.\n"
+        "5. Структурируй ответ: списки для перечислений, таблица Markdown для числовых данных.\n"
+        "6. Отвечай по существу, без вводных слов и пересказа вопроса."
+    ),
+    "advisor_internal_user": (
+        "Вопрос специалиста: {query}\n\n"
+        "Дай практический ответ по существу."
+    ),
     "advisor_system_description": "Системный промпт советчика.",
     "advisor_user_description":   "Шаблон запроса. Переменные: {query}, {context}.",
+    "advisor_internal_system_description": (
+        "Системный промпт внутреннего режима (только служебный слой, без источников)."
+    ),
+    "advisor_internal_user_description": (
+        "Шаблон запроса внутреннего режима. Переменная: {query}."
+    ),
 }
  
  
@@ -783,8 +855,47 @@ except ImportError:
     BM25_AVAILABLE = False
     print("[HYBRID] rank_bm25 не установлен. Запустите: pip install rank_bm25")
     print("[HYBRID] Будет использоваться только векторный поиск.")
- 
- 
+
+
+# =============================================================================
+# ФИЛЬТР ПО КОНКРЕТНЫМ ДОКУМЕНТАМ (уточнение перечня НПА в Советчике)
+#
+# ПОЧЕМУ ЭТО НЕ ПОСТФИЛЬТР. Раньше параметр filenames в search_vector_db
+# применялся уже ПОСЛЕ гибридного поиска — к списку кандидатов, отобранных
+# по всей базе. На корпусе в 12k+ чанков это не работает: пул кандидатов —
+# топ-30 по всей базе, и если пользователь оставил 3 документа из 500, их
+# чанков в этом пуле обычно нет вовсе. Постфильтр вырезал всё, поиск
+# возвращал пустоту, и пользователь получал «не найдено релевантных
+# документов» на вопрос, ответ на который в выбранном документе есть.
+#
+# ПРАВИЛЬНО — сузить пространство поиска ДО ранжирования:
+#   вектор : where={"filename": {"$in": [...]}} прямо в collection.query()
+#   BM25   : ограничить перебор позициями чанков выбранных документов
+# Тогда топ-K берётся ВНУТРИ выбранных документов, и RRF сливает два
+# полноценных списка, а не два обрубка.
+#
+# Постфильтр в search_vector_db оставлен как вторая линия защиты — он
+# дешёвый и ловит случай, когда фильтр по какой-то причине не доехал до
+# ретривера (например, fallback-ветка без rank_bm25).
+# =============================================================================
+def _filenames_where(filenames: Optional[List[str]]) -> Optional[dict]:
+    """
+    Собирает where-условие ChromaDB по списку имён файлов.
+
+    Для одного файла — {"filename": "x"}, для нескольких — оператор $in.
+    ChromaDB не принимает $in со списком из одного элемента в старых версиях,
+    поэтому случай одного файла обрабатывается отдельно.
+    """
+    if not filenames:
+        return None
+    uniq = list(dict.fromkeys([f for f in filenames if f]))
+    if not uniq:
+        return None
+    if len(uniq) == 1:
+        return {"filename": uniq[0]}
+    return {"filename": {"$in": uniq}}
+
+
 class HybridRetriever:
     """BM25 + векторный поиск с Reciprocal Rank Fusion."""
  
@@ -793,6 +904,8 @@ class HybridRetriever:
         self.all_docs:  list = []
         self.all_ids:   list = []
         self.all_meta:  list = []
+        # filename → список позиций его чанков в self.all_* (для BM25-фильтра)
+        self._fname_to_idx: dict = {}
         self.bm25 = None
         self._build_index()
  
@@ -822,6 +935,19 @@ class HybridRetriever:
 
         Кэш инвалидируется автоматически при изменении числа чанков в коллекции.
         Для принудительной перестройки: удалить data/bm25_cache.pkl.
+
+        ПРО СЛУЖЕБНЫЙ СЛОЙ. Скрытые чанки (doc_type == "hidden") тоже попадают
+        в этот индекс — это нормально и намеренно: индекс общий, а вырезаются
+        они позже, на этапе формирования результатов (см. _is_hidden_chunk).
+        Исключать их здесь нельзя: тогда сломается search_hidden_layer, которому
+        нужен доступ к тем же метаданным.
+
+        ПРО _fname_to_idx. Карта filename → позиции чанков строится здесь же,
+        одним проходом по уже загруженным метаданным. Она нужна фильтру по
+        конкретным документам: BM25 не умеет where-условий, и без карты
+        пришлось бы на каждый запрос линейно перебирать 12k метаданных.
+        Карта строится ДО проверки BM25_AVAILABLE — она может понадобиться
+        и без BM25 (например, list_documents).
         """
         import pickle
         t0 = time.perf_counter()
@@ -833,6 +959,16 @@ class HybridRetriever:
             self.all_meta = result["metadatas"]
             n = len(self.all_docs)
             print(f"[HYBRID] Загружено {n} чанков за {time.perf_counter()-t0:.2f} сек")
+
+            # ── Карта filename → позиции чанков (для фильтра по документам) ──
+            tm = time.perf_counter()
+            self._fname_to_idx = {}
+            for i, m in enumerate(self.all_meta):
+                fname = (m or {}).get("filename", "")
+                if fname:
+                    self._fname_to_idx.setdefault(fname, []).append(i)
+            print(f"[HYBRID] Карта документов: {len(self._fname_to_idx)} файлов "
+                  f"за {time.perf_counter()-tm:.2f} сек")
 
             if not BM25_AVAILABLE or not self.all_docs:
                 print("[HYBRID] BM25 недоступен, работаем без него.")
@@ -881,36 +1017,68 @@ class HybridRetriever:
 
         except Exception as e:
             print(f"[HYBRID ERROR] Ошибка построения индекса: {e}")
+
+    # ------------------------------------------------------------------
+    # Позиции чанков выбранных документов — для BM25-фильтра
+    # ------------------------------------------------------------------
+    def indices_for_filenames(self, filenames: List[str]) -> set:
+        """Множество позиций в self.all_* для перечисленных файлов."""
+        idx = set()
+        for fname in filenames:
+            idx.update(self._fname_to_idx.get(fname, []))
+        return idx
+
+    def known_filenames(self) -> list:
+        """Список всех имён файлов, известных индексу."""
+        return list(self._fname_to_idx.keys())
  
     # ------------------------------------------------------------------
     # Основной метод поиска
     # ------------------------------------------------------------------
-    def search(self, query: str, top_k: int = 20) -> list:
+    def search(self, query: str, top_k: int = 20,
+               filenames: Optional[List[str]] = None) -> list:
         """
         Возвращает список кандидатов, отсортированных по RRF-score.
         Каждый кандидат: {"id", "doc", "meta", "score", "in_vector", "in_bm25"}
+
+        filenames — если передан непустой список, поиск ведётся ТОЛЬКО внутри
+        этих документов (см. большой комментарий у _filenames_where). Фильтр
+        применяется внутри обеих веток поиска, а не после слияния.
         """
-        vector_hits = self._vector_search(query, top_k)
-        bm25_hits   = self._bm25_search(query, top_k) if self.bm25 else {}
+        where       = _filenames_where(filenames)
+        allowed_idx = None
+
+        if filenames:
+            allowed_idx = self.indices_for_filenames(filenames)
+            if not allowed_idx:
+                print(f"[FILE FILTER] Ни одного чанка по {len(filenames)} "
+                      f"выбранным документам — поиск пуст")
+                return []
+            print(f"[FILE FILTER] Поиск ограничен {len(filenames)} документами "
+                  f"({len(allowed_idx)} чанков)")
+
+        vector_hits = self._vector_search(query, top_k, where=where)
+        bm25_hits   = (self._bm25_search(query, top_k, allowed_idx=allowed_idx)
+                       if self.bm25 else {})
         _bw = _load_search_settings().get("bm25_weight", 1.5)
         return self._rrf_merge(vector_hits, bm25_hits, bm25_weight=_bw)
  
-    def _vector_search(self, query: str, top_k: int) -> dict:
+    def _vector_search(self, query: str, top_k: int,
+                       where: Optional[dict] = None) -> dict:
         """Возвращает {id: {"doc", "meta", "vector_rank"}}"""
         try:
+            kwargs = dict(
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            if where:
+                kwargs["where"] = where
+
             embedding = embed_query(query)
             if embedding is not None:
-                results = self.collection.query(
-                    query_embeddings=embedding,
-                    n_results=top_k,
-                    include=["documents", "metadatas", "distances"],
-                )
+                results = self.collection.query(query_embeddings=embedding, **kwargs)
             else:
-                results = self.collection.query(
-                    query_texts=[query],
-                    n_results=top_k,
-                    include=["documents", "metadatas", "distances"],
-                )
+                results = self.collection.query(query_texts=[query], **kwargs)
  
             hits = {}
             for rank, (id_, doc, meta) in enumerate(zip(
@@ -924,13 +1092,25 @@ class HybridRetriever:
             print(f"[HYBRID] Ошибка векторного поиска: {e}")
             return {}
  
-    def _bm25_search(self, query: str, top_k: int) -> dict:
-        """Возвращает {id: {"doc", "meta", "bm25_rank"}}"""
+    def _bm25_search(self, query: str, top_k: int,
+                     allowed_idx: Optional[set] = None) -> dict:
+        """
+        Возвращает {id: {"doc", "meta", "bm25_rank"}}
+
+        allowed_idx — если задано, ранжирование идёт только по этим позициям
+        (фильтр по конкретным документам). BM25 не поддерживает where-условий,
+        поэтому ограничиваем сам перебор, а не результат.
+        """
         try:
-            tokens     = self._tokenize(query)
-            scores     = self.bm25.get_scores(tokens)
-            top_idx    = sorted(range(len(scores)),
-                                key=lambda i: scores[i], reverse=True)[:top_k]
+            tokens = self._tokenize(query)
+            scores = self.bm25.get_scores(tokens)
+
+            pool = allowed_idx if allowed_idx is not None else range(len(scores))
+            # Нулевые совпадения отбрасываем сразу — они всё равно не нужны
+            candidates_idx = [i for i in pool if scores[i] > 0]
+            top_idx = sorted(candidates_idx,
+                             key=lambda i: scores[i], reverse=True)[:top_k]
+
             return {
                 self.all_ids[i]: {
                     "doc":      self.all_docs[i],
@@ -938,7 +1118,6 @@ class HybridRetriever:
                     "bm25_rank": rank,
                 }
                 for rank, i in enumerate(top_idx)
-                if scores[i] > 0   # отфильтровываем нулевые совпадения
             }
         except Exception as e:
             print(f"[HYBRID] Ошибка BM25: {e}")
@@ -1002,7 +1181,152 @@ def get_hybrid_retriever() -> Optional[HybridRetriever]:
 def invalidate_hybrid_retriever():
     """Принудительно сбрасывает BM25-индекс (вызывать после переиндексации)."""
     sys.modules.pop(_HYBRID_RETRIEVER_KEY, None)
+    invalidate_documents_cache()
     print("[HYBRID] Индекс сброшен. Будет перестроен при следующем запросе.")
+
+
+# =============================================================================
+# РЕЕСТР ДОКУМЕНТОВ — источник данных для датагрида «Уточнение перечня НПА»
+#
+# ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ. Диалогу уточнения нужен список ДОКУМЕНТОВ, а в
+# ChromaDB лежат ЧАНКИ. Тянуть ради этого ещё один полный collection.get()
+# на каждое открытие диалога — это несколько секунд и лишняя память, тогда
+# как HybridRetriever уже держит все метаданные в self.all_meta. Поэтому
+# реестр агрегируется из них, а прямой запрос к ChromaDB — только фоллбэк
+# на случай, когда rank_bm25 не установлен и ретривера нет вовсе.
+#
+# КЭШ. Результат кэшируется по (число_чанков, фильтры): пока база не
+# переиндексирована, ответ не меняется. Сбрасывается вместе с BM25-индексом
+# (см. invalidate_hybrid_retriever) — они инвалидируются по одной причине.
+#
+# СЛУЖЕБНЫЙ СЛОЙ в реестр НЕ попадает никогда: пользователь не должен ни
+# видеть его документы, ни иметь возможность отфильтровать по ним ответ.
+# =============================================================================
+_DOCS_CACHE_KEY = "__regula_ai_docs_registry__"
+_docs_lock      = threading.Lock()
+
+
+def invalidate_documents_cache():
+    """Сбрасывает кэш реестра документов (после переиндексации)."""
+    sys.modules.pop(_DOCS_CACHE_KEY, None)
+
+
+def _iter_all_metadatas() -> list:
+    """
+    Все метаданные чанков коллекции.
+
+    Сначала пытаемся взять у HybridRetriever (они там уже загружены),
+    иначе — прямой запрос к ChromaDB.
+    """
+    retriever = get_hybrid_retriever()
+    if retriever is not None and retriever.all_meta:
+        return retriever.all_meta
+
+    collection = get_chroma_collection()
+    if collection is None:
+        return []
+    try:
+        res = collection.get(include=["metadatas"])
+        return res.get("metadatas") or []
+    except Exception as e:
+        print(f"[DOCS] Не удалось загрузить метаданные: {e}")
+        return []
+
+
+def list_documents(spheres: Optional[List[str]] = None,
+                   doc_types: Optional[List[str]] = None,
+                   doc_status: Optional[str] = "active") -> List[Dict]:
+    """
+    Реестр документов базы НПА для диалога уточнения.
+
+    Фильтры работают ровно по тем же правилам, что и в поиске
+    (_sphere_match / _doc_type_match / _status_match): документы без
+    проставленной сферы, вида или статуса проходят фильтр — обратная
+    совместимость со старыми документами.
+
+    Возвращает список словарей, отсортированный по имени файла:
+        {"filename", "sphere", "doc_type", "doc_status",
+         "valid_from", "valid_to", "category", "chunks"}
+
+    chunks — число чанков документа, ПРОШЕДШИХ фильтр. Полезно в UI:
+    документ с одним чанком почти наверняка недоиндексирован.
+    """
+    _regular_doc_types, _, _ = _split_doc_types(doc_types)
+
+    cache_key = json.dumps(
+        {"s": sorted(spheres or []), "d": sorted(_regular_doc_types or []),
+         "st": doc_status},
+        ensure_ascii=False, sort_keys=True,
+    )
+
+    metas = _iter_all_metadatas()
+    n_chunks = len(metas)
+
+    with _docs_lock:
+        cached = sys.modules.get(_DOCS_CACHE_KEY)
+        if (isinstance(cached, dict)
+                and cached.get("n_chunks") == n_chunks
+                and cache_key in cached.get("data", {})):
+            return cached["data"][cache_key]
+
+    t0 = time.perf_counter()
+    docs: Dict[str, Dict] = {}
+
+    for meta in metas:
+        meta = meta or {}
+
+        # Служебный слой — безусловно вне реестра
+        if _is_hidden_chunk(meta):
+            continue
+
+        fname = meta.get("filename", "")
+        if not fname:
+            continue
+
+        if spheres and not _sphere_match(meta.get("sphere", ""), spheres):
+            continue
+        if _regular_doc_types and not _doc_type_match(meta.get("doc_type", ""),
+                                                      _regular_doc_types):
+            continue
+        if doc_status is not None and not _status_match(meta.get("doc_status", ""),
+                                                        doc_status):
+            continue
+
+        entry = docs.get(fname)
+        if entry is None:
+            docs[fname] = {
+                "filename":   fname,
+                "sphere":     meta.get("sphere", ""),
+                "doc_type":   meta.get("doc_type", ""),
+                "doc_status": meta.get("doc_status", ""),
+                "valid_from": meta.get("valid_from", ""),
+                "valid_to":   meta.get("valid_to", ""),
+                "category":   meta.get("category", ""),
+                "chunks":     1,
+            }
+        else:
+            entry["chunks"] += 1
+            # Метаданные документа берём из первого чанка, но пустые поля
+            # добираем из последующих: индексация не всегда проставляет
+            # всё в каждый чанк.
+            for field in ("sphere", "doc_type", "doc_status",
+                          "valid_from", "valid_to", "category"):
+                if not entry[field] and meta.get(field):
+                    entry[field] = meta.get(field)
+
+    result = sorted(docs.values(), key=lambda d: d["filename"].lower())
+
+    with _docs_lock:
+        cached = sys.modules.get(_DOCS_CACHE_KEY)
+        if not isinstance(cached, dict) or cached.get("n_chunks") != n_chunks:
+            cached = {"n_chunks": n_chunks, "data": {}}
+        cached["data"][cache_key] = result
+        sys.modules[_DOCS_CACHE_KEY] = cached
+
+    print(f"[DOCS] Реестр: {len(result)} документов из {n_chunks} чанков "
+          f"за {time.perf_counter()-t0:.2f} сек "
+          f"(сферы={spheres}, виды={_regular_doc_types}, статус={doc_status})")
+    return result
  
  
 # =============================================================================
@@ -1224,13 +1548,29 @@ def _cache_ttl_seconds() -> int:
 
 
 def get_cache_key(query: str, sources: list, model: str,
-                  namespace: Optional[str] = None) -> str:
+                  namespace: Optional[str] = None,
+                  hidden_sources: Optional[list] = None,
+                  internal_mode: bool = False) -> str:
     """
     Ключ кэша LLM-ответа.
 
     namespace ОБЯЗАТЕЛЬНО входит в хэш: без него ответ, построенный на
     локальной базе одного сегмента, мог бы вернуться пользователю другого.
     Если не передан — определяется автоматически (get_cache_namespace).
+
+    hidden_sources — чанки служебного слоя, подмешанные в промпт. Они ТОЖЕ
+    обязаны входить в ключ, иначе первый же ответ, сгенерированный без слоя
+    (или со старой его редакцией), закэшируется и будет возвращаться вместо
+    ответа со слоем — слой перестанет влиять на всё, кроме самого первого
+    запроса. Скрытый слой невидим в интерфейсе, поэтому такую поломку никто
+    бы не заметил.
+
+    internal_mode — во внутреннем режиме системный промпт другой, значит и
+    ответ другой. Без этого флага ответы двух режимов делили бы один ключ.
+
+    ПРО ФИЛЬТР ДОКУМЕНТОВ. Отдельный компонент ключа для него не нужен:
+    фильтр меняет состав sources, а sources уже входит в хэш. Два разных
+    уточнения перечня НПА дадут разные источники → разные ключи.
     """
     if namespace is None:
         namespace = get_cache_namespace()
@@ -1238,7 +1578,14 @@ def get_cache_key(query: str, sources: list, model: str,
         sorted([x.get('file', '') + x.get('snippet', '')[:100] for x in sources]),
         sort_keys=True,
     )
-    return hashlib.md5(f"{namespace}|||{query}|||{s}|||{model}".encode()).hexdigest()
+    h = json.dumps(
+        sorted([x.get('file', '') + x.get('snippet', '')[:100]
+                for x in (hidden_sources or [])]),
+        sort_keys=True,
+    )
+    mode = "internal" if internal_mode else "normal"
+    raw = f"{namespace}|||{query}|||{s}|||{h}|||{mode}|||{model}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _cache_get(cache_key: str) -> Optional[str]:
@@ -1442,6 +1789,25 @@ DEFAULT_SEARCH_SETTINGS = {
     "context_max_chars":   8000,
     "reranker_enabled":    True,
     "reranker_model":      "DiTy/cross-encoder-russian-msmarco",
+    # ── Служебный слой знаний ────────────────────────────────────────────────
+    # hidden_layer_enabled     — главный выключатель слоя целиком
+    # hidden_top_k             — сколько фрагментов слоя максимум идёт в промпт
+    # hidden_min_score         — порог релевантности по скору реранкера.
+    #                            Скор CrossEncoder — это логит, примерно от -10
+    #                            до +10; 0.0 ≈ «модель считает фрагмент скорее
+    #                            подходящим, чем нет». Без порога слой лез бы
+    #                            в КАЖДЫЙ ответ независимо от темы вопроса.
+    # hidden_neighbor_radius   — соседние чанки вокруг найденного фрагмента
+    #                            слоя (пояснение часто не влезает в один чанк)
+    # hidden_max_chars         — бюджет символов на блок слоя в промпте
+    # hidden_query_expansion   — искать ли нормативку дополнительно по тексту
+    #                            найденного пояснения (см. search_vector_db)
+    "hidden_layer_enabled":  True,
+    "hidden_top_k":          3,
+    "hidden_min_score":      0.0,
+    "hidden_neighbor_radius": 1,
+    "hidden_max_chars":      2500,
+    "hidden_query_expansion": False,
 }
 def _load_search_settings() -> dict:
     """Загружает настройки поиска из конфига. Fallback → DEFAULT_SEARCH_SETTINGS."""
@@ -1449,7 +1815,7 @@ def _load_search_settings() -> dict:
         import streamlit as st
         ss = st.session_state.get("_search_settings")
         if ss:
-            return ss
+            return {**DEFAULT_SEARCH_SETTINGS, **ss}
     except Exception:
         pass
     if os.path.exists(SEARCH_CONFIG_FILE):
@@ -1593,13 +1959,42 @@ def _sphere_match(chunk_sphere_str: str, selected_spheres: list) -> bool:
     return any(s in chunk_sphere_str for s in selected_spheres)
 
 
+def _is_hidden_chunk(meta) -> bool:
+    """
+    True, если чанк принадлежит СЛУЖЕБНОМУ СЛОЮ (см. большой комментарий
+    вверху файла). Такие чанки обязаны вырезаться из любой пользовательской
+    выдачи безусловно — независимо от выбранных фильтров.
+    """
+    return (meta or {}).get("doc_type", "") == HIDDEN_DOC_TYPE
+
+
+def _strip_hidden(candidates: list) -> list:
+    """
+    Жёсткий гейт служебного слоя для списка кандидатов гибридного поиска
+    (элементы вида {"id","doc","meta",...}).
+    """
+    if not candidates:
+        return candidates
+    pre = len(candidates)
+    out = [c for c in candidates if not _is_hidden_chunk(c.get("meta"))]
+    if pre != len(out):
+        print(f"[HIDDEN GATE] Вырезано из обычной выдачи: {pre - len(out)} чанков слоя")
+    return out
+
+
 def _doc_type_match(chunk_doc_type: str, selected_doc_types: list) -> bool:
     """
     Проверяет, подходит ли чанк под фильтр видов документов.
     Чанки без поля doc_type (старые документы / неопределённый тип)
     всегда проходят фильтр — обратная совместимость.
     Значения doc_type: 'npa', 'fas', 'court', 'methodics', 'unknown'.
+
+    Служебный слой ('hidden') не проходит НИКОГДА — даже если кто-то
+    передаст его в selected_doc_types. Это вторая линия защиты; основная —
+    _strip_hidden(), вызываемая безусловно.
     """
+    if chunk_doc_type == HIDDEN_DOC_TYPE:
+        return False
     if not chunk_doc_type or chunk_doc_type == "unknown":
         return True
     return chunk_doc_type in selected_doc_types
@@ -1665,24 +2060,208 @@ def _merge_ranked_lists(primary: list, secondary: list, top_k: int, k: int = 60)
 
 def _split_doc_types(doc_types: Optional[List[str]]) -> tuple:
     """
-    Разбивает список doc_types на (обычные_типы_для_tariff_docs, нужна_ли_локальная_база).
+    Разбивает список doc_types на
+    (обычные_типы_для_tariff_docs, нужна_ли_локальная_база, внутренний_режим).
 
     Примеры:
-      None                       -> (None,  False)  — фильтр выключен, локальная база не запрашивается
-      ["npa"]                    -> (["npa"], False)
-      ["local"]                  -> (None,  True)   — искать ТОЛЬКО в локальной базе сегмента
-      ["npa", "local"]           -> (["npa"], True) — искать и там, и там
+      None                   -> (None,  False, False)  — фильтр выключен
+      ["npa"]                -> (["npa"], False, False)
+      ["local"]              -> (None,  True,  False)  — только локальная база
+      ["npa", "local"]       -> (["npa"], True, False) — и там, и там
+      ["hidden_only"]        -> (None,  False, True)   — ВНУТРЕННИЙ РЕЖИМ:
+                                                         поиск по документам
+                                                         не выполняется вообще
     """
     if not doc_types:
-        return None, False
+        return None, False, False
     include_local = LOCAL_KB_DOC_TYPE in doc_types
-    regular = [dt for dt in doc_types if dt != LOCAL_KB_DOC_TYPE]
-    return (regular if regular else None), include_local
+    hidden_only   = HIDDEN_ONLY_DOC_TYPE in doc_types
+    regular = [
+        dt for dt in doc_types
+        if dt not in (LOCAL_KB_DOC_TYPE, HIDDEN_ONLY_DOC_TYPE, HIDDEN_DOC_TYPE)
+    ]
+    return (regular if regular else None), include_local, hidden_only
+
+
+# =============================================================================
+# СЛУЖЕБНЫЙ СЛОЙ: поиск
+#
+# Отдельный прямой запрос к ChromaDB с where={"doc_type": "hidden"}.
+# Почему не берём скрытые чанки из общего пула кандидатов — см. большой
+# комментарий вверху файла: их на порядки меньше, и в топ общего поиска они
+# не попадают даже при идеальной релевантности.
+#
+# ПРО ФИЛЬТР ДОКУМЕНТОВ. Уточнение перечня НПА на служебный слой НЕ влияет:
+# слой — это внутренние методические пояснения организации, а не источник,
+# который пользователь выбирает в диалоге. Он и в списке документов не
+# показывается (см. list_documents).
+# =============================================================================
+def search_hidden_layer(query: str, top_k: Optional[int] = None) -> list:
+    """
+    Возвращает список фрагментов служебного слоя, релевантных запросу,
+    в том же формате, что и обычные источники, но с source_kind="hidden".
+
+    Пустой список — нормальная ситуация: слой выключен, пуст или ни один
+    фрагмент не прошёл порог релевантности.
+    """
+    ss = _load_search_settings()
+    if not ss.get("hidden_layer_enabled", True):
+        return []
+
+    if top_k is None:
+        top_k = int(ss.get("hidden_top_k", 3))
+    if top_k <= 0:
+        return []
+
+    collection = get_chroma_collection()
+    if collection is None:
+        return []
+
+    t0 = time.perf_counter()
+
+    # Берём с запасом: часть кандидатов отсеет порог релевантности.
+    pool = max(top_k * 4, 10)
+    try:
+        embedding = embed_query(query)
+        if embedding is not None:
+            res = collection.query(
+                query_embeddings=embedding,
+                n_results=pool,
+                where={"doc_type": HIDDEN_DOC_TYPE},
+                include=["documents", "metadatas", "distances"],
+            )
+        else:
+            res = collection.query(
+                query_texts=[query],
+                n_results=pool,
+                where={"doc_type": HIDDEN_DOC_TYPE},
+                include=["documents", "metadatas", "distances"],
+            )
+    except Exception as e:
+        # Коллекция пуста или в ней вообще нет чанков слоя — не ошибка
+        print(f"[HIDDEN] Запрос к слою не выполнен: {e}")
+        return []
+
+    docs  = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
+    ids   = (res.get("ids") or [[]])[0]
+
+    if not docs:
+        print("[HIDDEN] В служебном слое нет подходящих фрагментов")
+        return []
+
+    candidates = []
+    for _id, doc, meta, dist in zip(ids, docs, metas, dists):
+        candidates.append({
+            "id":    _id,
+            "doc":   doc,
+            "meta":  meta or {},
+            "score": 1.0 - float(dist),
+        })
+
+    # ── Реранкинг и порог релевантности ─────────────────────────────────────
+    # Без порога слой подмешивался бы в КАЖДЫЙ ответ: векторный поиск всегда
+    # что-нибудь возвращает, даже когда тема вопроса никак не связана со слоем.
+    reranker = get_reranker() if ss.get("reranker_enabled", True) else None
+    if reranker:
+        candidates = reranker.rerank(query, candidates, top_n=max(top_k * 2, top_k))
+        min_score  = float(ss.get("hidden_min_score", 0.0))
+        before     = len(candidates)
+        candidates = [c for c in candidates
+                      if float(c.get("rerank_score", 0.0)) >= min_score][:top_k]
+        print(f"[HIDDEN] Порог {min_score}: {before} → {len(candidates)} фрагментов")
+    else:
+        # Реранкер выключен — порог применить не к чему (RRF-скор несопоставим
+        # с логитом CrossEncoder). Берём топ по дистанции без отсечения.
+        candidates = candidates[:top_k]
+        print(f"[HIDDEN] Реранкер выключен — взяли топ-{len(candidates)} по вектору")
+
+    if not candidates:
+        return []
+
+    # ── Соседние чанки ──────────────────────────────────────────────────────
+    # Пояснение редко укладывается в один чанк: без соседей модель получает
+    # обрывок фразы и толку от слоя мало.
+    radius    = int(ss.get("hidden_neighbor_radius", 1))
+    neighbors = _fetch_neighbors(candidates, collection, radius)
+
+    sources = []
+    for c in candidates:
+        meta  = c.get("meta") or {}
+        fname = meta.get("filename", "unknown")
+        cidx  = int(meta.get("chunk_index", 0))
+        snippet = neighbors.get((fname, cidx)) or c.get("doc", "")
+        sources.append({
+            "snippet":      snippet,
+            "file":         meta.get("filename", "Служебный слой"),
+            "page":         meta.get("page", ""),
+            "category":     "Служебный слой",
+            "doc_type":     HIDDEN_DOC_TYPE,
+            "doc_status":   "",
+            "article":      meta.get("article", ""),
+            "chunk_index":  meta.get("chunk_index", ""),
+            "distance":     round(max(0.0, 1.0 - c.get("score", 0.0)), 3),
+            "rerank_score": round(float(c.get("rerank_score", 0.0)), 3),
+            "sphere":       "",
+            "source_kind":  "hidden",
+        })
+
+    print(f"[HIDDEN] Подобрано {len(sources)} фрагментов слоя "
+          f"за {time.perf_counter()-t0:.3f} сек")
+    return sources
+
+
+def _build_hidden_context(hidden_sources: Optional[list],
+                          max_chars: Optional[int] = None) -> str:
+    """
+    Собирает блок служебных пояснений для промпта.
+
+    Фрагменты НЕ нумеруются и НЕ подписываются именами файлов — намеренно:
+    любая подпись провоцирует модель сослаться на «документ №2», а этот блок
+    по определению не является цитируемым источником. Вместо этого блок
+    открывается жёсткой инструкцией о том, как им пользоваться.
+    """
+    if not hidden_sources:
+        return ""
+
+    if max_chars is None:
+        max_chars = int(_load_search_settings().get("hidden_max_chars", 2500))
+
+    header = (
+        "СЛУЖЕБНЫЕ ПОЯСНЕНИЯ (внутренняя методическая информация организации).\n"
+        "Как их использовать:\n"
+        "- учитывай их содержание при подготовке ответа наравне с нормативными документами;\n"
+        "- при расхождении с твоими общими знаниями верь этим пояснениям;\n"
+        "- излагай их содержание СВОИМИ СЛОВАМИ, как собственное профессиональное знание.\n"
+        "СТРОГО ЗАПРЕЩЕНО: ссылаться на этот блок, цитировать его, нумеровать как источник, "
+        "упоминать сам факт его существования, писать «согласно пояснению», "
+        "«во внутренней информации указано» и подобные обороты.\n"
+        "---"
+    )
+
+    parts, budget = [], max_chars
+    for src in hidden_sources:
+        if budget <= 0:
+            break
+        text = (src.get("snippet") or "").strip()
+        if not text:
+            continue
+        if len(text) > budget:
+            text = text[:budget] + "..."
+        parts.append(text)
+        budget -= len(text)
+
+    if not parts:
+        return ""
+
+    return header + "\n" + "\n\n".join(parts) + "\n---"
 
 
 def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
                      doc_types: list = None, doc_status: str = "active",
-                     filenames: list = None, org_id: str = None) -> list:
+                     filenames: list = None, org_id: str = None,
+                     hidden_sources: list = None) -> list:
     """
     org_id — идентификатор сегмента текущего пользователя. Требуется только
     когда doc_types содержит "local" (запрос к локальной базе сегмента);
@@ -1691,6 +2270,22 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
     Если org_id не передан — определяется автоматически из session_state
     (get_current_org_id). Явный аргумент имеет приоритет: он нужен для вызовов
     из фоновых потоков, где session_state недоступен.
+
+    filenames — уточнение перечня документов из диалога Советчика. Непустой
+    список означает: искать ТОЛЬКО внутри этих документов. Фильтр уходит
+    внутрь HybridRetriever (where в ChromaDB + ограничение пула BM25), а не
+    применяется к готовому списку кандидатов — иначе на корпусе в 12k чанков
+    выдача почти всегда оказывалась бы пустой (см. комментарий у
+    _filenames_where). Постфильтр ниже оставлен как вторая линия защиты.
+
+    hidden_sources — уже найденные фрагменты служебного слоя (см.
+    search_hidden_layer). Сами они в результат НЕ попадают никогда. Они
+    используются только если включена настройка hidden_query_expansion: их
+    текст добавляется как дополнительный ВАРИАНТ ЗАПРОСА к обычному поиску.
+    Смысл: если в слое написано «ФОТ считаем по 760-э, форма 4.2», то поиск
+    по НПА подтянет 760-э даже когда пользователь спросил своими словами
+    («сколько людей закладывать»). Это даёт эффект второго прохода без
+    второго вызова LLM и без перефраза, который терял бы точные названия.
     """
     t0 = time.perf_counter()
 
@@ -1698,7 +2293,19 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
     # "" превращаем в None — у пользователя без сегмента локальной базы нет.
     org_id = org_id or get_current_org_id() or None
 
-    _regular_doc_types, _include_local = _split_doc_types(doc_types)
+    _regular_doc_types, _include_local, _hidden_only = _split_doc_types(doc_types)
+
+    # Нормализуем список файлов: пустой список — это «фильтр не задан»,
+    # а не «искать в нуле документов».
+    filenames = [f for f in (filenames or []) if f] or None
+
+    # ── Внутренний режим ────────────────────────────────────────────────────
+    # Поиск по документам не выполняется вообще: ни tariff_docs, ни локальная
+    # база. Ответ строится на знаниях модели плюс служебный слой, который
+    # вызывающий код получает отдельно через search_hidden_layer().
+    if _hidden_only:
+        print("[INTERNAL MODE] Поиск по документам отключён — источников нет")
+        return []
 
     # ── Локальная база сегмента ─────────────────────────────────────────────
     # Если выбрано ТОЛЬКО "Локальная база" (без npa/fas/court/methodics и без
@@ -1740,18 +2347,33 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
             ]
         except Exception:
             synonym_variants = []
+
+        # ── Шаг 1б: подсказки из служебного слоя как варианты запроса ───────
+        _ss_pre = _load_search_settings()
+        _hidden_variants = []
+        if hidden_sources and _ss_pre.get("hidden_query_expansion", False):
+            for h in hidden_sources[:2]:
+                _ht = (h.get("snippet") or "").strip()
+                if _ht:
+                    # 400 символов — достаточно, чтобы попали названия
+                    # документов и форм, и мало, чтобы не размыть эмбеддинг.
+                    _hidden_variants.append(_ht[:400])
+            if _hidden_variants:
+                print(f"[HIDDEN EXPANSION] Добавлено вариантов запроса из слоя: "
+                      f"{len(_hidden_variants)}")
  
         # Оригинальный запрос первым, синонимы — после, максимум 3 варианта
-        unique_variants = [query] + synonym_variants[:2]
+        unique_variants = [query] + synonym_variants[:2] + _hidden_variants
  
         if len(unique_variants) > 1:
-            print(f"[SYNONYMS] {len(unique_variants)} вариантов: {unique_variants}")
+            print(f"[SYNONYMS] {len(unique_variants)} вариантов: "
+                  f"{[v[:60] for v in unique_variants]}")
  
         # ── Шаг 2: гибридный поиск по всем вариантам ────────────────────────
         # Для каждого варианта запроса делаем поиск и собираем кандидатов.
         # Один кандидат может встретиться в нескольких вариантах — берём
         # лучший (максимальный) RRF-score.
-        _ss = _load_search_settings()
+        _ss = _ss_pre
         _cands_per_var = int(_ss.get("candidates_per_var", 15))
         # При активном фильтре по сфере или виду документа запрашиваем вдвое больше
         # кандидатов, чтобы компенсировать потери от постфильтрации.
@@ -1761,12 +2383,21 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
  
         merged: dict = {}   # id → candidate dict
         for variant in unique_variants:
-            for c in retriever.search(variant, top_k=_cands_per_var):
+            # filenames уходит ВНУТРЬ поиска — пул кандидатов сразу строится
+            # только из выбранных документов.
+            for c in retriever.search(variant, top_k=_cands_per_var,
+                                      filenames=filenames):
                 cid = c["id"]
                 if cid not in merged or c["score"] > merged[cid]["score"]:
                     merged[cid] = c
  
         candidates = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+        # ── Гейт служебного слоя (БЕЗУСЛОВНО, до всех остальных фильтров) ───
+        # См. большой комментарий вверху файла: обычный фильтр по doc_type
+        # здесь не помогает, потому что он применяется только при явно
+        # выбранных видах документов и пропускает пустой/unknown тип.
+        candidates = _strip_hidden(candidates)
  
         # ── Фильтрация по сфере (до реранкинга) ─────────────────────────────
         if spheres:
@@ -1779,7 +2410,8 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
                   f"по сферам: {spheres}")
 
         # ── Фильтрация по виду документа (до реранкинга) ────────────────────
-        # _regular_doc_types — только npa/fas/court/methodics, "local" уже вырезан.
+        # _regular_doc_types — только npa/fas/court/methodics, служебные
+        # псевдотипы ("local", "hidden_only") уже вырезаны _split_doc_types.
         if _regular_doc_types:
             pre_count  = len(candidates)
             candidates = [
@@ -1802,12 +2434,17 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
                 print(f"[STATUS FILTER] {pre_count} → {len(candidates)} кандидатов "
                       f"статус={doc_status}")
 
+        # Постфильтр по файлам — вторая линия защиты. Основная фильтрация уже
+        # произошла внутри retriever.search(), здесь ловим только случай, когда
+        # в пул каким-то образом просочился чужой чанк.
         if filenames:
             _fn_set = set(filenames)
             _pre = len(candidates)
             candidates = [c for c in candidates
                           if c.get("meta", {}).get("filename", "") in _fn_set]
-            print(f"[FILE FILTER] {_pre} → {len(candidates)} по {len(_fn_set)} файлам")
+            if _pre != len(candidates):
+                print(f"[FILE FILTER] постфильтр: {_pre} → {len(candidates)} "
+                      f"по {len(_fn_set)} файлам")
  
         t1 = time.perf_counter()
         n_overlap = sum(1 for c in candidates if c['in_vector'] and c['in_bm25'])
@@ -1871,7 +2508,13 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
         # ── Шаг 6: если локальная база выбрана ДОПОЛНИТЕЛЬНО к обычным видам —
         # подмешиваем её результаты по РАНГУ (см. _merge_ranked_lists), а не по
         # distance: шкалы pseudo_dist и косинусной дистанции несопоставимы.
-        if _include_local and org_id:
+        #
+        # При активном уточнении перечня НПА локальная база НЕ подмешивается:
+        # пользователь явно ограничил ответ конкретными документами общей базы,
+        # и подмешивать туда документы сегмента — прямое нарушение этого
+        # ограничения (в диалоге уточнения их не было и снять галку было
+        # невозможно).
+        if _include_local and org_id and not filenames:
             try:
                 from core.local_kb import search_local_kb
                 local_sources = search_local_kb(query, org_id, top_k=top_k)
@@ -1883,13 +2526,19 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
                           f"(сегмент {org_id})")
             except Exception as e:
                 print(f"[LOCAL_KB] Ошибка подмешивания: {e}")
+        elif _include_local and org_id and filenames:
+            print("[LOCAL_KB] Пропущена: активно уточнение перечня НПА")
 
         print(f"[TIMING] search_vector_db итого: {time.perf_counter()-t0:.3f} сек")
         return sources
  
     # ── Fallback: чистый векторный поиск ────────────────────────────────────
     print("[TIMING] Fallback — чистый векторный поиск (rank_bm25 не установлен)")
-    _fallback_sources = _pure_vector_search(query, top_k, t0)
+    # Фильтр по файлам уходит прямо в where ChromaDB — постфильтр здесь так же
+    # бесполезен, как и в основной ветке.
+    _fallback_sources = _pure_vector_search(
+        query, top_k, t0, where=_filenames_where(filenames),
+    )
     if spheres:
         _fallback_sources = [
             s for s in _fallback_sources
@@ -1905,7 +2554,7 @@ def search_vector_db(query: str, top_k: int = 5, spheres: list = None,
             s for s in _fallback_sources
             if _status_match(s.get("doc_status", ""), doc_status)
         ]
-    if _include_local and org_id:
+    if _include_local and org_id and not filenames:
         try:
             from core.local_kb import search_local_kb
             local_sources = search_local_kb(query, org_id, top_k=top_k)
@@ -1935,6 +2584,11 @@ def debug_search_candidates(query: str, top_k: int = 5,
                Значение "local" (локальная база сегмента) в этой отладочной
                функции игнорируется — она предназначена только для tariff_docs.
     doc_status: "active" | "pending" | "expired" | None (все).
+    filenames: конкретные документы (уточнение перечня НПА). Как и в боевом
+               поиске, уходит внутрь ретривера, а не применяется постфактум.
+
+    Служебный слой в эту выдачу НЕ попадает — для его проверки есть отдельный
+    тест на вкладке «Служебный слой» в Админке.
     """
     result = {
         "query_variants": [query],
@@ -1945,7 +2599,8 @@ def debug_search_candidates(query: str, top_k: int = 5,
         "error":          None,
     }
 
-    _regular_doc_types, _ = _split_doc_types(doc_types)
+    _regular_doc_types, _, _ = _split_doc_types(doc_types)
+    filenames = [f for f in (filenames or []) if f] or None
 
     t0 = time.perf_counter()
     try:
@@ -1976,12 +2631,16 @@ def debug_search_candidates(query: str, top_k: int = 5,
 
         merged: dict = {}
         for variant in unique_variants:
-            for c in retriever.search(variant, top_k=_cands_per_var):
+            for c in retriever.search(variant, top_k=_cands_per_var,
+                                      filenames=filenames):
                 cid = c["id"]
                 if cid not in merged or c["score"] > merged[cid]["score"]:
                     merged[cid] = c
 
         pre_rerank = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+        # Жёсткий гейт служебного слоя — до всех остальных фильтров
+        pre_rerank = _strip_hidden(pre_rerank)
 
         # Фильтрация по сфере до реранкинга
         if spheres:
@@ -2016,7 +2675,9 @@ def debug_search_candidates(query: str, top_k: int = 5,
             _pre = len(pre_rerank)
             pre_rerank = [c for c in pre_rerank
                           if c.get("meta", {}).get("filename", "") in _fn_set]
-            print(f"[FILE FILTER/debug] {_pre} → {len(pre_rerank)} по {len(_fn_set)} файлам")
+            if _pre != len(pre_rerank):
+                print(f"[FILE FILTER/debug] постфильтр: {_pre} → {len(pre_rerank)} "
+                      f"по {len(_fn_set)} файлам")
 
         result["pre_rerank"] = pre_rerank
 
@@ -2033,6 +2694,42 @@ def debug_search_candidates(query: str, top_k: int = 5,
 
     result["elapsed"] = round(time.perf_counter() - t0, 3)
     return result
+
+
+def debug_hidden_layer(query: str, top_k: Optional[int] = None) -> dict:
+    """
+    Диагностика служебного слоя для вкладки «Служебный слой» в Админке.
+
+    Возвращает:
+      {"total_chunks": сколько чанков слоя в базе,
+       "found": [фрагменты, прошедшие порог],
+       "settings": актуальные настройки слоя,
+       "elapsed": время, "error": текст ошибки или None}
+    """
+    out = {"total_chunks": 0, "found": [], "settings": {},
+           "elapsed": 0.0, "error": None}
+    t0 = time.perf_counter()
+    try:
+        out["settings"] = {
+            k: v for k, v in _load_search_settings().items()
+            if k.startswith("hidden_") or k == "reranker_enabled"
+        }
+        collection = get_chroma_collection()
+        if collection is None:
+            out["error"] = "Коллекция tariff_docs недоступна"
+            return out
+        try:
+            res = collection.get(where={"doc_type": HIDDEN_DOC_TYPE}, include=[])
+            out["total_chunks"] = len(res.get("ids", []))
+        except Exception:
+            out["total_chunks"] = 0
+
+        if query and query.strip():
+            out["found"] = search_hidden_layer(query.strip(), top_k=top_k)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["elapsed"] = round(time.perf_counter() - t0, 3)
+    return out
 
 
 def _is_valid_answer(text: str) -> bool:
@@ -2080,8 +2777,15 @@ def _build_context(sources: list, max_chars: int = None) -> str:
  
  
  
-def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
-    """Оригинальный векторный поиск. Используется как fallback."""
+def _pure_vector_search(query: str, top_k: int = 5, t0=None,
+                        where: Optional[dict] = None) -> list:
+    """
+    Оригинальный векторный поиск. Используется как fallback.
+
+    where — необязательное условие ChromaDB (например, фильтр по конкретным
+    документам из диалога уточнения). Уходит прямо в query(), чтобы сужение
+    работало ДО отбора топ-K, а не после.
+    """
     if t0 is None:
         t0 = time.perf_counter()
  
@@ -2094,18 +2798,16 @@ def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
     print(f"[TIMING] embed_query: {time.perf_counter()-t1:.3f} сек")
  
     try:
+        kwargs = dict(
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+        )
+        if where:
+            kwargs["where"] = where
         if embedding is not None:
-            results = collection.query(
-                query_embeddings=embedding,
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
+            results = collection.query(query_embeddings=embedding, **kwargs)
         else:
-            results = collection.query(
-                query_texts=[query],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
+            results = collection.query(query_texts=[query], **kwargs)
     except Exception as e:
         print(f"[VECTOR DB ERROR] {e}")
         return []
@@ -2121,12 +2823,16 @@ def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
     ):
         if meta is None:
             meta = {}
+        # Жёсткий гейт служебного слоя — и в fallback-ветке тоже
+        if _is_hidden_chunk(meta):
+            continue
         sources.append({
             "snippet":     doc[:800] + ("..." if len(doc) > 800 else ""),
             "file":        meta.get("filename", "Неизвестно"),
             "page":        meta.get("page", ""),
             "category":    meta.get("category", "Общее"),
             "doc_type":    meta.get("doc_type", ""),
+            "doc_status":  meta.get("doc_status", ""),
             "article":     meta.get("article", ""),
             "chunk_index": meta.get("chunk_index", ""),
             "distance":    round(dist, 3),
@@ -2142,6 +2848,50 @@ def _pure_vector_search(query: str, top_k: int = 5, t0=None) -> list:
 def strip_thinking_blocks(text: str) -> str:
     cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+
+# =============================================================================
+# Сборка системного промпта — общая для обычного и внутреннего режима
+# =============================================================================
+_LENGTH_INSTRUCTIONS = {
+    "short":    "8. Отвечай КРАТКО: максимум 3–5 предложений или маркированный список до 5 пунктов. "
+                "Без вводных слов и пересказа вопроса.",
+    "detailed": "8. Отвечай РАЗВЁРНУТО: подробно раскрой тему, приведи все релевантные нормы, "
+                "условия применения и исключения. Используй подзаголовки если тем несколько.",
+}
+
+
+def _build_system_prompt(prompts: dict, user_context: str = "",
+                         answer_length: str = "short",
+                         internal_mode: bool = False) -> str:
+    """
+    Собирает системный промпт: базовый текст + контекст пользователя +
+    инструкция по длине ответа + текущая дата.
+
+    internal_mode переключает базовый текст на advisor_internal_system —
+    обычный промпт требует опираться исключительно на контекст из документов,
+    которого во внутреннем режиме нет вовсе, и модель отказывалась бы отвечать.
+    """
+    key = "advisor_internal_system" if internal_mode else "advisor_system"
+    system_prompt = prompts.get(key, DEFAULT_PROMPTS[key])
+
+    if user_context and user_context.strip():
+        system_prompt = (
+            system_prompt
+            + "\n\n---\nКонтекст пользователя:\n"
+            + user_context.strip()
+        )
+
+    system_prompt = system_prompt + "\n" + _LENGTH_INSTRUCTIONS.get(
+        answer_length, _LENGTH_INSTRUCTIONS["short"]
+    )
+    system_prompt = (
+        system_prompt
+        + "\n\nТекущая дата и время: "
+        + datetime.now().strftime("%d.%m.%Y, %H:%M")
+        + "."
+    )
+    return system_prompt
  
  
 # =============================================================================
@@ -2155,6 +2905,8 @@ def stream_ai_answer(
     user_context: str = "",
     answer_length: str = "short",
     org_id: str = None,
+    hidden_sources: list = None,
+    internal_mode: bool = False,
 ):
     """
     Генератор токенов для Streamlit st.write_stream().
@@ -2164,6 +2916,11 @@ def stream_ai_answer(
     answer_length: "short" — кратко по существу, "detailed" — развёрнуто с пояснениями.
     org_id: сегмент пользователя. Если None — неймспейс кэша определяется
             автоматически из session_state (см. get_cache_namespace).
+
+    hidden_sources: фрагменты служебного слоя. Уходят в промпт отдельным
+            блоком (см. _build_hidden_context) и входят в ключ кэша, но
+            НИКОГДА не показываются пользователю как источник.
+    internal_mode: внутренний режим — без источников, другой системный промпт.
     """
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
@@ -2178,7 +2935,9 @@ def stream_ai_answer(
  
     # Кэш — возвращаем сразу без стриминга (неймспейс вшит в хэш ключа →
     # чужой сегмент физически не может попасть в выдачу)
-    cache_key = get_cache_key(query, sources, model, namespace=namespace)
+    cache_key = get_cache_key(query, sources, model, namespace=namespace,
+                              hidden_sources=hidden_sources,
+                              internal_mode=internal_mode)
     cached_answer = _cache_get(cache_key)
     if cached_answer is not None:
         print(f"[CACHE HIT stream] {model} | ns={namespace}")
@@ -2188,32 +2947,29 @@ def stream_ai_answer(
     # Строим промпт (та же логика что в generate_ai_answer)
     try:
         prompts = load_prompts()
-        context = _build_context(sources)
- 
-        system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
-        if user_context and user_context.strip():
-            system_prompt = (
-                system_prompt
-                + "\n\n---\nКонтекст пользователя:\n"
-                + user_context.strip()
-            )
-        _LENGTH_INSTRUCTIONS = {
-            "short":    "8. Отвечай КРАТКО: максимум 3–5 предложений или маркированный список до 5 пунктов. "
-                        "Без вводных слов и пересказа вопроса.",
-            "detailed": "8. Отвечай РАЗВЁРНУТО: подробно раскрой тему, приведи все релевантные нормы, "
-                        "условия применения и исключения. Используй подзаголовки если тем несколько.",
-        }
-        _len_instr = _LENGTH_INSTRUCTIONS.get(answer_length, _LENGTH_INSTRUCTIONS["short"])
-        system_prompt = system_prompt + "\n" + _len_instr
-        system_prompt = (
-            system_prompt
-            + "\n\nТекущая дата и время: "
-            + datetime.now().strftime("%d.%m.%Y, %H:%M")
-            + "."
+
+        system_prompt = _build_system_prompt(
+            prompts, user_context=user_context,
+            answer_length=answer_length, internal_mode=internal_mode,
         )
-        user_content  = prompts.get("advisor_user",   DEFAULT_PROMPTS["advisor_user"]).format(
-            query=query, context=context,
-        )
+
+        if internal_mode:
+            user_content = prompts.get(
+                "advisor_internal_user", DEFAULT_PROMPTS["advisor_internal_user"]
+            ).format(query=query)
+        else:
+            context = _build_context(sources)
+            user_content = prompts.get(
+                "advisor_user", DEFAULT_PROMPTS["advisor_user"]
+            ).format(query=query, context=context)
+
+        # Блок служебных пояснений идёт ПЕРЕД основным контекстом: так модель
+        # читает правила обращения с ним до того, как увидит нормативку.
+        hidden_block = _build_hidden_context(hidden_sources)
+        if hidden_block:
+            user_content = hidden_block + "\n\n" + user_content
+            print(f"[HIDDEN] В промпт добавлен блок слоя: "
+                  f"{len(hidden_block)} симв., {len(hidden_sources or [])} фрагм.")
  
         # ---------------------------------------------------------------
         # Отключение thinking-режима для моделей семейства Qwen3 / Qwen3.5
@@ -2236,7 +2992,7 @@ def stream_ai_answer(
         ]
 
         print(f"[LLM stream] {model} | ns={namespace} | max_tokens={max_tokens} | "
-              f"native={use_native} | "
+              f"native={use_native} | internal={internal_mode} | "
               f"промпт ~{len(system_prompt)+len(user_content)} симв. / "
               f"~{(len(system_prompt)+len(user_content))//4} токенов (оценка)")
         t0 = time.perf_counter()
@@ -2371,18 +3127,22 @@ def stream_clarification_answer(
     temperature: float = None,
     user_context: str = "",
     answer_length: str = "short",
+    hidden_sources: list = None,
+    internal_mode: bool = False,
 ):
     """
     Генератор токенов для уточняющих вопросов.
 
     Args:
-        clarify_q:     текст уточняющего вопроса
-        prev_answer:   предыдущий ответ LLM (исходный или последнее уточнение)
-        new_sources:   чанки из RAG, найденные по clarify_q
-        model:         модель LM Studio
-        temperature:   температура генерации
-        user_context:  контекст пользователя (роль, организация)
-        answer_length: "short" | "detailed"
+        clarify_q:      текст уточняющего вопроса
+        prev_answer:    предыдущий ответ LLM (исходный или последнее уточнение)
+        new_sources:    чанки из RAG, найденные по clarify_q
+        model:          модель LM Studio
+        temperature:    температура генерации
+        user_context:   контекст пользователя (роль, организация)
+        answer_length:  "short" | "detailed"
+        hidden_sources: фрагменты служебного слоя, найденные по clarify_q
+        internal_mode:  внутренний режим (без источников)
     """
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
@@ -2396,47 +3156,46 @@ def stream_clarification_answer(
 
     try:
         prompts       = load_prompts()
-        system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
-        if user_context and user_context.strip():
-            system_prompt = (
-                system_prompt
-                + "\n\n---\nКонтекст пользователя:\n"
-                + user_context.strip()
-            )
-        _LENGTH_INSTRUCTIONS = {
-            "short":    "8. Отвечай КРАТКО: максимум 3–5 предложений или маркированный список до 5 пунктов. "
-                        "Без вводных слов и пересказа вопроса.",
-            "detailed": "8. Отвечай РАЗВЁРНУТО: подробно раскрой тему, приведи все релевантные нормы, "
-                        "условия применения и исключения. Используй подзаголовки если тем несколько.",
-        }
-        system_prompt = system_prompt + "\n" + _LENGTH_INSTRUCTIONS.get(
-            answer_length, _LENGTH_INSTRUCTIONS["short"]
-        )
-        system_prompt = (
-            system_prompt
-            + "\n\nТекущая дата и время: "
-            + datetime.now().strftime("%d.%m.%Y, %H:%M")
-            + "."
+        system_prompt = _build_system_prompt(
+            prompts, user_context=user_context,
+            answer_length=answer_length, internal_mode=internal_mode,
         )
 
         # Контекст новых RAG-чанков (без псевдо-источника предыдущего ответа)
-        rag_context = _build_context(new_sources) if new_sources else "(новых документов не найдено)"
+        if internal_mode:
+            rag_context = ""
+        else:
+            rag_context = _build_context(new_sources) if new_sources \
+                          else "(новых документов не найдено)"
 
         # Промпт уточнения: предыдущий ответ — явный отдельный блок
         PREV_ANSWER_LIMIT = 2000   # символов — достаточно для контекста, не раздувает промпт
         user_content = (
-            "Ты продолжаешь консультацию. Ниже приведён предыдущий ответ и новые фрагменты документов.\n\n"
+            "Ты продолжаешь консультацию. Ниже приведён предыдущий ответ"
+            + ("." if internal_mode else " и новые фрагменты документов.")
+            + "\n\n"
             "## Предыдущий ответ\n"
             f"{prev_answer[:PREV_ANSWER_LIMIT]}"
             + (" _(сокращено)_" if len(prev_answer) > PREV_ANSWER_LIMIT else "")
             + "\n\n"
-            "## Новые фрагменты нормативных документов\n"
-            f"{rag_context}\n\n"
+        )
+        if not internal_mode:
+            user_content += (
+                "## Новые фрагменты нормативных документов\n"
+                f"{rag_context}\n\n"
+            )
+        user_content += (
             "## Вопрос уточнения\n"
             f"{clarify_q}\n\n"
-            "Дай ответ на вопрос уточнения, опираясь на предыдущий ответ и новые документы. "
-            "Не повторяй то, что уже было сказано, если это не нужно для ответа."
+            "Дай ответ на вопрос уточнения, опираясь на предыдущий ответ"
+            + ("." if internal_mode else " и новые документы.")
+            + " Не повторяй то, что уже было сказано, если это не нужно для ответа."
         )
+
+        # Служебный слой — тем же блоком, что и в основном ответе
+        hidden_block = _build_hidden_context(hidden_sources)
+        if hidden_block:
+            user_content = hidden_block + "\n\n" + user_content
 
         # См. комментарий в stream_ai_answer — надёжный think:false только
         # через нативный Ollama /api/chat, extra_body на /v1 ненадёжен.
@@ -2448,9 +3207,10 @@ def stream_clarification_answer(
             {"role": "user",   "content": user_content},
         ]
 
-        print(f"[CLARIFY stream] {model} | native={use_native} | "
+        print(f"[CLARIFY stream] {model} | native={use_native} | internal={internal_mode} | "
               f"промпт ~{len(system_prompt)+len(user_content)} симв. | "
-              f"prev_answer={len(prev_answer)} симв. | rag_chunks={len(new_sources)}")
+              f"prev_answer={len(prev_answer)} симв. | rag_chunks={len(new_sources or [])} | "
+              f"hidden={len(hidden_sources or [])}")
         t0 = time.perf_counter()
 
         full_text  = ""
@@ -2551,6 +3311,8 @@ def generate_ai_answer(
     model: str = None,
     temperature: float = None,
     org_id: str = None,
+    hidden_sources: list = None,
+    internal_mode: bool = False,
 ) -> str:
     config      = load_config()
     model       = model or config.get("default_model", "qwen/qwen3.5-9b")
@@ -2562,7 +3324,9 @@ def generate_ai_answer(
     if _SOURCES_ONLY_MODE:
         return "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключен."
  
-    cache_key = get_cache_key(query, sources, model, namespace=namespace)
+    cache_key = get_cache_key(query, sources, model, namespace=namespace,
+                              hidden_sources=hidden_sources,
+                              internal_mode=internal_mode)
     cached_answer = _cache_get(cache_key)
     if cached_answer is not None:
         print(f"[CACHE HIT] {model} | ns={namespace}")
@@ -2570,12 +3334,23 @@ def generate_ai_answer(
  
     try:
         prompts = load_prompts()
-        context = _build_context(sources)
- 
-        system_prompt = prompts.get("advisor_system", DEFAULT_PROMPTS["advisor_system"])
-        user_content  = prompts.get("advisor_user",   DEFAULT_PROMPTS["advisor_user"]).format(
-            query=query, context=context,
-        )
+
+        _sys_key = "advisor_internal_system" if internal_mode else "advisor_system"
+        system_prompt = prompts.get(_sys_key, DEFAULT_PROMPTS[_sys_key])
+
+        if internal_mode:
+            user_content = prompts.get(
+                "advisor_internal_user", DEFAULT_PROMPTS["advisor_internal_user"]
+            ).format(query=query)
+        else:
+            context = _build_context(sources)
+            user_content = prompts.get(
+                "advisor_user", DEFAULT_PROMPTS["advisor_user"]
+            ).format(query=query, context=context)
+
+        hidden_block = _build_hidden_context(hidden_sources)
+        if hidden_block:
+            user_content = hidden_block + "\n\n" + user_content
  
         # См. комментарий в stream_ai_answer — надёжный think:false только
         # через нативный Ollama /api/chat, extra_body на /v1 ненадёжен.
@@ -2589,7 +3364,7 @@ def generate_ai_answer(
  
         t0 = time.perf_counter()
         print(f"[LLM] {model} | ns={namespace} | max_tokens={max_tokens} | "
-              f"native={use_native} | "
+              f"native={use_native} | internal={internal_mode} | "
               f"промпт ~{len(system_prompt)+len(user_content)} симв.")
  
         if use_native:
@@ -2670,31 +3445,52 @@ def ask_question(
     spheres: list = None,
     doc_types: list = None,
     doc_status: str = "active",
+    filenames: list = None,
     org_id: str = None,
+    use_hidden_layer: bool = True,
 ) -> dict:
     """
     org_id — сегмент пользователя. Пробрасывается и в поиск (локальная база),
     и в ключ кэша LLM. Если None — берётся из session_state автоматически.
+
+    filenames — уточнение перечня НПА из диалога Советчика: ответ строится
+    ТОЛЬКО по чанкам перечисленных документов. Пустой список и None
+    равнозначны «фильтр не задан».
+
+    use_hidden_layer — подмешивать ли служебный слой (см. комментарий вверху
+    файла). Фрагменты слоя в result["sources"] НЕ попадают: в результате
+    возвращается только их количество (result["hidden_used"]).
     """
     t_start   = time.perf_counter()
     config    = load_config()
     model     = model or config.get("default_model", "qwen/qwen3.5-9b")
     org_id    = org_id or get_current_org_id() or None
     namespace = namespace_for_org(org_id) if org_id else get_cache_namespace()
+
+    filenames = [f for f in (filenames or []) if f] or None
+
+    _, _, _internal_mode = _split_doc_types(doc_types)
  
     if not _llm_cache:
         load_llm_cache()
  
-    print(f"\n{'='*55}\n[ASK] «{query[:70]}» | {model} | ns={namespace}\n{'='*55}")
+    print(f"\n{'='*55}\n[ASK] «{query[:70]}» | {model} | ns={namespace} | "
+          f"internal={_internal_mode} | "
+          f"файлов={len(filenames) if filenames else 'все'}\n{'='*55}")
  
     result = {
         "answer": "", "sources": [], "redirect": None,
         "redirect_reason": None, "from_faq": False,
         "from_cache": False, "model": model, "org_id": org_id,
+        "hidden_used": 0, "internal_mode": _internal_mode,
+        "filenames": filenames or [],
     }
  
     # FAQ
-    if use_faq:
+    # При активном уточнении перечня НПА FAQ пропускается: пользователь явно
+    # потребовал ответ по конкретным документам, а готовый ответ из FAQ к ним
+    # отношения не имеет и выглядел бы как игнорирование фильтра.
+    if use_faq and not _internal_mode and not filenames:
         faq = search_faq(query, top_k=3)
         if faq:
             result.update({
@@ -2709,20 +3505,37 @@ def ask_question(
                 result["redirect_reason"] = f"Для деталей рекомендуем раздел «{sec}»"
             print(f"[ASK] FAQ за {time.perf_counter()-t_start:.2f} сек")
             return result
+
+    # Служебный слой — отдельным поиском, в sources не попадает
+    hidden_sources = search_hidden_layer(query) if use_hidden_layer else []
+    result["hidden_used"] = len(hidden_sources)
  
     # Гибридный поиск (BM25 + vector + reranking)
     sources = search_vector_db(
         query, top_k=top_k, spheres=spheres, doc_types=doc_types,
-        doc_status=doc_status, org_id=org_id,
+        doc_status=doc_status, filenames=filenames, org_id=org_id,
+        hidden_sources=hidden_sources,
     )
     result["sources"] = sources
  
-    if sources:
-        cache_key  = get_cache_key(query, sources, model, namespace=namespace)
+    if sources or _internal_mode:
+        cache_key  = get_cache_key(query, sources, model, namespace=namespace,
+                                   hidden_sources=hidden_sources,
+                                   internal_mode=_internal_mode)
         was_cached = _cache_get(cache_key) is not None
-        result["answer"]     = generate_ai_answer(query, sources, model, temperature,
-                                                  org_id=org_id)
+        result["answer"]     = generate_ai_answer(
+            query, sources, model, temperature, org_id=org_id,
+            hidden_sources=hidden_sources, internal_mode=_internal_mode,
+        )
         result["from_cache"] = was_cached
+    elif filenames:
+        # Отдельное сообщение: пустая выдача при активном фильтре почти всегда
+        # означает не «нет ответа в базе», а «не в этих документах».
+        result["answer"] = (
+            f"❌ В выбранных документах ({len(filenames)} шт.) не найдено "
+            "фрагментов по вашему вопросу. Расширьте перечень в уточнении "
+            "или переформулируйте запрос."
+        )
     else:
         result["answer"] = ("❌ Не найдено релевантных документов в базе знаний. "
                             "Попробуйте переформулировать вопрос.")

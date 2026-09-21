@@ -37,10 +37,11 @@ DOC_TYPES = {
     "protocol":  "📋 Протокол",
 }
 
+# Водоснабжение и водоотведение объединены в одну сферу по явной просьбе —
+# на реальных данных эти два вида документов всё равно нужны вместе.
 SPHERES = [
     "Теплоснабжение",
-    "Водоснабжение",
-    "Водоотведение",
+    "Водоснабжение/водоотведение",
     "ТКО",
     "Электроэнергетика",
     "Газоснабжение",
@@ -113,6 +114,54 @@ def _registry_to_df(reg: dict) -> pd.DataFrame:
 # Формат: Регион_Сфера_Год_Организация_Метод_Описание_pdf
 # ──────────────────────────────────────────────────────────────────────────
 
+# ── Распознавание сферы по имени файла ──────────────────────────────────────
+# БЫЛО (баг): sphere_map требовал ТОЧНОГО совпадения латинского кода
+# (teplo/voda/vodootved/tko/elektro/gaz) как ОТДЕЛЬНОГО токена после
+# split("_"). Реальные имена файлов почти никогда не содержат эти точные
+# коды — в результате почти всем 3000 загруженным экспертным заключениям
+# проставлялась sphere="сфера_не_определена". Пока фильтр по сфере не
+# применялся ("Все сферы"), это было незаметно; как только пользователь
+# выбирал конкретную сферу — такие документы переставали находиться
+# вообще (сфера "не определена" не совпадает ни с одним значением из
+# expertise_panel.SPHERES).
+#
+# ТЕПЕРЬ: ищем ключевые слова (кириллица + частые латинские варианты) ГДЕ
+# УГОДНО в имени файла, без учёта регистра и без привязки к границам "_".
+# Порядок словаря важен: более специфичные термины (водоотведение,
+# канализация) проверяются РАНЬШЕ более общего корня "вод-" в
+# "Водоснабжение", чтобы "...канализация..." не определилось как
+# "Водоснабжение".
+#
+# Файлы, где ни одно ключевое слово не найдено, остаются с явным
+# "сфера_не_определена" — по требованию: такие документы должны
+# участвовать только в поиске БЕЗ фильтра по сфере ("Все сферы"), что уже
+# обеспечивается тем, что фильтр (см. _filter_candidates_by_where в
+# streamlit_pages/predictor.py) требует ТОЧНОГО совпадения sphere с одним
+# из выбранных значений — "сфера_не_определена" ни с одной реальной
+# сферой не совпадёт, а при снятом фильтре ограничение не применяется
+# вовсе, и документ ищется наравне с остальными.
+_SPHERE_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("Теплоснабжение",             ["теплоснаб", "тепло", "teplo", "gvs"]),  # gvs = горячее водоснабжение — тарифно относится к теплу
+    ("Водоснабжение/водоотведение", ["водоотвед", "канализ", "vodootved", "kanaliz",
+                                      "kanal", "водоснаб", "водопровод", "vodosnab", "voda"]),
+    ("ТКО",                        ["тко", "мусор", "отход", "tko"]),
+    ("Электроэнергетика",          ["электро", "elektro"]),
+    ("Газоснабжение",              ["газоснаб", "газ", "gaz"]),
+]
+
+
+def _detect_sphere(fname_lower: str) -> str:
+    """
+    Ищет первое совпадение из _SPHERE_KEYWORDS в имени файла (без учёта
+    регистра, по всей строке — не только по "_"-разделённым токенам).
+    Возвращает "сфера_не_определена", если ни одно ключевое слово не нашлось.
+    """
+    for sphere, keywords in _SPHERE_KEYWORDS:
+        if any(kw in fname_lower for kw in keywords):
+            return sphere
+    return "сфера_не_определена"
+
+
 def parse_attrs_from_filename(fname: str) -> dict:
     """
     Примитивный, надёжный парсер: разбивает имя файла по "_" и пытается
@@ -120,18 +169,15 @@ def parse_attrs_from_filename(fname: str) -> dict:
     при невозможности распознать поле возвращает "не_определён"/"не определена".
     Реальную точную грамматику имени файла уточним на реальных данных
     (см. uploaded примеры batch-импорта протоколов).
+
+    Сфера ищется отдельной функцией _detect_sphere по ВСЕМУ имени файла
+    (см. комментарий выше _SPHERE_KEYWORDS) — надёжнее, чем точное
+    совпадение отдельного "_"-токена, и не требует, чтобы имя файла
+    строго следовало формату "Регион_Сфера_Год_...".
     """
     base = os.path.splitext(fname)[0]
     parts = base.split("_")
 
-    sphere_map = {
-        "teplo": "Теплоснабжение",
-        "voda": "Водоснабжение",
-        "vodootved": "Водоотведение",
-        "tko": "ТКО",
-        "elektro": "Электроэнергетика",
-        "gaz": "Газоснабжение",
-    }
     method_map = {
         "indx": "Индексация",
         "eoz": "ЭОЗ",
@@ -139,16 +185,14 @@ def parse_attrs_from_filename(fname: str) -> dict:
     }
 
     region = parts[0] if len(parts) > 0 else "регион_не_определён"
-    sphere = "сфера_не_определена"
+    sphere = _detect_sphere(base.lower())
     year = "год_не_определён"
     method = "метод_не_определён"
     organization = "организация_не_определена"
 
     for p in parts[1:]:
         low = p.lower()
-        if low in sphere_map:
-            sphere = sphere_map[low]
-        elif low in method_map:
+        if low in method_map:
             method = method_map[low]
         elif _looks_like_year(p):
             year = p
@@ -314,6 +358,60 @@ def _reindex_document(fname: str) -> dict:
 
     _upsert_registry_entry(fname, {"doc_type": doc_type, **attrs, **result})
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Массовый пересчёт сферы по имени файла для УЖЕ ЗАГРУЖЕННЫХ документов
+#
+# Нужен, потому что исправление parse_attrs_from_filename/_detect_sphere
+# само по себе действует только на НОВЫЕ загрузки — уже проиндексированные
+# файлы (в т.ч. все чанки в ChromaDB) как были помечены
+# sphere="сфера_не_определена", так и останутся, пока их не пересчитать
+# явно. Полная переиндексация 3000 файлов заново прогнала бы всё через
+# эмбеддинг-модель без необходимости — здесь достаточно пересчитать
+# атрибуты из имени файла и обновить только metadata (реестр +
+# ChromaDB.update, см. core.expertise_chunker.update_expertise_file_metadata).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _resphere_preview(reg: dict) -> list[dict]:
+    """
+    Пересчитывает атрибуты по имени файла исправленным парсером для каждого
+    экспертного документа реестра и возвращает только те, у которых
+    ИЗМЕНИЛАСЬ сфера — ничего не записывает (чистый dry-run для предпросмотра
+    перед применением).
+    """
+    changed = []
+    for fname, entry in reg.items():
+        if entry.get("doc_type") != "expertise":
+            continue
+        new_attrs = parse_attrs_from_filename(fname)
+        old_sphere = entry.get("sphere") or "сфера_не_определена"
+        if new_attrs["sphere"] != old_sphere:
+            changed.append({
+                "fname": fname,
+                "old_sphere": old_sphere,
+                "new_sphere": new_attrs["sphere"],
+                "new_attrs": new_attrs,
+            })
+    return changed
+
+
+def _apply_resphere_one(fname: str, new_attrs: dict) -> bool:
+    """
+    Применяет пересчитанные атрибуты к ОДНОМУ файлу: обновляет запись в
+    реестре и metadata его чанков в ChromaDB (без повторного чанкования).
+    """
+    from core.expertise_chunker import update_expertise_file_metadata
+
+    patch = {
+        "region": new_attrs["region"],
+        "sphere": new_attrs["sphere"],
+        "year": new_attrs["year"],
+        "method": new_attrs["method"],
+    }
+    n_updated = update_expertise_file_metadata(fname, patch)
+    _upsert_registry_entry(fname, patch)
+    return n_updated > 0
 
 
 def show_documents_panel():
@@ -495,6 +593,102 @@ def show_documents_panel():
                                   "batch_folder_confirmed"]:
                             st.session_state.pop(k, None)
                         st.rerun()
+
+    st.divider()
+
+    # ── Пересчёт сферы по имени файла для уже загруженных документов ────
+    with st.expander("🔧 Пересчитать сферу у уже загруженных документов"):
+        st.caption(
+            "Распознавание сферы по имени файла было исправлено — раньше "
+            "оно требовало точного латинского кода и почти всегда "
+            "проставляло «сфера не определена». Это действие пересчитывает "
+            "сферу (и заодно год/метод) для КАЖДОГО уже загруженного "
+            "экспертного заключения новым парсером, БЕЗ повторного "
+            "чанкования и эмбеддинга — обновляются только метаданные в "
+            "реестре и в ChromaDB. Документы, где сфера по-прежнему не "
+            "распознаётся, останутся с «сфера не определена» и будут "
+            "участвовать только в поиске без фильтра по сфере (Прогнозист, "
+            "«Все сферы»)."
+        )
+
+        if st.button("🔍 Показать, что изменится", key="resphere_preview_btn"):
+            with st.spinner("Пересчитываю атрибуты по имени файла…"):
+                preview = _resphere_preview(reg)
+            st.session_state["resphere_preview"] = preview
+
+        _preview = st.session_state.get("resphere_preview")
+        if _preview is not None:
+            if not _preview:
+                st.success("Все экспертные документы уже размечены корректно — пересчитывать нечего.")
+            else:
+                _by_new_sphere: dict = {}
+                for row in _preview:
+                    _by_new_sphere.setdefault(row["new_sphere"], 0)
+                    _by_new_sphere[row["new_sphere"]] += 1
+                st.info(f"Сфера изменится у **{len(_preview)}** документ(ов):")
+                st.write({k: v for k, v in sorted(_by_new_sphere.items(), key=lambda kv: -kv[1])})
+                with st.expander(f"Список изменений ({len(_preview)})"):
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Файл": r["fname"], "Было": r["old_sphere"], "Станет": r["new_sphere"]}
+                            for r in _preview
+                        ]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                if st.button(
+                    f"▶️ Применить пересчёт ко всем ({len(_preview)})",
+                    type="primary", key="resphere_apply_btn",
+                ):
+                    st.session_state["resphere_queue"] = list(_preview)
+                    st.session_state["resphere_done"] = 0
+                    st.session_state["resphere_errors"] = []
+                    st.session_state["resphere_running"] = True
+                    st.session_state.pop("resphere_preview", None)
+                    st.rerun()
+
+        if st.session_state.get("resphere_running"):
+            queue = st.session_state.get("resphere_queue", [])
+            done = st.session_state.get("resphere_done", 0)
+            errors = st.session_state.get("resphere_errors", [])
+            total = len(queue) + done + len(errors)
+
+            progress_val = (done + len(errors)) / total if total else 1.0
+            st.progress(progress_val)
+            st.caption(f"Обновлено {done + len(errors)} из {total} (ошибок: {len(errors)})")
+
+            if queue:
+                row = queue.pop(0)
+                try:
+                    ok = _apply_resphere_one(row["fname"], row["new_attrs"])
+                    if ok:
+                        done += 1
+                    else:
+                        errors.append({"fname": row["fname"], "error": "Чанки файла не найдены в ChromaDB"})
+                except Exception as e:
+                    errors.append({"fname": row["fname"], "error": str(e)})
+
+                st.session_state["resphere_queue"] = queue
+                st.session_state["resphere_done"] = done
+                st.session_state["resphere_errors"] = errors
+                st.rerun()
+            else:
+                st.session_state["resphere_running"] = False
+                try:
+                    from streamlit_pages.predictor import invalidate_expertise_hybrid_retriever
+                    invalidate_expertise_hybrid_retriever()
+                except Exception:
+                    pass
+                st.success(f"✅ Пересчёт завершён. Обновлено: {done}, ошибок: {len(errors)}")
+                if errors:
+                    with st.expander(f"⚠️ Ошибки ({len(errors)})"):
+                        for err in errors:
+                            st.write(f"**{err['fname']}**: {err['error']}")
+                if st.button("Закрыть отчёт", key="resphere_close_report"):
+                    for k in ["resphere_queue", "resphere_done", "resphere_errors",
+                              "resphere_running"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
 
     st.divider()
 

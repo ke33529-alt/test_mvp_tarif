@@ -173,5 +173,44 @@
       }
     },
     "admin_panel_enabled": false
+  },
+  "org_20260908_184744": {
+    "name": "ЛенРТК",
+    "created_at": "2026-09-08T18:47:44",
+    "status": "active",
+    "archived_at": null,
+    "rag_collection_name": "len_rag",
+    "rag_doc_count": 0,
+    "rag_last_indexed_at": null,
+    "license_until": "9999-12-31",
+    "max_users": 999,
+    "admin_notes": "",
+    "admin_notes_updated_at": null,
+    "modules": {
+      "advisor": {
+        "enabled": true,
+        "status": "active"
+      },
+      "scanner": {
+        "enabled": true,
+        "status": "active"
+      },
+      "analyzer": {
+        "enabled": true,
+        "status": "active"
+      },
+      "predictor": {
+        "enabled": true,
+        "status": "active"
+      },
+      "protocol": {
+        "enabled": true,
+        "status": "active"
+      },
+      "tasks": {
+        "enabled": true,
+        "status": "active"
+      }
+    }
   }
 }
