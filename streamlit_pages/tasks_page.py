@@ -15,6 +15,13 @@
   истории Советчика / Протоколов / Прогнозиста / Заявок / Сканера документов
   (см. core/entity_picker.py). Статус фактически меняется только после
   подтверждения в модалке; отмена возвращает выбор статуса как было.
+
+Правка задачи (кнопка «Правка»):
+  В форме правятся ВСЕ атрибуты своей задачи — текст, приоритет, статус,
+  срок исполнения, а для статуса «Выполнено» ещё дата выполнения, резолюция
+  и привязанные записи. Сохранение — одним вызовом core/tasks.update_task.
+  Перевод в «Выполнено» из формы правки модалку не открывает: поля итога
+  выполнения показываются прямо в форме.
 """
 
 import html
@@ -116,6 +123,29 @@ def _ref_link_text(ref: dict) -> str:
     src_label = entity_picker.SOURCE_LABELS.get(ref.get("source", ""), ref.get("source", ""))
     label = ref.get("label", "")
     return f"🔗 {src_label}: {label} →" if label else f"🔗 {src_label} →"
+
+
+def _clear_edit_state(tid: str, final_status: str) -> None:
+    """
+    Выход из режима «Правка» (сохранение или отмена): чистим всё состояние
+    формы и синхронизируем виджеты карточки с итоговым статусом.
+
+    Селекторы приоритета/статуса на карточке (pr_/st_) не рисуются, пока
+    открыта правка, но трекер _task_status_seen_ — обычный ключ, он хранит
+    статус ДО правки. Если его не выставить в итоговый статус, при первой
+    отрисовке карточки виджет (новый статус) отличался бы от трекера (старый),
+    и это сочлось бы новым выбором пользователя — например, повторно открылась
+    бы модалка завершения для уже выполненной через правку задачи.
+    """
+    st.session_state.pop("_task_edit_id", None)
+    for k in (
+        f"_task_edit_text_{tid}", f"_task_edit_note_{tid}", f"_task_edit_refs_{tid}",
+        f"_task_edit_prio_{tid}", f"_task_edit_status_{tid}", f"_task_edit_done_{tid}",
+        f"_task_nodue_{tid}", f"_task_due_{tid}", f"_te_src_{tid}",
+        f"pr_{tid}", f"st_{tid}",
+    ):
+        st.session_state.pop(k, None)
+    st.session_state[f"_task_status_seen_{tid}"] = final_status
 
 
 @st.dialog("Удаление задачи")
@@ -543,6 +573,12 @@ def show_tasks():
             editing = st.session_state.get("_task_edit_id") == tid
 
             if editing:
+                # ── Режим «Правка»: ВСЕ атрибуты задачи ──────────────────────
+                # Текст, приоритет, статус, срок, а для «Выполнено» — дата
+                # выполнения, резолюция и ссылки. Всё сохраняется ОДНИМ вызовом
+                # update_task (атомарная запись). Перевод в «Выполнено» отсюда
+                # НЕ открывает модалку завершения: поля резолюции и ссылок
+                # появляются прямо в форме, как только выбран статус «Выполнено».
                 ekey = f"_task_edit_text_{tid}"
                 if ekey not in st.session_state:
                     st.session_state[ekey] = t.get("text", "")
@@ -555,12 +591,61 @@ def show_tasks():
                 )
                 st.caption(f"{len(st.session_state.get(ekey, ''))}/{tasks_core.MAX_CHARS}")
 
-                # Резолюция — только для завершённых задач. Правится отдельной
-                # функцией (update_completion_note), которая НЕ трогает
-                # completed_at и ссылки — только текст.
+                # Приоритет + статус
+                _eprio_key = f"_task_edit_prio_{tid}"
+                _estat_key = f"_task_edit_status_{tid}"
+                if _eprio_key not in st.session_state:
+                    st.session_state[_eprio_key] = (priority if priority in tasks_core.PRIORITY_CHOICES
+                                                    else tasks_core.DEFAULT_PRIORITY)
+                if _estat_key not in st.session_state:
+                    st.session_state[_estat_key] = (status if status in tasks_core.STATUS_ORDER
+                                                    else tasks_core.DEFAULT_STATUS)
+                epc1, epc2 = st.columns(2)
+                with epc1:
+                    _edit_prio = st.selectbox(
+                        "Приоритет",
+                        options=tasks_core.PRIORITY_CHOICES,
+                        format_func=lambda p: tasks_core.PRIORITY_LABELS.get(p, p),
+                        key=_eprio_key,
+                    )
+                with epc2:
+                    _edit_status = st.selectbox(
+                        "Статус",
+                        options=tasks_core.STATUS_ORDER,
+                        format_func=lambda s: tasks_core.STATUS_LABELS.get(s, s),
+                        key=_estat_key,
+                    )
+
+                _edit_is_done = _edit_status == tasks_core.STATUS_DONE
+
+                # Предупреждение: уход из «Выполнено» стирает итог выполнения
+                if (status == tasks_core.STATUS_DONE and not _edit_is_done
+                        and (t.get("completion_note") or t.get("completion_refs"))):
+                    st.warning("При смене статуса дата выполнения, резолюция и привязанные "
+                               "записи будут удалены.")
+
                 _nkey = f"_task_edit_note_{tid}"
                 _erefs_key = f"_task_edit_refs_{tid}"
-                if status == tasks_core.STATUS_DONE:
+                _edone_key = f"_task_edit_done_{tid}"
+                if _edit_is_done:
+                    # Дата выполнения: по умолчанию — текущая (для уже выполненной
+                    # задачи) или сегодня (если задачу переводят в «Выполнено»
+                    # прямо здесь). Будущую дату выбрать нельзя.
+                    _cur_done = None
+                    if completed_at:
+                        try:
+                            _cur_done = date.fromisoformat(completed_at[:10])
+                        except Exception:
+                            _cur_done = None
+                    _cur_done = min(_cur_done or date.today(), date.today())
+                    st.date_input(
+                        "Дата выполнения",
+                        value=_cur_done,
+                        format="DD.MM.YYYY",
+                        max_value=date.today(),
+                        key=_edone_key,
+                    )
+
                     if _nkey not in st.session_state:
                         st.session_state[_nkey] = t.get("completion_note", "")
                     st.markdown("**Резолюция**")
@@ -570,6 +655,7 @@ def show_tasks():
                         height=110,
                         max_chars=tasks_core.COMPLETION_NOTE_MAX_CHARS,
                         label_visibility="collapsed",
+                        placeholder="Что сделано, какой результат получен...",
                     )
                     st.caption(f"{len(st.session_state.get(_nkey, ''))}/{tasks_core.COMPLETION_NOTE_MAX_CHARS}")
 
@@ -577,7 +663,7 @@ def show_tasks():
                     # что и в модалке завершения (_show_complete_dialog):
                     # заготовка стартует с текущих ссылок задачи, «Добавить
                     # ссылку» дописывает, ✕ убирает. На «Сохранить» список
-                    # ЦЕЛИКОМ заменяет старый через update_completion_refs.
+                    # ЦЕЛИКОМ заменяет старый.
                     st.markdown("**Ссылки на записи системы**")
                     if _erefs_key not in st.session_state:
                         st.session_state[_erefs_key] = list(t.get("completion_refs", []))
@@ -674,31 +760,34 @@ def show_tasks():
                     if st.button("Сохранить", type="primary", key=f"save_{tid}", use_container_width=True):
                         if st.session_state.get(ekey, "").strip():
                             _due_str = "" if _no_due else (_edit_due.isoformat() if _edit_due else "")
-                            tasks_core.update_task(
-                                user, tid,
+                            _kw = dict(
                                 text=st.session_state[ekey],
+                                status=_edit_status,
+                                priority=_edit_prio,
                                 due_date=_due_str,
                             )
-                            if status == tasks_core.STATUS_DONE:
-                                tasks_core.update_completion_note(
-                                    user, tid, st.session_state.get(_nkey, "")
-                                )
-                                tasks_core.update_completion_refs(
-                                    user, tid, list(st.session_state.get(_erefs_key, []))
-                                )
-                            st.session_state.pop("_task_edit_id", None)
-                            st.session_state.pop(ekey, None)
-                            st.session_state.pop(_nkey, None)
-                            st.session_state.pop(_erefs_key, None)
+                            if _edit_is_done:
+                                _done_val = st.session_state.get(_edone_key)
+                                _kw["completed_at"]    = _done_val.isoformat() if _done_val else ""
+                                _kw["completion_note"] = st.session_state.get(_nkey, "")
+                                _kw["completion_refs"] = list(st.session_state.get(_erefs_key, []))
+                            _changed = tasks_core.update_task(user, tid, **_kw)
+                            if _changed:
+                                _audit(user, "task_edit")
+                                _log_usage("tasks", "task_edited", meta={
+                                    "task_id":     tid,
+                                    "status_from": status,
+                                    "status_to":   _edit_status,
+                                    "prio_from":   priority,
+                                    "prio_to":     _edit_prio,
+                                })
+                            _clear_edit_state(tid, _edit_status)
                             st.rerun()
                         else:
                             st.warning("Текст не может быть пустым.")
                 with ec2:
                     if st.button("Отмена", key=f"cancel_{tid}", use_container_width=True):
-                        st.session_state.pop("_task_edit_id", None)
-                        st.session_state.pop(ekey, None)
-                        st.session_state.pop(_nkey, None)
-                        st.session_state.pop(_erefs_key, None)
+                        _clear_edit_state(tid, status)
                         st.rerun()
             else:
                 st.markdown(
@@ -760,8 +849,9 @@ def show_tasks():
                 can_d = tasks_core.can_delete(user, owner_id, seg)
 
                 if can_e:
-                    # Свои задачи: смена приоритета/статуса + правка + удаление.
-                    # Срок задаётся/меняется/снимается в режиме «Правка».
+                    # Свои задачи: быстрая смена приоритета/статуса + правка + удаление.
+                    # Срок, дата выполнения, резолюция и ссылки (а также те же
+                    # приоритет/статус) правятся в режиме «Правка».
                     #
                     # Внешние колонки [5, 4] — та же пропорция, что у блока
                     # резолюция/ссылки выше: ряд управления встаёт точно под

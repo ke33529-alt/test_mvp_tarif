@@ -12,7 +12,8 @@
     • обычный пользователь — видит и правит только свои задачи;
     • segment_admin        — видит все задачи своего сегмента, удаляет любые в сегменте;
     • superadmin           — видит все задачи всех сегментов, удаляет любые.
-Редактирование (текст/статус/приоритет/срок) — всегда только своих задач.
+Редактирование (текст/статус/приоритет/срок/дата выполнения/резолюция/
+ссылки) — всегда только своих задач; все поля правятся одним вызовом update_task.
 
 Каждая задача несёт:
     • status   — этап работы: todo | in_progress | done;
@@ -467,18 +468,55 @@ def add_task(user: Dict, text: str,
     return task
 
 
+def _norm_completed_input(value, prev: str) -> str:
+    """
+    Дата выполнения, введённая вручную в режиме «Правка» ('YYYY-MM-DD' или date).
+
+    • пусто/некорректно      → прежнее значение (или «сейчас», если его не было);
+    • дата в будущем         → обрезается до сегодняшней (выполнить «завтра» нельзя);
+    • дата совпадает с прежней → прежнее значение целиком (не теряем время);
+    • сегодня                → текущий момент;
+    • иная прошедшая дата    → эта дата с временем 00:00:00.
+    """
+    d = _norm_due(value)
+    if not d:
+        return prev or _now()
+    today = date.today().isoformat()
+    if d > today:
+        d = today
+    if prev and prev[:10] == d:
+        return prev
+    if d == today:
+        return _now()
+    return f"{d}T00:00:00"
+
+
 def update_task(user: Dict, task_id: str,
                 text: Optional[str] = None,
                 status: Optional[str] = None,
                 priority: Optional[str] = None,
-                due_date: Optional[str] = None) -> bool:
+                due_date: Optional[str] = None,
+                completed_at: Optional[str] = None,
+                completion_note: Optional[str] = None,
+                completion_refs: Optional[List[Dict]] = None) -> bool:
     """
-    Обновляет свою задачу. Любой из параметров можно передать по отдельности.
+    Обновляет свою задачу. Любой из параметров можно передать по отдельности;
+    None — «не трогать». Все переданные изменения пишутся ОДНОЙ атомарной
+    записью (используется режимом «Правка», где правятся все атрибуты сразу).
     Передача due_date="" очищает срок. Чужие задачи не редактируются.
 
-    Дата выполнения (completed_at) не задаётся вручную — она автоматически
-    приравнивается к моменту перевода задачи в статус «Выполнено» и
-    сбрасывается, если статус меняют обратно на «Сделать»/«В работе».
+    Статус и дата выполнения (completed_at):
+      • переход в «Выполнено» — completed_at = переданная дата или «сейчас»;
+      • уход из «Выполнено»   — completed_at, резолюция и ссылки очищаются
+        (они относились к завершению, которого больше нет);
+      • задача остаётся/становится «Выполнено» и передан completed_at —
+        дата выполнения исправляется вручную (см. _norm_completed_input).
+
+    completion_note / completion_refs применяются, только если ИТОГОВЫЙ
+    статус — «Выполнено»; для незавершённой задачи они игнорируются.
+    Список ссылок целиком ЗАМЕНЯЕТ прежний.
+
+    Возвращает True, если что-то реально изменилось и записано на диск.
     """
     uid = _uid(user)
     segment = _seg(user)
@@ -487,33 +525,45 @@ def update_task(user: Dict, task_id: str,
     changed = False
     for t in tasks:
         if t.get("id") == task_id and t.get("owner_id") == uid:
+            before = json.dumps(t, ensure_ascii=False, sort_keys=True)
+
             if text is not None:
                 nt = _norm_text(text)
                 if nt:
                     t["text"] = nt
-                    changed = True
+
             if status is not None:
                 new_status = _norm_status(status)
                 prev_status = _norm_status(t.get("status"))
                 if new_status != prev_status:
                     if new_status == STATUS_DONE:
-                        t["completed_at"] = _now()
+                        t["completed_at"] = (
+                            _norm_completed_input(completed_at, "")
+                            if completed_at is not None else _now()
+                        )
                     elif prev_status == STATUS_DONE:
-                        # Уход из «Выполнено» — заметка и ссылки на сущности
-                        # относились к завершению, которого больше нет.
                         t["completed_at"]     = ""
                         t["completion_note"]  = ""
                         t["completion_refs"]  = []
                 t["status"] = new_status
-                changed = True
+
+            is_done = _norm_status(t.get("status")) == STATUS_DONE
+            if is_done:
+                if completed_at is not None:
+                    t["completed_at"] = _norm_completed_input(completed_at, t.get("completed_at", ""))
+                if completion_note is not None:
+                    t["completion_note"] = _norm_note(completion_note)
+                if completion_refs is not None:
+                    t["completion_refs"] = _norm_refs(completion_refs)
+
             if priority is not None:
                 t["priority"] = _norm_priority(priority)
-                changed = True
             if due_date is not None:
                 t["due_date"] = _norm_due(due_date)
-                changed = True
-            if changed:
+
+            if json.dumps(t, ensure_ascii=False, sort_keys=True) != before:
                 t["updated_at"] = _now()
+                changed = True
             break
     if changed:
         _write_file(path, tasks)

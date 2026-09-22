@@ -1065,7 +1065,7 @@ def _render_doc_map(data: Dict, key_prefix: str,
                         "Риск":               st.column_config.TextColumn("Риск", width="small"),
                         "Статья затрат":      st.column_config.TextColumn("Статья затрат", width="large"),
                         "Рег. год, тыс.руб.": st.column_config.NumberColumn(
-                            "Рег. год, тыс.руб.", format="%.0f", width="small"),
+                            "Рег. год, тыс.руб.", format="localized", width="small"),
                         "Документ":           st.column_config.TextColumn("Документ", width="large"),
                         "Где лежит":          st.column_config.TextColumn("Где лежит", width="medium"),
                         "Соответствие":       st.column_config.TextColumn("Соответствие", width="small"),
@@ -1826,7 +1826,42 @@ def _ap_make_df(articles: List[Dict], search_q: str, tf: Optional[str],
         row["Тип"] = _AP_TYPE_LBLS.get(a["type"], a["type"])
         rows.append(row)
     columns = ["_idx", "Включить", "Наименование", "Лист", "Ед.изм."] + year_cols + ["Тип"]
-    return pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    # Годы — всегда float: столбец из одних пустых ячеек иначе получает тип
+    # object, а целочисленный столбец Streamlit редактирует с шагом 1
+    for yr in year_cols:
+        df[yr] = pd.to_numeric(df[yr], errors="coerce").astype("float64")
+    return df
+
+
+def _fmt_amount(v: float) -> str:
+    """
+    Число для строки amounts в формате, который читает ядро.
+    _parse_amounts_timeseries ищет «цифры с пробелами + один десятичный
+    разделитель» перед «тыс» — «12 345.67». Раньше здесь было {:,.2f}
+    («1,500.00»): запятая-разделитель тысяч ломала разбор, и после любой
+    правки у статьи пропадали все значения от 1000 — рост не считался.
+    Точность — до 6 знаков, лишние нули отбрасываются.
+    """
+    s = f"{v:,.6f}".rstrip("0").rstrip(".")
+    return s.replace(",", " ")
+
+
+def _ap_year_config(year_cols: List[str], editable: bool) -> Dict:
+    """
+    Столбцы лет: дробные значения. Без step — у дробного столбца Streamlit
+    не ограничивает знаки после запятой (step=1 давал 0 знаков: редактор
+    выбрасывал набранную запятую или точку, вводились только целые).
+    «localized» — формат браузера: в русской локали «1 500,25».
+    """
+    return {
+        yr: st.column_config.NumberColumn(
+            yr, width="small", format="localized",
+            help=("Введите значение (или оставьте пустым). "
+                  "Дробная часть — через запятую или точку") if editable else None,
+        )
+        for yr in year_cols
+    }
 
 
 def _ap_apply_changes(a: Dict, changes: Dict, year_cols: List[str]) -> None:
@@ -1871,7 +1906,7 @@ def _ap_apply_changes(a: Dict, changes: Dict, year_cols: List[str]) -> None:
             changed = True
     if changed:
         a["amounts"] = " | ".join(
-            f"{yr} ({period_by.get(yr, '') or 'Принято'}): {val_by[yr]:,.2f} {unit_out}"
+            f"{yr} ({period_by.get(yr, '') or 'Принято'}): {_fmt_amount(val_by[yr])} {unit_out}"
             for yr in sorted(val_by.keys())
         )
 
@@ -2042,13 +2077,7 @@ def _approval_body(readonly: bool = False) -> None:
                 "Наименование": st.column_config.TextColumn("Наименование", width="large"),
                 "Лист":         st.column_config.TextColumn("Лист", width="medium", disabled=True),
                 "Ед.изм.":      st.column_config.TextColumn("Ед.изм.", width="small"),
-                **{
-                    yr: st.column_config.NumberColumn(
-                        yr, width="small", format="%.0f", step=1.0,
-                        help="Введите значение (или оставьте пустым)"
-                    )
-                    for yr in year_cols
-                },
+                **_ap_year_config(year_cols, editable=True),
                 "Тип":          st.column_config.SelectboxColumn(
                     "Тип", width="medium",
                     options=list(_AP_TYPE_LBLS.values()),
@@ -2067,6 +2096,7 @@ def _approval_body(readonly: bool = False) -> None:
             base.drop(columns=["_idx"]).rename(columns={"Включить": "✓"}),
             width="stretch", hide_index=True, placeholder="—",
             height=min(480, 35 * (len(base) + 1) + 3),
+            column_config=_ap_year_config(year_cols, editable=False),
         )
 
     # Счётчики — по всем статьям, а не только по видимым в фильтре
