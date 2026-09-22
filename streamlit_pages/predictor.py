@@ -83,6 +83,42 @@ _PRED_CFG_DEFAULTS = {
     "summary_npa_top_k":   6,
     "summary_max_sources": 6,   # источников с каждой стороны (за/против) в промпте резюме
     "summary_max_tokens":  900,
+    # ── Прикреплённые документы-обоснования ──────────────────────────────
+    # Документы живут ТОЛЬКО в рамках одного прогноза (st.session_state
+    # ["pred_docs"]) и намеренно НЕ сохраняются в базу Сканера документов:
+    # обоснование тарифной заявки — разовый рабочий материал, засорять им
+    # общую базу сканов не нужно.
+    "max_upload_mb":            50,    # потолок на один файл; не должен превышать
+                                       # maxUploadSize в .streamlit/config.toml,
+                                       # иначе Streamlit отрежет файл раньше нашей
+                                       # проверки и пользователь увидит не наше
+                                       # сообщение, а внутреннюю ошибку виджета
+    "max_docs":                 10,    # сколько документов можно приложить за раз
+    "head_pages":               2,     # страниц для верхнеуровневого чтения (шапка)
+    "head_summary_max_tokens":  200,
+    "min_readable_chars":       200,   # меньше — считаем документ нечитаемым
+                                       # (скан без OCR, пустой файл, битый PDF)
+    # ── Немашиночитаемые документы (сканы) ───────────────────────────────
+    # Распознавание делает doc_scanner (EasyOCR → Tesseract), но качество
+    # OCR напрямую влияет на вердикт прогноза: распознанный в мусор скан
+    # даёт уверенное, но неверное сопоставление. Поэтому OCR-документы
+    # помечаются, а подозрительное качество выносится предупреждением —
+    # решение оставить документ или заменить принимает эксперт.
+    "ocr_warn_page_ratio":      0.5,   # доля OCR-страниц, выше которой предупреждаем
+    "ocr_min_good_char_ratio":  0.85,  # доля осмысленных символов в распознанном
+    "ocr_max_tiny_token_ratio": 0.25,  # доля одиночных букв — признак мусорного OCR
+    "doc_full_text_budget":     8000,  # суммарный потолок текста всех документов,
+                                       # уходящего в обоснование
+    # Когда документы приложены, урезать позицию пользователя до
+    # justification_chars (200 симв. по умолчанию) нельзя — от обоснования
+    # не остаётся ничего. Отдельный, более щедрый лимит для этого случая.
+    "justification_chars_with_docs": 2000,
+    # Привязка каждого вердикта к конкретному приложенному документу.
+    # Реализована ВНУТРИ основного вызова классификации (дополнительное поле
+    # "doc" в JSON-ответе), а не отдельным LLM-вызовом на чанк — стоимость
+    # прогноза не удваивается. Выключается здесь, если добавочная инструкция
+    # в промпте начнёт заметно портить сам вердикт.
+    "doc_attribution":          True,
 }
 
 
@@ -286,6 +322,27 @@ _PRED_PROMPT_DEFAULTS = {
         "{expertise_context}\n"
         "=== КОНЕЦ ПРАКТИКИ ===\n\n"
         "Составь итоговое резюме по правилам из системного промпта."
+    ),
+    # ── Верхнеуровневое чтение приложенного документа ────────────────────
+    # Никакой классификации по видам документов здесь намеренно нет: нужно
+    # одно-два предложения о том, что это за бумага и о чём она, чтобы
+    # пользователь видел, что именно система прочитала, а поиск получил
+    # осмысленный контекст. Читается только шапка (первые head_pages
+    # страниц) — этого достаточно и это не стоит полного прохода по файлу.
+    "predictor_doc_head_system": (
+        "Ты — тарифный эксперт РФ. По началу документа (шапка, титульный "
+        "лист, первые строки) коротко определи, что это за документ и о чём "
+        "он. Отвечай ОДНИМ-ДВУМЯ предложениями на русском языке, без "
+        "вступлений, без списков, без рассуждений и без цитирования этой "
+        "инструкции. Если по фрагменту понять невозможно — так и напиши "
+        "одним предложением, ничего не выдумывая."
+    ),
+    "predictor_doc_head_user": (
+        "ИМЯ ФАЙЛА: {filename}\n"
+        "СТАТЬЯ ЗАТРАТ, по которой готовится обоснование: {article_name}\n\n"
+        "НАЧАЛО ДОКУМЕНТА:\n{head_text}\n\n"
+        "Одним-двумя предложениями: что это за документ и о чём он? Если "
+        "видно, как он связан со статьёй затрат — укажи это."
     ),
 }
 
@@ -662,6 +719,458 @@ def extract_file_text(file_bytes: bytes, filename: str) -> str:
         return "\n".join(p.get("text", "") for p in pages if p.get("text"))
     except Exception as e:
         return f"[Ошибка извлечения текста: {e}]"
+
+
+# =============================================================================
+# Прикреплённые документы-обоснования
+# =============================================================================
+# Документ живёт только в рамках одного прогноза, в st.session_state
+# ["pred_docs"], и в базу Сканера документов НЕ пишется. Структура записи:
+#
+#   {
+#     "id":           "a1b2c3d4",   # стабильный ключ виджетов Streamlit
+#     "sig":          "имя:размер", # для сопоставления с file_uploader
+#     "filename":     "Штатное расписание 2026.pdf",
+#     "size":         1048576,
+#     "ok":           True,         # прошёл ли валидацию
+#     "error":        "",           # причина отказа, если не прошёл
+#     "pages":        [...],        # как отдаёт doc_scanner.extract_text
+#     "full_text":    "...",
+#     "head_text":    "...",        # первые head_pages страниц (шапка)
+#     "head_summary": "...",        # верхнеуровневое чтение, 1–2 предложения
+#     "source":       "upload",     # upload | scanner
+#   }
+#
+# Расширения — ровно те, что реально умеет разбирать doc_scanner.extract_text;
+# всё остальное этот экстрактор вернёт как "[Формат ... не поддерживается]",
+# поэтому отсекаем заранее и говорим пользователю понятным языком.
+_SUPPORTED_EXTS = (
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt",
+    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp",
+)
+
+
+def _new_doc_id() -> str:
+    """Короткий стабильный идентификатор приложенного документа."""
+    import uuid
+    return uuid.uuid4().hex[:8]
+
+
+def ensure_ocr_ready() -> Dict:
+    """
+    Поднимает OCR, если он ещё не поднят, и возвращает его состояние:
+    {"available": bool, "engine": "easyocr"|"tesseract"|"", "error": str}.
+
+    ЗАЧЕМ ЭТО ЗДЕСЬ. doc_scanner._init_ocr() вызывается только внутри
+    show_doc_scanner() под флагом st.session_state["ocr_initialized"].
+    Пользователь, который открыл Прогнозист, не заходя в «Сканер
+    документов», получал _EASYOCR_AVAILABLE = False — _ocr_image()
+    молча возвращал пустую строку, и ЛЮБОЙ скан отклонялся как
+    нечитаемый, хотя сам документ был в порядке, а не поднят был движок.
+    Инициализируем под тем же самым ключом session_state, что и Сканер,
+    поэтому повторной загрузки модели в VRAM не происходит — кто первым
+    открыл раздел, тот её и поднял.
+    """
+    state = {"available": False, "engine": "", "error": ""}
+    try:
+        from streamlit_pages import doc_scanner as _ds
+    except Exception as e:
+        state["error"] = f"модуль Сканера недоступен: {e}"
+        return state
+
+    try:
+        if not st.session_state.get("ocr_initialized"):
+            _ds._init_ocr()
+            st.session_state["ocr_initialized"] = True
+    except Exception as e:
+        state["error"] = str(e)
+
+    if getattr(_ds, "_EASYOCR_AVAILABLE", False):
+        state.update(available=True, engine="easyocr")
+    elif getattr(_ds, "_TESSERACT_AVAILABLE", False):
+        state.update(available=True, engine="tesseract")
+    else:
+        state["error"] = state["error"] or st.session_state.get("ocr_init_error", "")
+    return state
+
+
+# Символы, которые считаем осмысленными в распознанном тексте: буквы, цифры,
+# пробелы и обычная деловая пунктуация. Всё остальное в товарных количествах —
+# признак того, что OCR выдал мусор.
+_OCR_GOOD_PUNCT = set(".,;:!?()[]-—–«»\"'%№/\\+=*§°  \t\n\r")
+
+
+def assess_ocr_quality(text: str) -> Tuple[bool, str]:
+    """
+    Грубая оценка качества распознанного текста. Возвращает
+    (выглядит_нормально, пояснение_для_пользователя).
+
+    Проверяется два признака мусорного OCR:
+      1. доля осмысленных символов — плохое распознавание даёт много
+         посторонних глифов;
+      2. доля одиночных букв среди токенов — характерный след, когда OCR
+         рассыпает слова на отдельные символы.
+
+    Документ по результатам этой проверки НЕ отклоняется: OCR-распознавание
+    сканов — штатный сценарий, а порог здесь эвристический. Задача проверки —
+    предупредить эксперта, что вердикт построен на сомнительном тексте.
+    """
+    text = (text or "").strip()
+    if not text:
+        return False, "распознанный текст пуст"
+
+    cfg          = load_predictor_config()
+    min_good     = float(cfg.get("ocr_min_good_char_ratio", 0.85))
+    max_tiny     = float(cfg.get("ocr_max_tiny_token_ratio", 0.25))
+
+    good = sum(1 for ch in text if ch.isalnum() or ch in _OCR_GOOD_PUNCT)
+    good_ratio = good / len(text)
+
+    tokens = [t for t in re.split(r"\s+", text) if t]
+    tiny_ratio = (
+        sum(1 for t in tokens if len(t) == 1 and t.isalpha()) / len(tokens)
+        if tokens else 1.0
+    )
+
+    problems = []
+    if good_ratio < min_good:
+        problems.append(f"посторонних символов {(1 - good_ratio) * 100:.0f}%")
+    if tiny_ratio > max_tiny:
+        problems.append(f"текст рассыпан на отдельные буквы ({tiny_ratio * 100:.0f}%)")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ""
+
+
+def _doc_sig(filename: str, size: int) -> str:
+    """Подпись файла для сопоставления с содержимым st.file_uploader."""
+    return f"{filename}:{size}"
+
+
+def validate_and_read_upload(file_bytes: bytes, filename: str) -> Dict:
+    """
+    Проверяет пригодность файла и читает его. Возвращает запись документа
+    (см. структуру выше) — в том числе и при отказе, с ok=False и
+    заполненным error, чтобы интерфейс мог показать причину рядом с самим
+    файлом и предложить заменить его, не роняя остальные приложенные
+    документы.
+
+    Три причины отказа:
+      1. расширение вне списка поддерживаемых doc_scanner;
+      2. размер больше max_upload_mb;
+      3. текст не извлёкся — экстрактор вернул ошибку или получилось
+         меньше min_readable_chars символов (скан без OCR, пустой или
+         битый файл).
+    """
+    cfg        = load_predictor_config()
+    max_bytes  = int(cfg.get("max_upload_mb", 50)) * 1024 * 1024
+    min_chars  = int(cfg.get("min_readable_chars", 200))
+    head_pages = int(cfg.get("head_pages", 2))
+
+    size = len(file_bytes or b"")
+    doc = {
+        "id":           _new_doc_id(),
+        "sig":          _doc_sig(filename, size),
+        "filename":     filename,
+        "size":         size,
+        "ok":           False,
+        "error":        "",
+        "pages":        [],
+        "full_text":    "",
+        "head_text":    "",
+        "head_summary": "",
+        "source":       "upload",
+        # Немашиночитаемые документы: сколько страниц прошло через OCR и как
+        # выглядит качество распознавания (см. assess_ocr_quality).
+        "ocr_pages":       0,
+        "ocr_ratio":       0.0,
+        "ocr_quality_ok":  True,
+        "ocr_quality_note": "",
+    }
+
+    ext = os.path.splitext(filename.lower())[1]
+    if ext not in _SUPPORTED_EXTS:
+        doc["error"] = (
+            f"Формат {ext or '—'} не поддерживается. "
+            f"Допустимы: {', '.join(e.lstrip('.') for e in _SUPPORTED_EXTS)}."
+        )
+        return doc
+
+    if size > max_bytes:
+        doc["error"] = (
+            f"Файл {size / 1024 / 1024:.1f} МБ — больше лимита "
+            f"{cfg.get('max_upload_mb', 50)} МБ."
+        )
+        return doc
+
+    if size == 0:
+        doc["error"] = "Файл пустой."
+        return doc
+
+    try:
+        from streamlit_pages.doc_scanner import extract_text
+    except Exception as e:
+        doc["error"] = f"Модуль Сканера документов недоступен: {e}"
+        return doc
+
+    # OCR поднимаем ДО разбора: для немашиночитаемого документа (скан без
+    # текстового слоя) doc_scanner молча вернёт пустой текст, если движок
+    # распознавания не инициализирован — и файл будет отклонён как
+    # «нечитаемый», хотя с ним всё в порядке. См. ensure_ocr_ready.
+    _ocr = ensure_ocr_ready()
+
+    # Полный разбор. Для скана это OCR всех страниц — может быть долгим,
+    # поэтому вызывается один раз при прикреплении и результат остаётся
+    # в session_state до конца прогноза.
+    try:
+        pages = extract_text(file_bytes, filename)
+    except Exception as e:
+        doc["error"] = f"Не удалось прочитать файл: {e}"
+        return doc
+
+    full_text = "\n".join(p.get("text", "") for p in pages if p.get("text")).strip()
+
+    _ocr_pages = sum(1 for p in pages if p.get("method") == "ocr")
+    doc["ocr_pages"] = _ocr_pages
+    doc["ocr_ratio"] = (_ocr_pages / len(pages)) if pages else 0.0
+
+    if not pages or all(p.get("method") == "error" for p in pages):
+        doc["error"] = (
+            "Файл не читается — вероятно, повреждён или защищён от "
+            "извлечения текста."
+        )
+        doc["pages"] = pages
+        return doc
+
+    if len(full_text) < min_chars:
+        # Различаем две принципиально разные причины. Раньше обе давали
+        # текст «проверьте качество скана» — и пользователь шёл
+        # пересканировать нормальный документ, хотя на деле на сервере
+        # просто не поднялся OCR.
+        if _ocr_pages and not _ocr.get("available"):
+            _why = _ocr.get("error") or "модуль распознавания не установлен"
+            doc["error"] = (
+                f"Документ немашиночитаемый (скан), а распознавание текста "
+                f"недоступно: {_why}. С самим файлом, скорее всего, всё в "
+                f"порядке — нужно поднять OCR на сервере либо приложить "
+                f"текстовую версию документа."
+            )
+        elif _ocr_pages:
+            doc["error"] = (
+                f"Скан распознан лишь частично — извлечено {len(full_text)} симв. "
+                f"Проверьте качество скана (разрешение, контраст, перекос) "
+                f"или приложите текстовую версию."
+            )
+        else:
+            doc["error"] = (
+                f"Извлечено всего {len(full_text)} симв. — документ пуст или "
+                f"нечитаем. Приложите текстовую версию."
+            )
+        doc["pages"]     = pages
+        doc["full_text"] = full_text
+        return doc
+
+    # Качество OCR оценивается только по распознанной части: для документа
+    # с текстовым слоем эта проверка бессмысленна и не проводится.
+    if _ocr_pages:
+        _ocr_text = "\n".join(
+            p.get("text", "") for p in pages if p.get("method") == "ocr"
+        )
+        _q_ok, _q_note = assess_ocr_quality(_ocr_text)
+        doc["ocr_quality_ok"]   = _q_ok
+        doc["ocr_quality_note"] = _q_note
+
+    # Шапка для верхнеуровневого чтения — первые head_pages страниц уже
+    # разобранного документа (повторно файл не парсим).
+    head_text = "\n".join(
+        p.get("text", "") for p in pages[:max(1, head_pages)] if p.get("text")
+    ).strip()
+
+    doc.update({
+        "ok":        True,
+        "pages":     pages,
+        "full_text": full_text,
+        "head_text": head_text,
+    })
+    return doc
+
+
+def doc_from_scanner(scan_doc: Dict) -> Dict:
+    """
+    Оборачивает документ из базы Сканера в ту же структуру, что и
+    приложенный с рабочей машины. Файл уже разобран Сканером — повторное
+    извлечение текста и валидация формата не нужны.
+    """
+    from streamlit_pages.doc_scanner import _fname as _scan_fname
+
+    cfg        = load_predictor_config()
+    head_pages = int(cfg.get("head_pages", 2))
+
+    pages     = scan_doc.get("pages", []) or []
+    full_text = scan_doc.get("full_text", "") or "\n".join(
+        p.get("text", "") for p in pages if p.get("text")
+    )
+    head_text = "\n".join(
+        p.get("text", "") for p in pages[:max(1, head_pages)] if p.get("text")
+    ).strip() or full_text[:3000]
+
+    filename = _scan_fname(scan_doc)
+
+    # Сканер уже посчитал, сколько страниц прошло через OCR (add_to_db,
+    # поле ocr_pages) — берём оттуда, а при отсутствии считаем сами по
+    # методам страниц: документы, загруженные старыми версиями Сканера,
+    # этого поля могут не иметь.
+    _ocr_pages = scan_doc.get("ocr_pages")
+    if _ocr_pages is None:
+        _ocr_pages = sum(1 for p in pages if p.get("method") == "ocr")
+
+    doc = {
+        "id":           _new_doc_id(),
+        "sig":          f"scanner:{scan_doc.get('id', filename)}",
+        "filename":     filename,
+        "size":         len(full_text.encode("utf-8", errors="ignore")),
+        "ok":           bool(full_text.strip()),
+        "error":        "" if full_text.strip() else "Документ Сканера пуст.",
+        "pages":        pages,
+        "full_text":    full_text,
+        "head_text":    head_text,
+        "head_summary": "",
+        "source":       "scanner",
+        "ocr_pages":       _ocr_pages,
+        "ocr_ratio":       (_ocr_pages / len(pages)) if pages else 0.0,
+        "ocr_quality_ok":  True,
+        "ocr_quality_note": "",
+    }
+
+    if _ocr_pages:
+        _ocr_text = "\n".join(
+            p.get("text", "") for p in pages if p.get("method") == "ocr"
+        ) or full_text
+        doc["ocr_quality_ok"], doc["ocr_quality_note"] = assess_ocr_quality(_ocr_text)
+
+    return doc
+
+
+def read_document_head(doc: Dict, article_name: str,
+                       client=None, model: str = None) -> str:
+    """
+    Верхнеуровневое чтение документа: один LLM-вызов по шапке (первые
+    head_pages страниц) → одно-два предложения о том, что это за документ.
+
+    Справочника видов документов здесь намеренно нет — система не
+    классифицирует бумагу по типу, а просто коротко пересказывает, что
+    прочитала. Сбой мягкий: возвращается пустая строка, документ остаётся
+    пригодным для прогноза.
+    """
+    if not doc.get("ok") or not doc.get("head_text"):
+        return ""
+
+    cfg        = load_predictor_config()
+    prompts    = load_predictor_prompts()
+    max_tokens = int(cfg.get("head_summary_max_tokens", 200))
+
+    try:
+        if client is None:
+            from openai import OpenAI
+            lm_url, _model = _load_lm_config()
+            client = OpenAI(base_url=lm_url, api_key="lm-studio", timeout=180.0)
+            model = model or _model
+        user_prompt = (
+            prompts["predictor_doc_head_user"]
+            .replace("{filename}",     doc.get("filename", ""))
+            .replace("{article_name}", article_name or "(не указана)")
+            .replace("{head_text}",    (doc.get("head_text") or "")[:6000])
+        )
+        raw = _lm_call(
+            client, model, prompts["predictor_doc_head_system"],
+            user_prompt, max_tokens=max_tokens,
+        )
+        if raw.startswith("[Ошибка LM:"):
+            print(f"[PREDICTOR DOCS] Верхнеуровневое чтение не удалось: {raw}", flush=True)
+            return ""
+        return raw.strip()
+    except Exception as e:
+        print(f"[PREDICTOR DOCS] Верхнеуровневое чтение не удалось: {e}", flush=True)
+        return ""
+
+
+def ok_docs(docs: Optional[List[Dict]]) -> List[Dict]:
+    """Только те документы, что прошли валидацию — непригодные в прогноз не идут."""
+    return [d for d in (docs or []) if d.get("ok")]
+
+
+def build_docs_context(docs: List[Dict], article_name: str = "",
+                       budget: int = None, _progress_cb=None) -> str:
+    """
+    Собирает текст приложенных документов в единый блок обоснования с явной
+    маркировкой источника каждого фрагмента:
+
+        === ДОКУМЕНТ 1: Штатное расписание 2026.pdf ===
+        <текст или сжатое резюме>
+
+    Маркировка нужна классификатору, чтобы он мог указать, ИЗ КАКОГО именно
+    документа взята сопоставляемая позиция (см. classify_chunk, поле "doc").
+
+    Бюджет делится поровну между документами; тот, чей текст в свою долю не
+    помещается, сжимается через compress_document (Map-Reduce по статье
+    затрат), а не обрезается посередине — обрезка по символу выбрасывает
+    именно концовку, где у регуляторных документов обычно и стоят выводы.
+    """
+    docs = ok_docs(docs)
+    if not docs:
+        return ""
+
+    if budget is None:
+        budget = int(load_predictor_config().get("doc_full_text_budget", 8000))
+
+    per_doc = max(1500, budget // max(1, len(docs)))
+    blocks  = []
+    total   = len(docs)
+
+    for i, doc in enumerate(docs, 1):
+        body = (doc.get("full_text") or "").strip()
+        if len(body) > per_doc:
+            if _progress_cb:
+                _progress_cb(
+                    (i - 1) / total,
+                    f"Сжатие документа {i}/{total}: {doc.get('filename', '')}…",
+                )
+            compressed = compress_document(body, article_name or "")
+            if compressed and not compressed.startswith("[Ошибка сжатия:"):
+                body = compressed
+            else:
+                # Сжатие не удалось — берём начало и конец, а не только
+                # начало: выводы регуляторных документов обычно в конце.
+                head_part = body[: per_doc // 2]
+                tail_part = body[-(per_doc // 2):]
+                body = f"{head_part}\n…\n{tail_part}"
+        blocks.append(
+            f"=== ДОКУМЕНТ {i}: {doc.get('filename', 'без имени')} ===\n{body}"
+        )
+
+    return "\n\n".join(blocks)
+
+
+def build_doc_labels(docs: List[Dict], per_doc_chars: int = 200) -> List[str]:
+    """
+    Компактный нумерованный перечень приложенных документов для промпта
+    классификации: «1 — имя файла: о чём документ».
+
+    Отдельно от build_docs_context намеренно: полный текст документов в
+    промпте классификации урезается по justification_chars_with_docs и
+    последние документы из него могут выпасть целиком. Этот короткий
+    перечень выпасть не может, поэтому привязка вердикта к документу
+    остаётся возможной независимо от длины обоснования.
+    """
+    labels = []
+    for i, doc in enumerate(ok_docs(docs), 1):
+        head = (doc.get("head_summary") or "").strip().replace("\n", " ")
+        line = f"{i} — {doc.get('filename', 'без имени')}"
+        if head:
+            line += f": {head[:per_doc_chars]}"
+        labels.append(line)
+    return labels
 
 
 # =============================================================================
@@ -1400,7 +1909,8 @@ def _verify_regulator_choice_vs_user_position(
 
 
 def classify_chunk(chunk_text: str, article_name: str, justification_summary: str,
-                   client, model: str, force_verification: Optional[bool] = None) -> Dict:
+                   client, model: str, force_verification: Optional[bool] = None,
+                   doc_labels: Optional[List[str]] = None) -> Dict:
     """
     Классифицирует один чанк протокола.
     Возвращает: {"decision": "positive"|"negative"|"neutral", "quote": str, "reason": str}
@@ -1412,12 +1922,33 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
     (используется переключателем в интерфейсе, чтобы можно было быстро
     сравнить результат с включённой/выключенной второй проверкой без
     правки config-файла).
+
+    `doc_labels` — компактный перечень приложенных пользователем документов
+    (см. build_doc_labels). Если передан и включён doc_attribution, к
+    промпту добавляется требование указать в поле "doc" номер документа,
+    из которого взята сопоставляемая позиция пользователя — тогда в
+    результате появляется "source_doc_idx". Привязка делается ВНУТРИ этого
+    же вызова, без отдельного LLM-запроса на чанк: стоимость прогноза не
+    удваивается, добавляется лишь несколько токенов в ответе.
+
+    ВАЖНО: когда документов нет (doc_labels пуст), промпт и лимиты
+    остаются ровно теми же, что и до появления этой возможности —
+    поведение прежнего сценария «только текстом» не меняется вообще.
     """
     cfg     = load_predictor_config()
     prompts = load_predictor_prompts()
 
+    _doc_labels     = [l for l in (doc_labels or []) if l]
+    _attribution_on = bool(_doc_labels) and bool(cfg.get("doc_attribution", True))
+
     _chunk_chars   = int(cfg["chunk_chars_to_llm"])
-    _justify_chars = int(cfg["justification_chars"])
+    # С приложенными документами обоснование урезать до justification_chars
+    # (200 симв. по умолчанию) нельзя — от позиции пользователя не остаётся
+    # ничего, и сравнивать становится не с чем.
+    _justify_chars = int(
+        cfg.get("justification_chars_with_docs", 2000) if _doc_labels
+        else cfg["justification_chars"]
+    )
     _max_tokens    = int(cfg["classify_max_tokens"])
 
     _chunk   = chunk_text[:_chunk_chars]
@@ -1469,6 +2000,30 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
         .replace("{justification_line}", _justify_line)
         .replace("{chunk}",             _chunk)
     )
+
+    # ── Привязка вердикта к конкретному приложенному документу ───────────
+    # Блок добавляется в самый конец промпта и ЯВНО отменяет формат ответа,
+    # заданный выше в шаблоне — иначе модель, увидев два описания JSON,
+    # выбирает первое и поле "doc" не возвращает. Основная инструкция по
+    # классификации при этом не трогается: добавочный текст говорит только
+    # о том, ОТКУДА взята позиция пользователя, и не вмешивается в правила
+    # определения decision.
+    if _attribution_on:
+        _docs_list = "\n".join(_doc_labels)
+        prompt += (
+            "\n\nДОПОЛНИТЕЛЬНО. Пользователь приложил документы-обоснования:\n"
+            f"{_docs_list}\n\n"
+            "Укажи в поле \"doc\" номер ТОГО документа, в котором заявлена "
+            "позиция пользователя, которую ты сейчас сравнивал с решением "
+            "регулятора. Если позиция взята из текстового описания, а не из "
+            "документа, либо определить источник невозможно — укажи 0. Не "
+            "угадывай: 0 — нормальный ответ.\n"
+            "ИТОГОВЫЙ ФОРМАТ ОТВЕТА (заменяет указанный выше; поле \"doc\" "
+            "обязательно):\n"
+            '{"decision":"positive|negative|neutral","quote":"…","reason":"…","doc":0}'
+        )
+        _max_tokens += 20  # запас на добавочное поле, чтобы не обрезать JSON
+
     raw = _lm_call(client, model, system_prompt, prompt, max_tokens=_max_tokens)
     # Парсим JSON
     try:
@@ -1481,6 +2036,19 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
         reason = data.get("reason", "")
         quote  = data.get("quote", chunk_text[:150])
         decision, _was_fixed = _reconcile_decision_with_reason(decision, reason)
+
+        # Номер приложенного документа, давшего основание для сравнения.
+        # 0 / отсутствие поля / мусор / номер вне диапазона → None: привязка
+        # просто не показывается, на сам вердикт это не влияет.
+        _source_doc_idx = None
+        if _attribution_on:
+            try:
+                _raw_doc = data.get("doc", 0)
+                _doc_num = int(str(_raw_doc).strip())
+                if 1 <= _doc_num <= len(_doc_labels):
+                    _source_doc_idx = _doc_num
+            except Exception:
+                _source_doc_idx = None
 
         needs_expert_review = False
         original_decision = None
@@ -1542,6 +2110,7 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
             "decision_fields": decision_fields,
             "needs_expert_review": needs_expert_review,
             "original_decision": original_decision,
+            "source_doc_idx": _source_doc_idx,
         }
     except Exception:
         # Fallback: пробуем угадать по ключевым словам
@@ -1554,7 +2123,7 @@ def classify_chunk(chunk_text: str, article_name: str, justification_summary: st
             decision = "neutral"
         decision, _was_fixed = _reconcile_decision_with_reason(decision, raw)
         return {"decision": decision, "quote": chunk_text[:150], "reason": raw[:100],
-                "decision_fields": decision_fields}
+                "decision_fields": decision_fields, "source_doc_idx": None}
 
 
 # =============================================================================
@@ -1606,6 +2175,17 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
 
         _file_needs_review = any(c.get("needs_expert_review") for c in chunks)
 
+        # Приложенные документы, на которые сослались чанки этого файла
+        # (см. classify_chunk, поле "doc"). Берём только чанки с
+        # победившим решением — ссылка из отброшенного меньшинства к
+        # итоговому вердикту файла отношения не имеет. Сохраняем как
+        # отсортированный список номеров: один прецедент вполне может
+        # сопоставляться сразу с несколькими документами пользователя.
+        _doc_refs = sorted({
+            c["source_doc_idx"] for c in candidates
+            if c.get("source_doc_idx")
+        })
+
         file_record = {
             "file":         fname,
             "date":         best_chunk.get("date", ""),
@@ -1623,6 +2203,8 @@ def aggregate_by_file(classified_chunks: List[Dict]) -> Dict:
             "original_decision": best_chunk.get("original_decision"),
             "chunks_total": len(chunks),
             "chunks_decision": dict(counter),
+            "source_doc_idx":  best_chunk.get("source_doc_idx"),
+            "source_doc_refs": _doc_refs,
         }
         result[decision].append(file_record)
         result["total_files"] += 1
@@ -1827,6 +2409,7 @@ def run_prediction(
     _progress_cb=None,
     force_verification: Optional[bool] = None,
     with_summary: bool = True,
+    docs: Optional[List[Dict]] = None,
 ) -> Optional[Dict]:
     """
     Запускает полный цикл прогноза. Возвращает dict с результатами или None при ошибке.
@@ -1837,9 +2420,36 @@ def run_prediction(
     классификации; см. generate_prediction_summary. Управляется чекбоксом в
     интерфейсе и общим выключателем "enable_summary" в конфиге (оба должны
     разрешать резюме).
+    `docs` — приложенные документы-обоснования (см. validate_and_read_upload).
+    Их текст добавляется к обоснованию с маркировкой источника, а каждый
+    вердикт получает привязку к конкретному документу (source_doc_idx).
+    При docs=None поведение полностью совпадает с прежним — сценарий
+    «только текстом» не затронут.
     """
     if not article_name.strip():
         return None
+
+    # ── Приложенные документы ────────────────────────────────────────────
+    # Непригодные (не прошедшие валидацию) сюда не попадают — интерфейс
+    # показывает их отдельно с причиной отказа, но в прогноз не отдаёт.
+    _docs        = ok_docs(docs)
+    _doc_labels  = build_doc_labels(_docs)
+    _docs_context = ""
+    # Текстовое описание пользователя ДО подмешивания документов — именно оно
+    # (а не текст документов) идёт в поисковый запрос ниже. Без отдельной
+    # переменной в запрос утекал весь контекст документов целиком.
+    _user_text   = (justification_text or "").strip()
+    if _docs:
+        if _progress_cb:
+            _progress_cb(0.02, f"Подготовка приложенных документов ({len(_docs)} шт.)…")
+        _docs_context = build_docs_context(
+            _docs, article_name,
+            _progress_cb=lambda p, m: _progress_cb(0.02 + p * 0.06, m) if _progress_cb else None,
+        )
+        justification_text = (
+            f"{justification_text}\n\n{_docs_context}".strip()
+            if (justification_text or "").strip() else _docs_context
+        )
 
     if sources is None:
         sources = ["expertise"]
@@ -1859,14 +2469,29 @@ def run_prediction(
     if _progress_cb:
         _progress_cb(0.05, "Формирование поискового запроса…")
     _JUSTIFICATION_QUERY_CHARS = 400
-    if justification_text:
+    if _docs:
+        # С приложенными документами в запрос идёт НЕ начало их текста —
+        # первая страница регуляторного документа это обычно шапка с
+        # реквизитами, по которой поиск уходит в сторону. Берём
+        # верхнеуровневые описания документов (о чём они) плюс текстовое
+        # описание пользователя, если оно есть.
+        _heads = " ".join(
+            (d.get("head_summary") or "").strip() for d in _docs
+        ).strip()
+        _query_tail = " ".join(x for x in (_heads, _user_text) if x)
+        search_query = f"{article_name} {_query_tail[:_JUSTIFICATION_QUERY_CHARS]}".strip()
+    elif justification_text:
         search_query = f"{article_name} {justification_text[:_JUSTIFICATION_QUERY_CHARS]}"
     else:
         search_query = article_name
 
-    # 2. Сжимаем обоснование если длинное
+    # 2. Сжимаем обоснование если длинное.
+    # С приложенными документами глобальное сжатие НЕ применяется: текст уже
+    # ограничен бюджетом doc_full_text_budget в build_docs_context, а проход
+    # через compress_document уничтожил бы маркеры «=== ДОКУМЕНТ N: … ===»,
+    # без которых невозможна привязка вердикта к документу.
     justification_summary = justification_text
-    if justification_text and len(justification_text) > _LARGE_DOC_THRESHOLD:
+    if (not _docs) and justification_text and len(justification_text) > _LARGE_DOC_THRESHOLD:
         if _progress_cb:
             _progress_cb(0.1, "Сжатие документа-обоснования…")
         justification_summary = compress_document(
@@ -1933,6 +2558,7 @@ def run_prediction(
         classification = classify_chunk(
             chunk["text"], article_name, justification_summary, client, model,
             force_verification=force_verification,
+            doc_labels=_doc_labels,
         )
         classified.append({**chunk, **classification})
 
@@ -1978,6 +2604,26 @@ def run_prediction(
         "sources":              sources,
         "npa_sources":          npa_sources,
         "summary":              summary_result,
+        # Приложенные документы — без текста (он уже в justification_summary):
+        # результат прогноза кладётся в session_state, и таскать в нём
+        # полные тексты всех документов незачем.
+        "user_docs": [
+            {
+                "idx":          i,
+                "filename":     d.get("filename", ""),
+                "head_summary": d.get("head_summary", ""),
+                "chars":        len(d.get("full_text", "") or ""),
+                "pages":        len(d.get("pages", []) or []),
+                "source":       d.get("source", "upload"),
+                # Немашиночитаемые документы прослеживаются до самого
+                # результата: эксперт должен видеть, что вердикт опирается
+                # на распознанный, а не на исходный текст.
+                "ocr_pages":        d.get("ocr_pages", 0),
+                "ocr_quality_ok":   d.get("ocr_quality_ok", True),
+                "ocr_quality_note": d.get("ocr_quality_note", ""),
+            }
+            for i, d in enumerate(_docs, 1)
+        ],
     }
 
 
@@ -2045,8 +2691,15 @@ def compute_approval_score(n_positive: int, n_negative: int, n_neutral: int) -> 
     }
 
 
-def _source_card(record: Dict, idx: int, decision: str, article: str = "") -> None:
-    """Отображает одну карточку-источник в свёрнутом виде (как в советчике)."""
+def _source_card(record: Dict, idx: int, decision: str, article: str = "",
+                 user_docs: Optional[List[Dict]] = None) -> None:
+    """Отображает одну карточку-источник в свёрнутом виде (как в советчике).
+
+    `user_docs` — приложенные пользователем документы (result["user_docs"]).
+    Если передан, в карточке показывается, ИЗ КАКОГО именно документа взята
+    позиция, которую модель сопоставляла с этим прецедентом (см.
+    classify_chunk, поле "doc" → source_doc_idx).
+    """
     color_map = {"positive": "#2e7a50", "negative": "#b33a3a", "neutral": "#888"}
     border_color = color_map.get(decision, "#888")
 
@@ -2100,6 +2753,24 @@ def _source_card(record: Dict, idx: int, decision: str, article: str = "") -> No
         # Причина (от LLM-классификатора — почему отнесён к за/против/нейтрально)
         if record.get("reason"):
             st.caption(f"Оценка системы: {record['reason']}")
+
+        # ── Привязка к приложенному документу ────────────────────────────
+        # Показывает, текст какого именно документа пользователя послужил
+        # основанием для сопоставления с этим прецедентом. Отсутствие
+        # привязки — штатная ситуация (позиция взята из текстового описания
+        # либо модель не смогла определить источник), поэтому при пустом
+        # source_doc_refs просто ничего не показываем.
+        if user_docs:
+            _by_idx = {d.get("idx"): d for d in user_docs}
+            _refs   = record.get("source_doc_refs") or (
+                [record["source_doc_idx"]] if record.get("source_doc_idx") else []
+            )
+            _names = [
+                _by_idx[r].get("filename", "")
+                for r in _refs if r in _by_idx
+            ]
+            if _names:
+                st.caption("Сопоставлено с вашим документом: " + "  ·  ".join(_names))
 
         # ── Ручная коррекция эксперта — доступна для ЛЮБОЙ категории ────────
         # Раньше кнопки "за/против" показывались только для нейтральных
@@ -2268,8 +2939,10 @@ def _show_registry():
 def show_predictor():
     st.header("Прогноз решения регулятора")
     st.info(
-        "Введите статью затрат и обоснование — система найдёт аналогичные случаи "
-        "в протоколах и экспертных заключениях регуляторов и оценит вероятность одобрения."
+        "Введите статью затрат и обоснование — текстом и/или приложенными "
+        "документами. Система прочитает приложенное, найдёт аналогичные случаи "
+        "в протоколах и экспертных заключениях регуляторов, оценит вероятность "
+        "одобрения и покажет, какой из ваших документов с чем сопоставлен."
     )
 
     # ── session_state ────────────────────────────────────────────────────────
@@ -2277,6 +2950,7 @@ def show_predictor():
         ("pred_result",       None),
         ("pred_running",      False),
         ("pred_doc_text",     ""),
+        ("pred_docs",         []),   # приложенные документы текущего прогноза
     ]:
         if key not in st.session_state:
             st.session_state[key] = val
@@ -2474,85 +3148,240 @@ def _show_predict_tab():
     )
 
     # ── Шаг 2: Документы-обоснования ─────────────────────────────────────────
+    # ОБЪЕДИНЁННЫЙ РЕЖИМ. Раньше здесь была радиокнопка «Текстом / Загрузить
+    # файл / Из Сканера» — три взаимоисключающих способа, по одному файлу за
+    # раз. Теперь текстовое описание, файлы с рабочей машины и документы из
+    # базы Сканера можно сочетать в одном прогнозе, а приложить — сразу
+    # несколько. Документы живут только в рамках текущего прогноза
+    # (st.session_state["pred_docs"]) и в базу Сканера не записываются.
     st.subheader("2. Документы-обоснования")
     st.caption(
-        "Опишите обоснование текстом и/или приложите файл. "
-        "Большие документы будут автоматически сжаты."
+        "Опишите обоснование текстом и/или приложите документы — с рабочей "
+        "машины или из базы Сканера. Способы можно сочетать: в прогноз "
+        "уйдёт всё приложенное вместе."
     )
 
-    input_method = st.radio(
-        "Способ ввода",
-        ["Текстом", "Загрузить файл", "Из Сканера документов"],
-        horizontal=True,
-        key="pred_input_method",
+    _cfg_ui   = load_predictor_config()
+    _max_docs = int(_cfg_ui.get("max_docs", 10))
+    _max_mb   = int(_cfg_ui.get("max_upload_mb", 50))
+
+    docs: List[Dict] = st.session_state.setdefault("pred_docs", [])
+
+    # ── Состояние распознавания немашиночитаемых документов ──────────────
+    # Показываем ДО прикрепления: если OCR не поднят, скан не прочитается,
+    # и лучше сказать об этом сразу, чем после долгой обработки файла.
+    # Инициализация идёт под тем же ключом session_state, что и в Сканере,
+    # поэтому модель в VRAM не грузится повторно.
+    _ocr_state = ensure_ocr_ready()
+    if not _ocr_state.get("available"):
+        st.warning(
+            "Распознавание текста (OCR) недоступно"
+            + (f": {_ocr_state['error']}" if _ocr_state.get("error") else "")
+            + ". Документы с текстовым слоем (PDF, DOCX, XLSX, TXT) читаются "
+              "как обычно, а сканы и фотографии приложить не получится."
+        )
+    elif _ocr_state.get("engine") == "tesseract":
+        st.caption(
+            "⚠️ Основной модуль распознавания недоступен, работает резервный "
+            "(Tesseract) — качество распознавания сканов будет ниже."
+        )
+
+    justification_text = st.text_area(
+        "Описание обоснования (опционально, если приложены документы)",
+        height=140,
+        placeholder=(
+            "Опишите суть обоснования: какие нормативы применялись, "
+            "какие расчёты выполнены, на какие документы опираетесь..."
+        ),
+        key="pred_justification_text",
     )
 
-    justification_text = ""
+    # ── Прикрепление с рабочей машины ────────────────────────────────────
+    _uploaded = st.file_uploader(
+        f"Приложить документы с рабочей машины "
+        f"(до {_max_docs} шт., до {_max_mb} МБ каждый)",
+        type=[e.lstrip(".") for e in _SUPPORTED_EXTS],
+        accept_multiple_files=True,
+        key="pred_upload",
+        help=(
+            "PDF (в том числе сканы — распознаются через OCR), DOCX, DOC, "
+            "XLSX, TXT, изображения. Каждый документ читается один раз при "
+            "прикреплении, повторно при пересчёте прогноза не разбирается."
+        ),
+    )
 
-    if input_method == "Текстом":
-        justification_text = st.text_area(
-            "Описание обоснования",
-            height=160,
-            placeholder=(
-                "Опишите документы и суть обоснования: "
-                "какие нормативы применялись, какие расчёты выполнены, "
-                "какие документы прилагаются..."
-            ),
-            key="pred_justification_text",
-        )
+    # Синхронизация с виджетом: файл, убранный пользователем из загрузчика,
+    # убираем и из списка. Документы из Сканера виджету не принадлежат —
+    # их эта синхронизация не трогает.
+    _widget_sigs = {_doc_sig(f.name, f.size) for f in (_uploaded or [])}
+    _kept = [
+        d for d in docs
+        if d.get("source") != "upload" or d.get("sig") in _widget_sigs
+    ]
+    if len(_kept) != len(docs):
+        docs[:] = _kept
 
-    elif input_method == "Загрузить файл":
-        uploaded = st.file_uploader(
-            "Загрузите документ-обоснование",
-            type=["pdf", "docx", "doc", "txt", "xlsx"],
-            key="pred_upload",
-        )
-        if uploaded:
-            with st.spinner("Извлекаю текст из файла…"):
-                raw_text = extract_file_text(uploaded.read(), uploaded.name)
-            st.session_state.pred_doc_text = raw_text
-            st.success(f"Файл прочитан: {len(raw_text):,} символов")
-            preview = raw_text[:500]
-            with st.expander("Предпросмотр текста"):
-                st.text(preview + ("…" if len(raw_text) > 500 else ""))
-        justification_text = st.session_state.get("pred_doc_text", "")
+    _known_sigs = {d.get("sig") for d in docs}
+    _new_files  = [
+        f for f in (_uploaded or [])
+        if _doc_sig(f.name, f.size) not in _known_sigs
+    ]
 
-        # Дополнительный текст
-        extra = st.text_area(
-            "Дополнительное описание (опционально)",
-            height=80,
-            key="pred_extra_text",
-        )
-        if extra.strip():
-            justification_text = (justification_text + "\n\n" + extra).strip()
-
-    elif input_method == "Из Сканера документов":
-        try:
-            from streamlit_pages.doc_scanner import load_db as load_scan_db, _fname
-            scan_db = load_scan_db()
-            docs = scan_db.get("documents", [])
-        except Exception:
-            docs = []
-
-        if not docs:
-            st.warning("База Сканера пуста. Загрузите документы в разделе «Сканер документов».")
-        else:
-            doc_options = {_fname(d): d for d in docs}
-            selected_name = st.selectbox(
-                "Выберите документ",
-                list(doc_options.keys()),
-                key="pred_scanner_select",
+    if _new_files:
+        _free = max(0, _max_docs - len(docs))
+        if len(_new_files) > _free:
+            st.warning(
+                f"Приложить можно не больше {_max_docs} документов — "
+                f"лишние файлы пропущены."
             )
-            if selected_name:
-                selected_doc = doc_options[selected_name]
-                scan_text = selected_doc.get("full_text", "")
-                if not scan_text:
-                    scan_text = "\n".join(
-                        p.get("text", "") for p in selected_doc.get("pages", [])
+        # Один клиент на всю пачку — не поднимаем соединение на каждый файл.
+        _head_client, _head_model = None, None
+        try:
+            from openai import OpenAI
+            _lm_url, _head_model = _load_lm_config()
+            _head_client = OpenAI(base_url=_lm_url, api_key="lm-studio", timeout=180.0)
+        except Exception as _e:
+            st.caption(
+                f"⚠️ LLM недоступна ({_e}) — документы будут приложены без "
+                f"верхнеуровневого описания."
+            )
+        for _f in _new_files[:_free]:
+            with st.spinner(f"Читаю «{_f.name}»…"):
+                _d = validate_and_read_upload(_f.getvalue(), _f.name)
+                if _d.get("ok"):
+                    _d["head_summary"] = read_document_head(
+                        _d, article_name, _head_client, _head_model,
                     )
-                st.session_state.pred_doc_text = scan_text
-                st.caption(f"Объём: {len(scan_text):,} символов · {selected_doc.get('word_count', 0):,} слов")
-                justification_text = scan_text
+            docs.append(_d)
+            _log_usage("predictor", "doc_attached", meta={
+                "filename": _d.get("filename", "")[:120],
+                "source":   "upload",
+                "ok":       bool(_d.get("ok")),
+                "chars":    len(_d.get("full_text", "") or ""),
+                "error":    (_d.get("error") or "")[:120],
+            })
+        st.rerun()
+
+    # ── Выбор из базы Сканера документов ─────────────────────────────────
+    with st.expander("Выбрать документы из Сканера", expanded=False):
+        try:
+            from streamlit_pages.doc_scanner import (
+                load_db as _load_scan_db, _fname as _scan_fname,
+            )
+            _scan_docs = _load_scan_db().get("documents", [])
+        except Exception:
+            _scan_docs = []
+
+        if not _scan_docs:
+            st.caption(
+                "База Сканера пуста — загрузите документы в разделе "
+                "«Сканер документов»."
+            )
+        else:
+            _scan_opts = {_scan_fname(d): d for d in _scan_docs}
+            _picked = st.multiselect(
+                "Документы из базы Сканера",
+                list(_scan_opts.keys()),
+                key="pred_scanner_pick",
+                placeholder="Ничего не выбрано",
+            )
+            if st.button(
+                "Приложить выбранные",
+                key="pred_scanner_add",
+                disabled=not _picked,
+                use_container_width=True,
+            ):
+                _free = max(0, _max_docs - len(docs))
+                _already = {d.get("filename") for d in docs}
+                _head_client, _head_model = None, None
+                try:
+                    from openai import OpenAI
+                    _lm_url, _head_model = _load_lm_config()
+                    _head_client = OpenAI(
+                        base_url=_lm_url, api_key="lm-studio", timeout=180.0,
+                    )
+                except Exception:
+                    _head_client = None
+                _added = 0
+                for _name in _picked:
+                    if _added >= _free or _name in _already:
+                        continue
+                    with st.spinner(f"Читаю «{_name}»…"):
+                        _d = doc_from_scanner(_scan_opts[_name])
+                        if _d.get("ok"):
+                            _d["head_summary"] = read_document_head(
+                                _d, article_name, _head_client, _head_model,
+                            )
+                    docs.append(_d)
+                    _added += 1
+                    _log_usage("predictor", "doc_attached", meta={
+                        "filename": _d.get("filename", "")[:120],
+                        "source":   "scanner",
+                        "ok":       bool(_d.get("ok")),
+                        "chars":    len(_d.get("full_text", "") or ""),
+                    })
+                st.rerun()
+
+    # ── Карточки приложенных документов ──────────────────────────────────
+    if docs:
+        _n_ok  = len(ok_docs(docs))
+        _n_bad = len(docs) - _n_ok
+        _hdr = f"Приложено документов: {_n_ok}"
+        if _n_bad:
+            _hdr += f"  ·  отклонено: {_n_bad}"
+        st.markdown(f"**{_hdr}**")
+
+        for _i, _d in enumerate(docs):
+            _is_ok   = bool(_d.get("ok"))
+            _mark    = "✅" if _is_ok else "⚠️"
+            _src_lbl = "Сканер" if _d.get("source") == "scanner" else "с машины"
+            _size_kb = (_d.get("size", 0) or 0) / 1024
+
+            _c1, _c2 = st.columns([11, 1])
+            with _c1:
+                st.markdown(
+                    f"{_mark} **{_d.get('filename', 'без имени')}**  "
+                    f"<span style='color:#666;font-size:0.82rem'>"
+                    f"{_src_lbl} · {_size_kb:,.0f} КБ · "
+                    f"{len(_d.get('pages', []) or [])} стр. · "
+                    f"{len(_d.get('full_text', '') or ''):,} симв.</span>".replace(",", " "),
+                    unsafe_allow_html=True,
+                )
+                if _is_ok:
+                    if _d.get("head_summary"):
+                        st.caption(f"Система прочитала: {_d['head_summary']}")
+                    else:
+                        st.caption(
+                            "Верхнеуровневое описание не получено — на сам "
+                            "прогноз это не влияет, документ используется целиком."
+                        )
+                    with st.expander("Показать текст документа", expanded=False):
+                        for _p in (_d.get("pages") or [])[:50]:
+                            _ptxt = (_p.get("text") or "").strip()
+                            if not _ptxt:
+                                continue
+                            _pm = " · OCR" if _p.get("method") == "ocr" else ""
+                            st.caption(f"Страница {_p.get('page', '?')}{_pm}")
+                            st.text(_ptxt[:3000] + ("…" if len(_ptxt) > 3000 else ""))
+                        if len(_d.get("pages") or []) > 50:
+                            st.caption("… показаны первые 50 страниц.")
+                else:
+                    st.caption(f"Не принят: {_d.get('error', 'причина не определена')}")
+            with _c2:
+                if st.button(
+                    "✕", key=f"pred_doc_del_{_d.get('id', _i)}",
+                    help="Убрать документ",
+                ):
+                    docs[:] = [x for x in docs if x.get("id") != _d.get("id")]
+                    st.rerun()
+
+        if _n_bad:
+            st.caption(
+                "Отклонённые документы в прогноз не идут. Замените их "
+                "читаемой версией или уберите — остальные приложенные "
+                "документы это не затрагивает."
+            )
+        st.markdown("")
 
     # ── Шаг 3: Источник поиска ───────────────────────────────────────────────
     st.subheader("3. Источник поиска")
@@ -2809,6 +3638,10 @@ def _show_predict_tab():
             st.session_state._pred_params = {
                 "article":       article_name,
                 "justification": justification_text,
+                # Документы намеренно НЕ копируются в _pred_params: их полный
+                # текст уже лежит в st.session_state["pred_docs"], и дублировать
+                # его во втором ключе session_state незачем — читаем оттуда
+                # напрямую в момент запуска.
                 "top_k":         top_k,
                 "sources":       selected_sources,
                 "enable_verification": enable_verification,
@@ -2847,6 +3680,7 @@ def _show_predict_tab():
             "sources":          params.get("sources"),
             "has_filters":      bool(params.get("filters")),
             "has_justification": bool((params.get("justification") or "").strip()),
+            "n_docs":           len(ok_docs(st.session_state.get("pred_docs", []))),
         })
 
         with st.spinner("Анализирую протоколы и экспертные заключения…"):
@@ -2859,6 +3693,7 @@ def _show_predict_tab():
                 _progress_cb      = _progress,
                 force_verification= params.get("enable_verification"),
                 with_summary      = params.get("enable_summary", True),
+                docs              = st.session_state.get("pred_docs", []),
             )
 
         progress_bar.progress(1.0, text="Готово")
@@ -2882,6 +3717,11 @@ def _show_predict_tab():
                     {"file": r["file"], "decision": d}
                     for d in ("positive", "negative", "neutral")
                     for r in result["aggregated"].get(d, [])
+                ],
+                # Имена приложенных документов — без текста: реестр должен
+                # оставаться компактным, тексты обоснований в нём не хранятся.
+                "user_docs": [
+                    d.get("filename", "") for d in result.get("user_docs", [])
                 ],
             }
             save_to_registry(registry_record)
@@ -3072,6 +3912,45 @@ def _show_predict_tab():
 
     st.divider()
 
+    # ── Приложенные документы и их охват ─────────────────────────────────────
+    # Прослеживаемость: видно, что именно система прочитала и на сколько
+    # найденных прецедентов каждый документ реально повлиял. Документ с
+    # нулевым охватом — сигнал, что он к этой статье затрат отношения не
+    # имеет либо прочитан плохо (например, скан низкого качества).
+    _user_docs = result.get("user_docs") or []
+    if _user_docs:
+        _ref_counts = {d["idx"]: 0 for d in _user_docs}
+        for _rec in list(pos) + list(neg) + list(neu):
+            for _r in (_rec.get("source_doc_refs") or []):
+                if _r in _ref_counts:
+                    _ref_counts[_r] += 1
+
+        st.markdown(
+            "<div style='font-weight:600;font-size:1rem;margin-bottom:6px'>"
+            "Приложенные документы</div>",
+            unsafe_allow_html=True,
+        )
+        for _d in _user_docs:
+            _cnt = _ref_counts.get(_d["idx"], 0)
+            _src_lbl = "Сканер" if _d.get("source") == "scanner" else "с машины"
+            st.markdown(
+                f"**{_d['idx']}. {_d.get('filename', 'без имени')}**  "
+                f"<span style='color:#666;font-size:0.82rem'>{_src_lbl} · "
+                f"{_d.get('pages', 0)} стр. · {_d.get('chars', 0):,} симв. · "
+                f"сопоставлен с {_cnt} источник(ами)</span>".replace(",", " "),
+                unsafe_allow_html=True,
+            )
+            if _d.get("head_summary"):
+                st.caption(_d["head_summary"])
+            if _cnt == 0:
+                st.caption(
+                    "⚠️ Ни один найденный прецедент не был сопоставлен с этим "
+                    "документом — возможно, он не относится к данной статье "
+                    "затрат либо прочитан некачественно."
+                )
+        st.markdown("")
+        st.divider()
+
     # ── Источники — положительные ─────────────────────────────────────────────
     if pos:
         st.markdown(
@@ -3080,7 +3959,8 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(pos):
-            _source_card(rec, i, "positive", article=result.get("article", ""))
+            _source_card(rec, i, "positive", article=result.get("article", ""),
+                         user_docs=result.get("user_docs"))
         st.markdown("")
 
     # ── Источники — отрицательные ─────────────────────────────────────────────
@@ -3091,7 +3971,8 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(neg):
-            _source_card(rec, i, "negative", article=result.get("article", ""))
+            _source_card(rec, i, "negative", article=result.get("article", ""),
+                         user_docs=result.get("user_docs"))
         st.markdown("")
 
     # ── Источники — нейтральные ───────────────────────────────────────────────
@@ -3102,7 +3983,8 @@ def _show_predict_tab():
             unsafe_allow_html=True,
         )
         for i, rec in enumerate(neu):
-            _source_card(rec, i, "neutral", article=result.get("article", ""))
+            _source_card(rec, i, "neutral", article=result.get("article", ""),
+                         user_docs=result.get("user_docs"))
 
     if not pos and not neg and not neu:
         st.warning("По данной статье затрат не найдено релевантных фрагментов в протоколах.")
@@ -3110,14 +3992,28 @@ def _show_predict_tab():
     # ── Запрос и сжатое обоснование ───────────────────────────────────────────
     with st.expander("Детали поиска", expanded=False):
         st.caption(f"Поисковый запрос: {result.get('query', '—')}")
+        if result.get("user_docs"):
+            st.caption(
+                "Обоснование собрано из приложенных документов с маркировкой "
+                "источника («=== ДОКУМЕНТ N: … ===») — по ней модель и "
+                "определяет, с каким вашим документом сопоставлен прецедент."
+            )
         if result.get("justification_summary") and result["justification_summary"] != result.get("justification_text"):
-            st.markdown("**Сжатое обоснование:**")
+            st.markdown("**Обоснование, ушедшее в анализ:**")
             st.text(result["justification_summary"][:800])
 
     # ── Сброс ─────────────────────────────────────────────────────────────────
     st.divider()
     if st.button("Новый прогноз", key="pred_reset_btn"):
-        for k in ["pred_result", "pred_running", "_pred_params", "pred_doc_text"]:
+        # pred_docs и ключи виджетов прикрепления тоже сбрасываем: документы
+        # живут ровно один прогноз (решение по архитектуре — в базу Сканера
+        # они не сохраняются), поэтому «Новый прогноз» должен начинать с
+        # чистого листа, а не тянуть за собой файлы прошлой заявки.
+        for k in [
+            "pred_result", "pred_running", "_pred_params", "pred_doc_text",
+            "pred_docs", "pred_upload", "pred_scanner_pick",
+            "pred_expert_overrides",
+        ]:
             st.session_state.pop(k, None)
         st.rerun()
 

@@ -30,7 +30,8 @@ from core.help_requests import submit_request as submit_help, count_new as count
 # 🎨 Настройка страницы
 # =============================================================================
 st.set_page_config(page_title="РЕГУЛА.AI", layout="wide", page_icon="⚙")
-
+from core.ru_locale import apply_russian_ui
+apply_russian_ui()
 # =============================================================================
 # 🧪 ВРЕМЕННО: диагностика зависания загрузки файлов
 # =============================================================================
