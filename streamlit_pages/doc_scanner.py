@@ -1111,6 +1111,98 @@ def _confirm_delete_dialog(doc_id: str, filename: str, has_summary: bool):
 
 
 # =============================================================================
+# Модалка просмотра деталей документа (реестр)
+# =============================================================================
+def _db_page_step(pkey: str, delta: int, n_pages: int):
+    """on_click-колбэк навигации: меняет страницу до рендера модалки."""
+    cur = st.session_state.get(pkey, 0) + delta
+    st.session_state[pkey] = max(0, min(cur, max(n_pages - 1, 0)))
+
+
+@st.dialog("Детали документа", width="large")
+def _doc_details_dialog(doc: Dict, summary: str = ""):
+    """
+    Модальное окно с постраничным текстом распознавания и пересказом.
+    st.dialog работает как фрагмент: клики внутри перерисовывают только
+    модалку, поэтому навигация идёт через on_click-колбэки без st.rerun()
+    (st.rerun() закрыл бы окно).
+    """
+    _did   = doc["id"]
+    _dfn   = _fname(doc)
+    _pages = doc.get("pages", [])
+    _n     = len(_pages)
+
+    st.markdown(f"**{_dfn}**")
+    st.caption(
+        f"{doc.get('page_count') or _n} стр. · {doc.get('word_count', 0):,} слов · "
+        f"OCR: {doc.get('ocr_pages', 0)} · {(doc.get('processed_at') or '')[:10]}"
+    )
+
+    _tabs = st.tabs(["Текст распознавания", "Пересказ"])
+
+    # ── Текст по страницам ───────────────────────────────────────────────
+    with _tabs[0]:
+        if not _pages:
+            st.info("Текст распознавания отсутствует.")
+        else:
+            _pkey = f"db_page_{_did}"
+            if _pkey not in st.session_state:
+                st.session_state[_pkey] = 0
+            _pidx = max(0, min(st.session_state[_pkey], _n - 1))
+            _pcur = _pages[_pidx]
+
+            _n1, _n2, _n3 = st.columns([1, 4, 1])
+            with _n1:
+                st.button("◀", key=f"dlg_prev_{_did}", disabled=(_pidx == 0),
+                          use_container_width=True,
+                          on_click=_db_page_step, args=(_pkey, -1, _n))
+            with _n2:
+                _pw = _pcur.get("word_count") or len(_pcur.get("text", "").split())
+                st.markdown(
+                    f"<div style='text-align:center;padding-top:6px;'>"
+                    f"Страница <b>{_pidx+1}</b> из <b>{_n}</b> "
+                    f"<span style='color:#888;font-size:0.82em;'>"
+                    f"({_pcur.get('method','')} · {_pw} слов)</span></div>",
+                    unsafe_allow_html=True,
+                )
+            with _n3:
+                st.button("▶", key=f"dlg_next_{_did}", disabled=(_pidx >= _n - 1),
+                          use_container_width=True,
+                          on_click=_db_page_step, args=(_pkey, 1, _n))
+
+            st.markdown(
+                f"<div style='font-size:0.85em;line-height:1.55;"
+                f"background:#f8f9fa;border:1px solid #e0e0e0;"
+                f"border-radius:6px;padding:10px 12px;margin-top:6px;"
+                f"max-height:55vh;overflow-y:auto;"
+                f"white-space:pre-wrap;word-break:break-word;'>"
+                f"{_pcur.get('text','').replace('<','&lt;').replace('>','&gt;')}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Пересказ ─────────────────────────────────────────────────────────
+    with _tabs[1]:
+        if not summary:
+            st.info("Пересказ для этого документа ещё не сформирован.")
+        else:
+            st.caption(f"{len(summary.split())} слов")
+            st.markdown(
+                f"<div style='font-size:0.85em;line-height:1.6;"
+                f"background:#f0f4f8;border:1px solid #d0d8e4;"
+                f"border-radius:6px;padding:12px 14px;"
+                f"max-height:55vh;overflow-y:auto;"
+                f"white-space:pre-wrap;word-break:break-word;'>"
+                f"{summary.replace('<','&lt;').replace('>','&gt;')}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    if st.button("Закрыть", key=f"dlg_close_{_did}", use_container_width=True):
+        st.rerun()
+
+
+# =============================================================================
 # UI — главная страница сканера
 # =============================================================================
 def show_doc_scanner():
@@ -1994,10 +2086,6 @@ def show_doc_scanner():
             st.caption(f"Показано: {len(_filtered)} из {len(docs)}  ·  {_flt_hint}")
 
             # ── Список карточек ──────────────────────────────────────────────
-            _open_key = "db_open_card"
-            if _open_key not in st.session_state:
-                st.session_state[_open_key] = None
-
             for _d in _filtered:
                 _did  = _d["id"]
                 _dfn  = _fname(_d)
@@ -2012,7 +2100,6 @@ def show_doc_scanner():
                 )
                 _has_s  = bool(_dsum)
                 _orig_ok = bool(_dorig and os.path.exists(_dorig))
-                _is_open = st.session_state[_open_key] == _did
 
                 # Карточка — шапка
                 _badge = "✅ пересказ" if _has_s else "— пересказа нет"
@@ -2034,12 +2121,9 @@ def show_doc_scanner():
                 # Кнопки-действия в строке
                 _ca, _cb_btn, _cc, _cd, _ce_del = st.columns([3, 2, 2, 3, 1])
                 with _ca:
-                    _btn_label = "Скрыть детали" if _is_open else "Показать детали"
-                    if st.button(_btn_label, key=f"db_toggle_{_did}",
+                    if st.button("Показать детали", key=f"db_toggle_{_did}",
                                  use_container_width=True):
-                        st.session_state[_open_key] = None if _is_open else _did
-                        st.session_state[_del_pending_key] = None
-                        st.rerun()
+                        _doc_details_dialog(_d, _dsum or "")
                 with _cb_btn:
                     _file_label = "Открыть файл" if _orig_ok else "Файл недоступен"
                     if st.button(_file_label, key=f"db_open_{_did}",
@@ -2097,84 +2181,8 @@ def show_doc_scanner():
                                  help="Удалить документ из базы"):
                         _confirm_delete_dialog(_did, _dfn, _has_s)
 
-                # Развёрнутая карточка
-                if _is_open:
-                    with st.container():
-                        st.markdown(
-                            "<div style='border:1px solid #dce3ec;border-top:none;"
-                            "border-radius:0 0 6px 6px;padding:14px 16px;"
-                            "background:#fafbfc;margin-bottom:12px;'>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Навигация по страницам
-                        _pages  = _d.get("pages", [])
-                        _pkey   = f"db_page_{_did}"
-                        if _pkey not in st.session_state:
-                            st.session_state[_pkey] = 0
-                        _pidx = max(0, min(st.session_state[_pkey], len(_pages)-1))
-                        _pcur = _pages[_pidx] if _pages else {}
-
-                        _n1, _n2, _n3 = st.columns([1, 4, 1])
-                        with _n1:
-                            if st.button("◀", key=f"db_prev_{_did}",
-                                         disabled=(_pidx == 0)):
-                                st.session_state[_pkey] = _pidx - 1
-                                st.rerun()
-                        with _n2:
-                            _pw = _pcur.get("word_count") or len(_pcur.get("text","").split())
-                            st.markdown(
-                                f"<div style='text-align:center;padding-top:6px;'>"
-                                f"Страница <b>{_pidx+1}</b> из <b>{len(_pages)}</b> "
-                                f"<span style='color:#888;font-size:0.82em;'>"
-                                f"({_pcur.get('method','')} · {_pw} слов)</span></div>",
-                                unsafe_allow_html=True,
-                            )
-                        with _n3:
-                            if st.button("▶", key=f"db_next_{_did}",
-                                         disabled=(_pidx >= len(_pages)-1)):
-                                st.session_state[_pkey] = _pidx + 1
-                                st.rerun()
-
-                        st.markdown(
-                            f"<div style='font-size:0.85em;line-height:1.55;"
-                            f"background:#f8f9fa;border:1px solid #e0e0e0;"
-                            f"border-radius:6px;padding:10px 12px;margin-top:6px;"
-                            f"max-height:280px;overflow-y:auto;"
-                            f"white-space:pre-wrap;word-break:break-word;'>"
-                            f"{_pcur.get('text','').replace('<','&lt;').replace('>','&gt;')}"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Пересказ
-                        if _dsum:
-                            st.divider()
-                            _swc = len(_dsum.split())
-                            st.markdown(
-                                f"<div style='display:flex;justify-content:space-between;"
-                                f"align-items:center;margin-bottom:4px;'>"
-                                f"<span style='font-weight:600;'>Пересказ</span>"
-                                f"<span style='color:#5a6a7a;font-size:0.78em;'>{_swc} слов</span>"
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
-                            _sh = max(120, min(400, _swc * 6))
-                            st.markdown(
-                                f"<div style='font-size:0.85em;line-height:1.6;"
-                                f"background:#f0f4f8;border:1px solid #d0d8e4;"
-                                f"border-radius:6px;padding:12px 14px;"
-                                f"max-height:{_sh}px;overflow-y:auto;"
-                                f"white-space:pre-wrap;word-break:break-word;'>"
-                                f"{_dsum.replace('<','&lt;').replace('>','&gt;')}"
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
-
-                        st.markdown("</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div style='margin-bottom:8px;'></div>",
-                                unsafe_allow_html=True)
+                st.markdown("<div style='margin-bottom:8px;'></div>",
+                            unsafe_allow_html=True)
 
             st.divider()
 
