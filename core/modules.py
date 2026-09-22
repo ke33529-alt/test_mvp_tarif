@@ -206,30 +206,15 @@ def is_module_accessible(user: Dict, module_id: str) -> bool:
 
 def get_module_usage_30d(org_id: str) -> Dict[str, int]:
     """
-    Возвращает количество открытий каждого модуля за последние 30 дней
-    для указанного сегмента.
+    Возвращает количество рабочих действий в каждом модуле за последние
+    30 дней для указанного сегмента.
 
-    Данные берутся из audit_log.jsonl — не хранятся отдельно.
+    Данные берутся из журнала использования функций (core/usage_tracker.py,
+    data/usage_log/) — не из аудита: аудит хранит только события
+    безопасности и администрирования.
     Возвращает dict: {module_id: count}
     """
-    from datetime import date, timedelta
-    from core.audit import read_log
+    from core.usage_tracker import get_segment_module_counts
 
-    date_from = str(date.today() - timedelta(days=30))
-    date_to   = str(date.today())
-
-    records = read_log(
-        date_from=date_from,
-        date_to=date_to,
-        org_id=org_id,
-        event="module_open",
-        limit=10_000,
-    )
-
-    counts: Dict[str, int] = {mid: 0 for mid in ALL_MODULES}
-    for rec in records:
-        mod = rec.get("module", "")
-        if mod in counts:
-            counts[mod] += 1
-
-    return counts
+    counts = get_segment_module_counts(org_id, days=30)
+    return {mid: counts.get(mid, 0) for mid in ALL_MODULES}

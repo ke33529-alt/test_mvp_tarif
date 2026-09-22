@@ -34,21 +34,6 @@ from core import tasks as tasks_core
 from core import entity_picker
 
 
-def _audit(user: dict, event: str) -> None:
-    """Аудит-лог события (не критично при сбое)."""
-    try:
-        from core.audit import log_event
-        log_event(
-            org_id=user.get("org_id", ""),
-            user_id=user.get("user_id", ""),
-            role=user.get("role", ""),
-            event=event,
-            module="tasks",
-        )
-    except Exception:
-        pass
-
-
 try:
     from core.usage_tracker import log_event as _log_usage
 except Exception:
@@ -162,7 +147,6 @@ def _show_delete_dialog(user: dict, pending: dict):
         ok = tasks_core.delete_task(user, pending["id"], pending["owner_id"], pending["segment"])
         st.session_state.pop("_task_del", None)
         if ok:
-            _audit(user, "task_delete")
             _log_usage("tasks", "task_deleted", meta={"task_id": pending["id"]})
         st.rerun()
     if c_no.button("Отмена", use_container_width=True, key="_task_del_no"):
@@ -278,7 +262,6 @@ def _show_complete_dialog(user: dict, pending: dict):
     with c1:
         if st.button("Завершить задачу", type="primary", use_container_width=True, key=f"_tc_ok_{tid}"):
             tasks_core.complete_task(user, tid, note=note, refs=list(st.session_state.get(refs_key, [])))
-            _audit(user, "task_complete")
             _log_usage("tasks", "task_completed", meta={
                 "task_id":  tid,
                 "has_note": bool((note or "").strip()),
@@ -406,7 +389,6 @@ def show_tasks():
                 priority=_new_prio,
                 due_date=(_new_due.isoformat() if _new_due else ""),
             )
-            _audit(user, "task_add")
             _log_usage("tasks", "task_created", meta={
                 "priority": _new_prio,
                 "has_due":  bool(_new_due),
@@ -773,7 +755,6 @@ def show_tasks():
                                 _kw["completion_refs"] = list(st.session_state.get(_erefs_key, []))
                             _changed = tasks_core.update_task(user, tid, **_kw)
                             if _changed:
-                                _audit(user, "task_edit")
                                 _log_usage("tasks", "task_edited", meta={
                                     "task_id":     tid,
                                     "status_from": status,

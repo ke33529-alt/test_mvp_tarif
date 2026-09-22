@@ -76,6 +76,13 @@ from core.session_scope import (
 from core.user_prefs import load_prefs, save_prefs
 from core import tasks as _tasks_core
 
+# Журнал использования функций (не аудит!): запросы, ответы, уточнения, оценки.
+# Тексты вопросов и ответов не пишутся — только факты, размеры и время.
+try:
+    from core.usage_tracker import log_event as _log_usage
+except Exception:
+    def _log_usage(*a, **kw): pass  # noqa: E731
+
 
 # Модель Советчика по умолчанию — принудительно выставляется при первом
 # открытии раздела в сессии (см. show_advisor), чтобы «на старте» всегда был
@@ -805,31 +812,6 @@ def show_advisor():
                                 raw_answer = ""
                             answer = strip_thinking_blocks(raw_answer)
 
-                            # Аудит: фиксируем ФАКТ запроса, без текста вопроса
-                            try:
-                                from core.audit import log_event
-                                log_event(
-                                    org_id=_user_org_id,
-                                    user_id=_user_id,
-                                    role=_user_role,
-                                    event="llm_query",
-                                    module="advisor",
-                                    meta={
-                                        "model":       st.session_state.advisor_model,
-                                        "num_sources": len(sources),
-                                        "local_kb":    "local" in adv_doc_types,
-                                        # Сам текст пояснений в аудит не пишем —
-                                        # только факт и количество фрагментов.
-                                        "hidden_used":   len(_hidden_sources),
-                                        "internal_mode": _internal_mode,
-                                        # Только количество: имена документов
-                                        # в аудит не пишем.
-                                        "npa_filter":    len(_npa_filenames or []),
-                                    },
-                                )
-                            except Exception:
-                                pass
-
                         elif st.session_state.sources_only_mode:
                             answer = "[РЕЖИМ ТЕСТА ЧАНКОВ] LLM отключён."
                             st.info(answer)
@@ -839,6 +821,34 @@ def show_advisor():
                         from_faq = False
 
                     query_time = (datetime.now() - start_time).total_seconds()
+
+                    # Использование: запрос + его исход. Режим теста чанков —
+                    # служебная отладка, в статистику не идёт.
+                    if not st.session_state.sources_only_mode:
+                        _log_usage("advisor", "query_submitted", meta={
+                            "query_len":     len(query),
+                            "internal_mode": _internal_mode,
+                            "npa_filter":    len(_npa_filenames or []),
+                        })
+                        if from_faq:
+                            _log_usage("advisor", "faq_matched", meta={
+                                "duration_sec": round(query_time, 1),
+                            })
+                        elif answer and not answer.startswith("❌"):
+                            _log_usage("advisor", "answer_generated", meta={
+                                "model":         st.session_state.advisor_model,
+                                "sources":       len(sources),
+                                "hidden_used":   len(_hidden_sources),
+                                "local_kb":      "local" in (adv_doc_types or []),
+                                "internal_mode": _internal_mode,
+                                "duration_sec":  round(query_time, 1),
+                            })
+                        else:
+                            _log_usage("advisor", "answer_not_found", meta={
+                                "npa_filter":   len(_npa_filenames or []),
+                                "duration_sec": round(query_time, 1),
+                            })
+
                     st.session_state.query_times.append(query_time)
                     if len(st.session_state.query_times) > 10:
                         st.session_state.query_times = st.session_state.query_times[-10:]
@@ -1005,6 +1015,7 @@ def show_advisor():
                         submit_feedback("user", "answer_rating", label,
                                         question=query_for_fb[:500],
                                         answer=answer[:1000], rating=rating)
+                        _log_usage("advisor", "answer_rated", meta={"rating": rating})
                         st.session_state.last_result      = None
                         st.session_state.search_triggered = False
                         st.session_state.clarifications   = []
@@ -1118,6 +1129,11 @@ def show_advisor():
                                     # уходят в персистентную историю, а слой
                                     # нигде не должен становиться видимым.
                                     "sources": _new_sources,
+                                })
+                                _log_usage("advisor", "clarification_submitted", meta={
+                                    "n":         len(st.session_state.clarifications),
+                                    "query_len": len(clarify_q),
+                                    "sources":   len(_new_sources or []),
                                 })
 
                                 # Сессионная история — последняя запись текущей личности

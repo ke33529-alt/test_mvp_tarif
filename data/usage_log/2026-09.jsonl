@@ -141,3 +141,18 @@
 {"ts": "2026-09-22T22:19:03.850195", "module": "predictor", "action": "prediction_started", "user_id": "superadmin", "org": "", "meta": {"article": "Заработная плата", "top_k": 30, "sources": ["expertise"], "has_filters": true, "has_justification": false, "n_docs": 1}}
 {"ts": "2026-09-22T22:20:05.053021", "module": "predictor", "action": "prediction_started", "user_id": "superadmin", "org": "", "meta": {"article": "Заработная плата", "top_k": 30, "sources": ["expertise"], "has_filters": true, "has_justification": false, "n_docs": 1}}
 {"ts": "2026-09-22T22:20:57.704660", "module": "predictor", "action": "prediction_completed", "user_id": "superadmin", "org": "", "meta": {"article": "Заработная плата", "n_positive": 0, "n_negative": 0, "n_neutral": 21, "score_pct": 50.0, "confidence": "low", "sources": ["expertise"]}}
+{"ts": "2026-09-23T02:28:55.666343", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:29:31.347719", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:30:01.678988", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 26, "internal_mode": false, "npa_filter": 0}}
+{"ts": "2026-09-23T02:30:01.679132", "module": "advisor", "action": "answer_generated", "user_id": "superadmin", "org": "", "meta": {"model": "qwen3.5:9b", "sources": 50, "hidden_used": 8, "local_kb": false, "internal_mode": false, "duration_sec": 21.4}}
+{"ts": "2026-09-23T02:34:29.949229", "module": "doc_scanner", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:34:38.075137", "module": "doc_scanner", "action": "scan_started", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "filenames": ["Проведение one-to-one-v4-20260922_154435.pdf"]}}
+{"ts": "2026-09-23T02:34:38.183790", "module": "doc_scanner", "action": "scan_completed", "user_id": "superadmin", "org": "", "meta": {"file_count": 1, "total_pages": 5, "total_words": 445}}
+{"ts": "2026-09-23T02:34:57.116475", "module": "doc_scanner", "action": "summary_generated", "user_id": "superadmin", "org": "", "meta": {"filename": "Проведение one-to-one-v4-20260922_154435.pdf", "pages": 5, "summary_len": 4008}}
+{"ts": "2026-09-23T02:35:09.267883", "module": "claim_analyzer", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:13.843038", "module": "predictor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:16.407719", "module": "protocol", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:18.177827", "module": "tasks", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:18.938386", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:21.867128", "module": "doc_scanner", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:35:25.448922", "module": "claim_analyzer", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}

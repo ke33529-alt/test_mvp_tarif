@@ -7,8 +7,11 @@
   1. Сегменты и пользователи — список сегментов, список пользователей,
      управление статусами, сброс пароля, заметки
   2. Создать пользователя — форма создания нового аккаунта
-  3. Статистика — использование модулей по пользователям за период
-  4. Лог действий — аудит лог с фильтрами и экспортом CSV
+  3. Статистика — использование модулей (журнал использования функций)
+  4. Лог действий — два журнала:
+       «Аудит системы»          — core/audit.py: вход/выход, учётные записи,
+                                  сегменты, права, базы знаний;
+       «Использование функций»  — core/usage_tracker.py: работа в модулях
 
 Вызов из app.py:
   from streamlit_pages.superadmin import show_superadmin
@@ -37,15 +40,44 @@ from core.auth import (
     USERS_FILE,
     SEGMENTS_FILE,
 )
-from core.audit import export_to_csv, get_module_stats, log_event, read_log
+from core.audit import (
+    EVENT_BADGE_COLORS,
+    EVENT_BADGE_DEFAULT,
+    EVENT_LABELS,
+    audit,
+    export_to_csv,
+    format_details,
+    log_event,
+    read_log,
+)
 
-# Usage tracker — с защитой: если модуль ещё не создан, показывается заглушка
+# Журнал использования функций — с защитой: при сбое импорта вкладки
+# статистики показывают предупреждение, остальное Управление работает
 try:
-    from core.usage_tracker import show_usage_stats as _show_usage_stats
+    from core.usage_tracker import (
+        MODULE_LABELS as USAGE_MODULE_LABELS,
+        get_funnel_stats,
+        get_module_stats,
+        get_segment_module_counts,
+        show_usage_stats as _show_usage_stats,
+    )
     _USAGE_TRACKER_AVAILABLE = True
 except Exception:
     _USAGE_TRACKER_AVAILABLE = False
+    USAGE_MODULE_LABELS = {}
     def _show_usage_stats(): pass  # noqa: E731
+    def get_module_stats(**kw): return []  # noqa: E731
+    def get_funnel_stats(**kw): return []  # noqa: E731
+    def get_segment_module_counts(*a, **kw): return {}  # noqa: E731
+
+from core.audit import now_local as _now_local
+
+
+def _today() -> date:
+    """Сегодняшняя дата по Москве: контейнер работает в UTC, и с 00:00 до 03:00
+    date.today() показывал бы вчерашний день — журналы открывались бы пустыми."""
+    return _now_local().date()
+
 
 # ── Пути ─────────────────────────────────────────────────────────────────────
 
@@ -248,6 +280,7 @@ def _restore_segment(org_id: str) -> bool:
     segments[org_id]["status"]      = "active"
     segments[org_id]["archived_at"] = None
     _save_segments(segments)
+    audit("segment_restored", module="superadmin", meta={"target_org_id": org_id})
     return True
 
 
@@ -256,8 +289,14 @@ def _update_segment_rag(org_id: str, rag_collection: str) -> bool:
     segments = _load_segments()
     if org_id not in segments:
         return False
+    old_rag = segments[org_id].get("rag_collection_name", "")
     segments[org_id]["rag_collection_name"] = rag_collection.strip()
     _save_segments(segments)
+    if old_rag != rag_collection.strip():
+        audit("segment_settings_changed", module="superadmin", meta={
+            "target_org_id": org_id,
+            "changed": {"rag_collection": {"from": old_rag, "to": rag_collection.strip()}},
+        })
     return True
 
 
@@ -284,8 +323,25 @@ def _save_segment_modules(org_id: str, modules: Dict) -> bool:
     segments = _load_segments()
     if org_id not in segments:
         return False
+    old_modules = _get_segment_modules(org_id)
     segments[org_id]["modules"] = modules
     _save_segments(segments)
+
+    # Аудит: только реально изменившиеся модули, в человекочитаемом виде
+    def _state(cfg: Dict) -> str:
+        if not cfg.get("enabled", True):
+            return "выключен"
+        return MODULE_STATUS_LABELS.get(cfg.get("status", "active"), cfg.get("status", ""))
+
+    changed = {}
+    for mid, cfg in modules.items():
+        before = _state(old_modules.get(mid, {"enabled": True, "status": "active"}))
+        after  = _state(cfg)
+        if before != after:
+            changed[MODULES.get(mid, mid)] = {"from": before, "to": after}
+    if changed:
+        audit("segment_modules_changed", module="superadmin",
+              meta={"target_org_id": org_id, "changed": changed})
     return True
 
 
@@ -300,6 +356,10 @@ def _set_admin_panel_enabled(org_id: str, enabled: bool) -> bool:
         return False
     segments[org_id]["admin_panel_enabled"] = enabled
     _save_segments(segments)
+    audit("segment_settings_changed", module="superadmin", meta={
+        "target_org_id": org_id,
+        "changed": {"admin_panel": "включена" if enabled else "выключена"},
+    })
     return True
 
 
@@ -322,31 +382,12 @@ def _get_allowed_modules(user: Dict) -> list:
 
 def _get_module_usage_stats(org_id: str, days: int = 30) -> Dict[str, int]:
     """
-    Возвращает счётчик открытий каждого модуля за последние N дней.
-    Считается из audit_log.jsonl на лету — не хранится в segments.json.
+    Рабочие действия в каждом модуле сегмента за последние N дней.
+    Считается из журнала использования функций (data/usage_log/) на лету.
+    Ключи — module_id из MODULES (advisor, scanner, analyzer, ...).
     """
-    from datetime import date as date_type
-    date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    date_to   = datetime.now().strftime("%Y-%m-%d")
-
-    records = read_log(
-        date_from=date_from,
-        date_to=date_to,
-        org_id=org_id,
-        event="module_open",
-        limit=50_000,
-    )
-
-    # Маппинг из имени модуля в audit_log на module_id
-    choice_to_module = {v: k for k, v in MODULE_TO_CHOICE.items()}
-
-    counts: Dict[str, int] = {mid: 0 for mid in MODULES}
-    for rec in records:
-        mod = rec.get("module", "")
-        mid = choice_to_module.get(mod, mod)
-        if mid in counts:
-            counts[mid] += 1
-    return counts
+    counts = get_segment_module_counts(org_id, days=days) or {}
+    return {mid: counts.get(mid, 0) for mid in MODULES}
 
 
 def _update_user(
@@ -372,11 +413,29 @@ def _update_user(
     if existing and existing["user_id"] != user_id:
         return False, f"Логин {login_str} уже занят другим пользователем"
 
+    before = users[user_id]
+    segments = _load_segments()
+    changed = {}
+    for field, new_val in (("name", name.strip()), ("login", login_str),
+                           ("role", role), ("org_id", org_id)):
+        old_val = before.get(field, "")
+        if old_val != new_val:
+            if field == "role":
+                old_val, new_val = ROLE_LABELS.get(old_val, old_val), ROLE_LABELS.get(new_val, new_val)
+            elif field == "org_id":
+                old_val = segments.get(old_val, {}).get("name", old_val)
+                new_val = segments.get(new_val, {}).get("name", new_val)
+            changed[field] = {"from": old_val, "to": new_val}
+
     users[user_id]["name"]    = name.strip()
     users[user_id]["login"]   = login_str
     users[user_id]["role"]    = role
     users[user_id]["org_id"]  = org_id
     _save_users(users)
+
+    if changed:
+        audit("user_updated", module="superadmin",
+              meta={"target_user_id": user_id, "changed": changed})
     return True, ""
 
 
@@ -389,6 +448,7 @@ def _restore_user(user_id: str) -> bool:
     users[user_id]["status"]        = "active"
     users[user_id]["blocked_until"] = None
     _save_users(users)
+    audit("user_restored", module="superadmin", meta={"target_user_id": user_id})
     return True
 
 
@@ -885,6 +945,8 @@ def _tab_users():
                                          use_container_width=True):
                                 ok, temp = reset_password(uid)
                                 if ok:
+                                    audit("password_reset", module="superadmin",
+                                          meta={"target_user_id": uid})
                                     st.session_state[f"temp_pass_{uid}"] = temp
                                 else:
                                     st.error("Ошибка сброса пароля")
@@ -894,6 +956,8 @@ def _tab_users():
                                 if st.button("Выбить из системы", key=f"logout_{uid}",
                                              use_container_width=True):
                                     set_force_logout(uid)
+                                    audit("force_logout", module="superadmin",
+                                          meta={"target_user_id": uid})
                                     st.success("Пользователь будет выбит при следующем действии")
 
                         with a3:
@@ -901,11 +965,15 @@ def _tab_users():
                                 if st.button("Заблокировать", key=f"block_{uid}",
                                              use_container_width=True):
                                     set_user_status(uid, "blocked")
+                                    audit("user_blocked", module="superadmin",
+                                          meta={"target_user_id": uid})
                                     st.rerun()
                             elif status == "blocked":
                                 if st.button("Разблокировать", key=f"unblock_{uid}",
                                              use_container_width=True):
                                     set_user_status(uid, "active")
+                                    audit("user_unblocked", module="superadmin",
+                                          meta={"target_user_id": uid})
                                     st.rerun()
 
                         with a4:
@@ -980,19 +1048,26 @@ def _tab_users():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tab_stats():
+    """
+    Показатели использования продукта — по журналу использования функций
+    (core/usage_tracker.py). Аудит сюда не подмешивается.
+    """
     segments = _load_segments()
     users    = _load_users()
 
     st.markdown("##### Статистика использования модулей")
 
-    # Фильтры периода
+    if not _USAGE_TRACKER_AVAILABLE:
+        st.warning("Журнал использования функций недоступен (ошибка импорта core/usage_tracker.py).")
+        return
+
     sc1, sc2, sc3 = st.columns([1, 1, 1])
     with sc1:
         date_from = st.date_input(
-            "С даты", value=date.today() - timedelta(days=30), key="stat_from"
+            "С даты", value=_today() - timedelta(days=30), key="stat_from"
         )
     with sc2:
-        date_to = st.date_input("По дату", value=date.today(), key="stat_to")
+        date_to = st.date_input("По дату", value=_today(), key="stat_to")
     with sc3:
         seg_options = {"": "Все сегменты"} | {k: v["name"] for k, v in segments.items()}
         stat_seg    = st.selectbox(
@@ -1003,45 +1078,81 @@ def _tab_stats():
             label_visibility="collapsed",
         )
 
+    # ── Воронка по модулям ───────────────────────────────────────────────────
+    funnel = get_funnel_stats(
+        org_id=stat_seg or None,
+        date_from=str(date_from),
+        date_to=str(date_to),
+    )
+    st.markdown("**Модули: запуски и результат**")
+    st.caption(
+        "Запущено — начатые операции (запрос, анализ, прогноз, сканирование, "
+        "транскрипция, задача). Результат — успешно завершённые. "
+        "Действий — все рабочие события модуля, без открытий раздела."
+    )
+    fw = [2, 1, 1, 1, 1, 1]
+    fh = st.columns(fw)
+    for col, label in zip(fh, ["Модуль", "Пользователей", "Действий",
+                               "Запущено", "Результат", "Конверсия"]):
+        col.markdown(f"<small style='color:#5a6a7a;font-weight:600'>{label}</small>",
+                     unsafe_allow_html=True)
+    for row in funnel:
+        rc = st.columns(fw)
+        rc[0].markdown(USAGE_MODULE_LABELS.get(row["module"], row["module"]))
+        rc[1].markdown(str(row["users"]) if row["users"] else "—")
+        rc[2].markdown(str(row["actions"]) if row["actions"] else "—")
+        rc[3].markdown(str(row["started"]) if row["started"] else "—")
+        rc[4].markdown(str(row["completed"]) if row["completed"] else "—")
+        conv = row["conversion"]
+        rc[5].markdown(f"{conv:.0f}%" if conv is not None else "—")
+
+    st.divider()
+
+    # ── Пользователи × модули ────────────────────────────────────────────────
     stats = get_module_stats(
         org_id=stat_seg or None,
         date_from=str(date_from),
         date_to=str(date_to),
     )
 
+    st.markdown("**Пользователи: рабочие действия по модулям**")
     if not stats:
-        st.info("Нет данных за выбранный период. Убедитесь что аудит лог подключён к модулям.")
+        st.info("Нет данных за выбранный период.")
         return
 
-    # Все уникальные модули
-    all_modules = set()
-    for row in stats:
-        all_modules.update(row["modules"].keys())
-    all_modules = sorted(all_modules)
+    all_modules = [m for m in USAGE_MODULE_LABELS
+                   if any(r["modules"].get(m) for r in stats)]
 
-    # Таблица: пользователь + модули + итого
-    header_cols = st.columns([2, 1] + [1] * len(all_modules))
+    widths = [2, 1, 1] + [1] * len(all_modules)
+    header_cols = st.columns(widths)
     header_cols[0].markdown("**Пользователь**")
     header_cols[1].markdown("**Итого**")
+    header_cols[2].markdown("**Последняя активность**")
     for i, mod in enumerate(all_modules):
-        header_cols[2 + i].markdown(f"**{MODULE_LABELS.get(mod, mod)}**")
+        header_cols[3 + i].markdown(f"**{USAGE_MODULE_LABELS.get(mod, mod)}**")
 
     st.divider()
 
     for row in stats:
         uid      = row["user_id"]
         org_id   = row["org_id"]
-        rec      = users.get(uid, {})
-        name     = rec.get("name", uid)
-        seg_name = segments.get(org_id, {}).get("name", "—")
+        if uid == "superadmin":
+            name = "Суперадмин"
+        else:
+            name = users.get(uid, {}).get("name", uid)
+        seg_name = segments.get(org_id, {}).get("name", "—") if org_id else "—"
 
-        row_cols = st.columns([2, 1] + [1] * len(all_modules))
+        row_cols = st.columns(widths)
         row_cols[0].markdown(f"{name}  \n<small style='color:#5a6a7a'>{seg_name}</small>",
                              unsafe_allow_html=True)
         row_cols[1].markdown(f"**{row['total']}**")
+        row_cols[2].markdown(
+            f"<small>{row['last_ts'][:16].replace('T', ' ') or '—'}</small>",
+            unsafe_allow_html=True,
+        )
         for i, mod in enumerate(all_modules):
             count = row["modules"].get(mod, 0)
-            row_cols[2 + i].markdown(str(count) if count else "—")
+            row_cols[3 + i].markdown(str(count) if count else "—")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1054,19 +1165,24 @@ def _tab_audit_log():
 
     st.markdown("##### Лог действий")
 
-    # Под-вкладки: системный аудит + лог использования функций
+    # Два независимых журнала:
+    #   «Аудит системы»         — безопасность и администрирование (core/audit.py)
+    #   «Использование функций» — работа в модулях (core/usage_tracker.py)
     sub1, sub2 = st.tabs(["Аудит системы", "Использование функций"])
 
-    # ── Под-вкладка 1: системный аудит (логин / выход / открытие модулей) ─────
+    # ── Под-вкладка 1: аудит системы ─────────────────────────────────────────
     with sub1:
-        # Первая строка фильтров: даты
+        st.caption(
+            "Вход и выход, учётные записи, права, настройки сегментов, "
+            "состав баз знаний, выгрузки журналов. Работа в модулях — "
+            "на вкладке «Использование функций»."
+        )
         fr1c1, fr1c2 = st.columns([1, 1])
         with fr1c1:
-            log_date_from = st.date_input("С даты", value=date.today(), key="log_from")
+            log_date_from = st.date_input("С даты", value=_today(), key="log_from")
         with fr1c2:
-            log_date_to = st.date_input("По дату", value=date.today(), key="log_to")
+            log_date_to = st.date_input("По дату", value=_today(), key="log_to")
 
-        # Вторая строка фильтров: сегмент, пользователь, событие
         fr2c1, fr2c2, fr2c3 = st.columns([1, 1, 1])
         with fr2c1:
             seg_opts = {"": "Все сегменты"} | {k: v["name"] for k, v in segments.items()}
@@ -1076,7 +1192,7 @@ def _tab_audit_log():
                 key="log_seg", label_visibility="collapsed",
             )
         with fr2c2:
-            user_opts = {"": "Все пользователи"} | {
+            user_opts = {"": "Все пользователи", "superadmin": "Суперадмин"} | {
                 uid: rec.get("name", uid) for uid, rec in users.items()
             }
             log_user = st.selectbox(
@@ -1085,8 +1201,9 @@ def _tab_audit_log():
                 key="log_user", label_visibility="collapsed",
             )
         with fr2c3:
-            from core.audit import EVENT_TYPES
-            event_opts = {"": "Все события"} | {e: e for e in sorted(EVENT_TYPES)}
+            event_opts = {"": "Все события"} | dict(EVENT_LABELS)
+            if st.session_state.get("log_event") not in event_opts:
+                st.session_state["log_event"] = ""
             log_event_filter = st.selectbox(
                 "Событие", options=list(event_opts.keys()),
                 format_func=lambda x: event_opts[x],
@@ -1102,7 +1219,6 @@ def _tab_audit_log():
             limit=200,
         )
 
-        # Шапка + экспорт
         meta_col, export_col = st.columns([3, 1])
         with meta_col:
             st.caption(f"Показано записей: {len(records)}")
@@ -1111,99 +1227,63 @@ def _tab_audit_log():
                 csv = export_to_csv(records)
                 st.download_button(
                     "Экспорт CSV",
-                    data=csv,
+                    data=csv.encode("utf-8"),
                     file_name=f"audit_{log_date_from}_{log_date_to}.csv",
                     mime="text/csv",
                     key="export_csv",
+                    on_click=lambda n=len(records): audit(
+                        "log_exported", module="superadmin",
+                        meta={"log": "audit", "records": n},
+                    ),
                 )
 
         if not records:
             st.info("Событий за выбранный период не найдено.")
         else:
-            # Таблица лога
-            EVENT_LABELS = {
-                "login":            "Вход",
-                "logout":           "Выход",
-                "module_open":      "Раздел",
-                "button_click":     "Кнопка",
-                "llm_query":        "Запрос",
-                "file_upload":      "Файл",
-                "file_deleted":     "Удалён",
-                "password_reset":   "Сброс пароля",
-                "user_created":     "Создан польз.",
-                "user_archived":    "Архив польз.",
-                "segment_created":  "Создан сегм.",
-                "segment_archived": "Архив сегм.",
-            }
+            import html as _html
 
-            EVENT_BADGE_COLORS = {
-                "login":        ("#EAF3DE", "#27500A"),
-                "logout":       ("#F1EFE8", "#5F5E5A"),
-                "module_open":  ("#E6F1FB", "#0C447C"),
-                "button_click": ("#FAECE7", "#712B13"),
-                "llm_query":    ("#EEEDFE", "#3C3489"),
-                "file_upload":  ("#FAEEDA", "#633806"),
-                "file_deleted": ("#F1EFE8", "#5F5E5A"),
-            }
+            def _who(rec: Dict) -> str:
+                uid = rec.get("user_id", "")
+                if uid == "superadmin":
+                    return "Суперадмин"
+                if uid:
+                    return users.get(uid, {}).get("name", uid)
+                if rec.get("event") == "login_failed":
+                    return "не опознан"
+                return "—"
 
-            # Заголовок таблицы
-            hc = st.columns([1, 1, 2, 1, 3])
+            widths = [1, 1, 2, 1.3, 3]
+            hc = st.columns(widths)
             for col, label in zip(hc, ["Время", "Сегмент", "Пользователь", "Событие", "Детали"]):
                 col.markdown(f"<small style='color:#5a6a7a;font-weight:600'>{label}</small>",
                              unsafe_allow_html=True)
             st.divider()
 
             for rec in records:
-                ts       = rec.get("ts", "")[:16].replace("T", " ")
-                org_id   = rec.get("org_id", "")
-                uid      = rec.get("user_id", "")
-                ev       = rec.get("event", "")
-                mod      = rec.get("module") or ""
-                meta     = rec.get("meta", {})
+                ts     = rec.get("ts", "")[:16].replace("T", " ")
+                org_id = rec.get("org_id", "")
+                ev     = rec.get("event", "")
 
-                seg_name  = segments.get(org_id, {}).get("name", org_id or "—")
-                user_name = users.get(uid, {}).get("name", uid or "суперадмин")
+                seg_name = segments.get(org_id, {}).get("name", org_id) if org_id else "—"
+                details  = format_details(rec, users, segments)
 
-                # Формируем детали из метаданных
-                details_parts = []
-                if mod:
-                    details_parts.append(MODULE_LABELS.get(mod, mod))
-                if meta.get("label"):
-                    details_parts.append(meta["label"])
-                if meta.get("file_type"):
-                    size = meta.get("size_kb", "")
-                    details_parts.append(f"{meta['file_type'].upper()} {size}КБ" if size else meta["file_type"].upper())
-                if meta.get("target_user_id"):
-                    target = users.get(meta["target_user_id"], {}).get("name", meta["target_user_id"])
-                    details_parts.append(f"→ {target}")
-                if meta.get("target_org_id"):
-                    target_seg = segments.get(meta["target_org_id"], {}).get("name", meta["target_org_id"])
-                    details_parts.append(f"→ {target_seg}")
-                if meta.get("duration_min"):
-                    details_parts.append(f"длит. {meta['duration_min']} мин")
-
-                details = " · ".join(details_parts) if details_parts else "—"
-
-                # Цвет бейджа события
-                bg, color = EVENT_BADGE_COLORS.get(ev, ("#F1EFE8", "#5F5E5A"))
+                bg, color = EVENT_BADGE_COLORS.get(ev, EVENT_BADGE_DEFAULT)
                 ev_badge  = _badge(EVENT_LABELS.get(ev, ev), bg, color)
 
-                rc = st.columns([1, 1, 2, 1, 3])
+                rc = st.columns(widths)
                 rc[0].markdown(f"<small style='color:#5a6a7a'>{ts}</small>", unsafe_allow_html=True)
-                rc[1].markdown(f"<small>{seg_name}</small>", unsafe_allow_html=True)
-                rc[2].markdown(f"<small>{user_name}</small>", unsafe_allow_html=True)
+                rc[1].markdown(f"<small>{_html.escape(seg_name)}</small>", unsafe_allow_html=True)
+                rc[2].markdown(f"<small>{_html.escape(_who(rec))}</small>", unsafe_allow_html=True)
                 rc[3].markdown(ev_badge, unsafe_allow_html=True)
-                rc[4].markdown(f"<small style='color:#5a6a7a'>{details}</small>", unsafe_allow_html=True)
+                rc[4].markdown(f"<small style='color:#5a6a7a'>{_html.escape(details)}</small>",
+                               unsafe_allow_html=True)
 
-    # ── Под-вкладка 2: использование функций (usage_tracker) ─────────────────
+    # ── Под-вкладка 2: использование функций ─────────────────────────────────
     with sub2:
         if _USAGE_TRACKER_AVAILABLE:
             _show_usage_stats()
         else:
-            st.warning(
-                "Модуль `core/usage_tracker.py` не найден. "
-                "Добавьте его в проект — он уже создан и готов к использованию."
-            )
+            st.warning("Журнал использования функций недоступен (ошибка импорта core/usage_tracker.py).")
 
 
 def _tab_help():
@@ -1822,20 +1902,23 @@ def show_superadmin():
     # Метрики верхнего уровня
     segments = _load_segments()
     users    = _load_users()
-    today    = str(date.today())
 
     active_segs  = sum(1 for s in segments.values() if s.get("status") == "active")
     active_users = sum(1 for u in users.values()    if u.get("status") == "active")
 
-    from core.audit import get_daily_stats
     from core.help_requests import count_new as _count_help_new
-    daily      = get_daily_stats(today)
+    try:
+        from core.usage_tracker import get_daily_usage
+        daily = get_daily_usage()
+    except Exception:
+        daily = {"actions": 0, "active_users": 0}
     help_count = _count_help_new()
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Сегментов",      active_segs)
     m2.metric("Пользователей",  active_users)
-    m3.metric("Событий сегодня", daily["total_events"])
+    m3.metric("Действий сегодня", daily["actions"],
+              help="Рабочие действия в модулях по журналу использования функций")
     m4.metric("Активны сегодня", daily["active_users"])
     m5.metric("Запросы на помощь", help_count)
 

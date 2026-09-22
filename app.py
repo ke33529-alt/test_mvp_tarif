@@ -20,6 +20,10 @@ from streamlit_pages.tasks_page import show_tasks
 # Аутентификация и модули
 from core.auth import get_current_user, logout, _show_login_page
 from core.audit import log_event
+try:
+    from core.usage_tracker import log_module_open as _log_module_open
+except Exception:
+    def _log_module_open(*a, **kw): pass  # noqa: E731
 from core.modules import (
     get_visible_modules, get_module_status,
     is_module_accessible, is_admin_panel_enabled, ALL_MODULES, MODULE_STATUS_LABELS,
@@ -651,6 +655,7 @@ main_choice = st.session_state.main_choice
 # 🏠 Лендинг
 # =============================================================================
 if st.session_state.show_landing:
+    st.session_state["_usage_last_module"] = None
     _set_landing_background()
     st.markdown("""
     <style>
@@ -839,9 +844,11 @@ def _check_module(choice: str) -> bool:
     Защищает от обхода сайдбара через прямую навигацию.
     Суперадмин проходит всегда.
     """
-    if _is_superadmin:
-        return True
     mid = _CHOICE_TO_MODULE.get(choice)
+    if _is_superadmin:
+        if mid:
+            _log_module_open(mid)
+        return True
     if not mid:
         return True  # не управляемый модуль — пропускаем
     status = get_module_status(_current_user, mid)
@@ -861,11 +868,18 @@ def _check_module(choice: str) -> bool:
         </div>
         """, unsafe_allow_html=True)
         return False
+    # Журнал использования: переход в модуль (повторные rerun не пишутся)
+    _log_module_open(mid)
     return True
 
 # =============================================================================
 # 🗂️ Роутинг
 # =============================================================================
+
+# Ушли из рабочих модулей (Управление, Админка и т.п.) — следующий вход
+# в модуль снова считается открытием
+if main_choice not in _CHOICE_TO_MODULE:
+    st.session_state["_usage_last_module"] = None
 
 if main_choice == "Управление":
     from streamlit_pages.superadmin import show_superadmin

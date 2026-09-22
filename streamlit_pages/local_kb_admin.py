@@ -18,10 +18,12 @@ UI-раздел для управления локальной базой зна
 import streamlit as st
 
 from core.auth import get_current_user
+# Аудит: изменения состава и настроек базы знаний сегмента — событие
+# администрирования, пишется в журнал «Аудит системы»
 try:
-    from core.audit import log_event
+    from core.audit import audit as _audit
 except Exception:
-    def log_event(*a, **kw):
+    def _audit(*a, **kw):  # noqa: E731
         pass
 
 try:
@@ -133,6 +135,12 @@ def _tab_documents(org_id: str):
                 else:
                     err_list.append(f"{uf.name}: {result.get('message', 'ошибка')}")
                 progress.progress((i + 1) / len(uploaded))
+            _audit("kb_doc_uploaded", module="local_kb", meta={
+                "target_org_id": org_id,
+                "count":         ok_count,
+                "errors":        len(err_list),
+                "filename":      ", ".join(uf.name for uf in uploaded)[:200],
+            })
             if ok_count:
                 st.session_state["_local_kb_upload_msg"] = (
                     f"Загружено и проиндексировано: {ok_count} файл(ов)"
@@ -238,6 +246,11 @@ def _tab_documents(org_id: str):
                 if st.button("🗑️", key=f"local_kb_del_{filename}", use_container_width=True):
                     result = remove_document(org_id, filename)
                     if result.get("status") == "success":
+                        _audit("kb_doc_deleted", module="local_kb", meta={
+                            "target_org_id": org_id,
+                            "filename":      filename,
+                            "chunks":        result.get("deleted", 0),
+                        })
                         st.session_state["_local_kb_upload_msg"] = (
                             f"Удалено: {filename} ({result.get('deleted', 0)} фрагм.)"
                         )
@@ -265,6 +278,8 @@ def _tab_documents(org_id: str):
                 result = clear_segment_collection(org_id)
                 st.session_state["_confirm_clear_local_kb"] = False
                 if result.get("status") == "success":
+                    _audit("kb_cleared", module="local_kb",
+                           meta={"target_org_id": org_id})
                     st.success("Локальная база очищена.")
                 else:
                     st.error(f"Ошибка: {result.get('message', '?')}")
@@ -350,12 +365,15 @@ def _tab_chunking_settings(org_id: str):
     with col_save:
         if st.button("Сохранить настройки", type="primary",
                      key=f"save_chunk_{org_id}", use_container_width=True):
-            save_chunking_settings(org_id, {
+            _new_chunking = {
                 "method":     method,
                 "chunk_size": int(chunk_size),
                 "overlap":    int(overlap),
                 "word_safe":  bool(word_safe),
-            })
+            }
+            save_chunking_settings(org_id, _new_chunking)
+            _audit("kb_settings_changed", module="local_kb",
+                   meta={"target_org_id": org_id, "changed": _new_chunking})
             st.session_state["_chunk_saved"] = True
             st.rerun()
 
@@ -363,6 +381,8 @@ def _tab_chunking_settings(org_id: str):
         if st.button("Сбросить к дефолтным", type="secondary",
                      key=f"reset_chunk_{org_id}", use_container_width=True):
             reset_chunking_settings(org_id)
+            _audit("kb_settings_changed", module="local_kb",
+                   meta={"target_org_id": org_id, "reason": "сброс к значениям по умолчанию"})
             st.session_state["_chunk_reset"] = True
             st.rerun()
 

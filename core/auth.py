@@ -638,6 +638,20 @@ def _show_login_page() -> None:
                         pass
                     st.rerun()
                 else:
+                    # Аудит: неудачная попытка входа — введённый логин и
+                    # причина (пароль, разумеется, не пишется)
+                    try:
+                        from core.audit import log_event
+                        log_event(
+                            org_id="",
+                            user_id="",
+                            role="",
+                            event="login_failed",
+                            module=None,
+                            meta={"login": login_input.strip().lower()[:80], "reason": err},
+                        )
+                    except Exception:
+                        pass
                     st.error(err)
 
 
@@ -655,6 +669,17 @@ def _show_change_password_page(user: Dict) -> None:
         else:
             ok, err = change_password(user["user_id"], old_p, new_p)
             if ok:
+                try:
+                    from core.audit import log_event
+                    log_event(
+                        org_id=user.get("org_id", ""),
+                        user_id=user["user_id"],
+                        role=user.get("role", ""),
+                        event="password_changed",
+                        module=None,
+                    )
+                except Exception:
+                    pass
                 st.session_state.pop("_auth_user", None)
                 st.success("Пароль изменён. Добро пожаловать!")
                 st.rerun()
