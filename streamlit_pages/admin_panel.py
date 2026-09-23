@@ -103,6 +103,74 @@ def get_live_answer_stats(days: int = 7):
 
 
 
+# Метки, которые Советчик пишет в description при оценке БЕЗ комментария
+# (плюс старые формулировки из ранних версий). Такие записи — не отзыв,
+# а просто голос, и в список комментариев не попадают.
+_RATING_DEFAULT_LABELS = {
+    "", "Полезно", "Нормально", "Не помогло",
+    "Пользователь оценил ответ как полезный",
+    "Пользователь оценил ответ как нормальный",
+    "Пользователь оценил ответ как бесполезный",
+}
+_RATING_LABELS_UI = {3: "👍 Полезно", 2: "😐 Нормально", 1: "👎 Не помогло"}
+
+
+def get_answer_comments(days: int | None = None) -> list[dict]:
+    """
+    Отзывы пользователей к оценкам Советчика — записи answer_rating, у
+    которых в description лежит текст пользователя, а не метка оценки.
+    Комментарий пишется модалкой «Что не понравилось в ответе?» после 😐/👎
+    (см. streamlit_pages/advisor_page.py).
+
+    days — период в днях от текущего момента; None — за всё время. Запись с
+    нечитаемой датой в период не отсекается: лучше показать лишний отзыв,
+    чем молча потерять его.
+
+    Возвращает список словарей (новые первые): ts, rating, comment,
+    question, answer.
+    """
+    feedback_file = os.path.join("data", "feedback", "feedback_log.jsonl")
+    if not os.path.exists(feedback_file):
+        return []
+
+    cutoff = None
+    if days:
+        from datetime import timedelta
+        cutoff = datetime.now() - timedelta(days=days)
+
+    out = []
+    with open(feedback_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                fb = json.loads(line)
+            except Exception:
+                continue
+            if fb.get("feedback_type") != "answer_rating":
+                continue
+            comment = (fb.get("description") or "").strip()
+            if comment in _RATING_DEFAULT_LABELS:
+                continue
+            ts = fb.get("timestamp", "") or ""
+            if cutoff is not None:
+                try:
+                    if datetime.fromisoformat(ts) < cutoff:
+                        continue
+                except Exception:
+                    pass
+            out.append({
+                "ts":       ts,
+                "rating":   fb.get("rating"),
+                "comment":  comment,
+                "question": fb.get("question") or "",
+                "answer":   fb.get("answer") or "",
+            })
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return out
+
+
 def is_admin_logged() -> bool:
     return st.session_state.get("admin_logged_in", False)
 
@@ -158,15 +226,85 @@ def show_admin_panel():
                             "Количество": [stats["rating_3"],stats["rating_2"],stats["rating_1"]],
                         })
                         st.bar_chart(rating_df.set_index("Оценка"))
-                        if stats["top_bad_questions"]:
-                            st.subheader("Топ вопросов для улучшения")
-                            for i, item in enumerate(stats["top_bad_questions"], 1):
-                                with st.expander(f"{i}. «{item['question']}...»"):
-                                    st.write(f"**Ответ ИИ:** {item['answer']}")
-                                    st.write(f"**Комментарий:** {item['comment']}")
-                                    st.write(f"**Дата:** {item['timestamp'][:10]}")
                     else:
                         st.info("📭 Пока нет оценок.")
+
+                    # ── Комментарии пользователей ────────────────────────
+                    # Заменяет прежний блок «Топ вопросов для улучшения»:
+                    # тот показывал все оценки подряд (включая 👍), а
+                    # комментарием в нём была просто метка оценки.
+                    # Здесь — только отзывы с текстом, оставленным в модалке
+                    # Советчика после 😐/👎. Период берётся из селектора выше.
+                    st.divider()
+                    st.subheader("Комментарии пользователей")
+                    _comments = get_answer_comments(
+                        days=None if period == "Всё время" else days
+                    )
+                    if not _comments:
+                        st.info("За выбранный период комментариев нет.")
+                    else:
+                        _fc1, _fc2 = st.columns([1, 2])
+                        with _fc1:
+                            _rt_filter = st.multiselect(
+                                "Оценка",
+                                options=[2, 1, 3],
+                                default=[2, 1],
+                                format_func=lambda r: _RATING_LABELS_UI.get(r, str(r)),
+                                key="adm_fb_rating_filter",
+                            )
+                        with _fc2:
+                            _q_filter = st.text_input(
+                                "Поиск по комментарию и вопросу",
+                                key="adm_fb_search",
+                                placeholder="например: норма, теплоснабжение...",
+                            ).strip().lower()
+
+                        _shown = [
+                            c for c in _comments
+                            if (not _rt_filter or c["rating"] in _rt_filter)
+                            and (not _q_filter
+                                 or _q_filter in c["comment"].lower()
+                                 or _q_filter in c["question"].lower())
+                        ]
+                        st.caption(f"Показано: **{len(_shown)}** из {len(_comments)}")
+
+                        if _shown:
+                            _cdf = pd.DataFrame([{
+                                "Дата":        c["ts"][:16].replace("T", " "),
+                                "Оценка":      _RATING_LABELS_UI.get(c["rating"], str(c["rating"])),
+                                "Комментарий": c["comment"],
+                                "Вопрос":      c["question"],
+                                "Ответ ИИ":    c["answer"],
+                            } for c in _shown])
+                            st.dataframe(
+                                _cdf[["Дата", "Оценка", "Комментарий", "Вопрос"]],
+                                use_container_width=True, hide_index=True,
+                                column_config={
+                                    "Комментарий": st.column_config.TextColumn(width="large"),
+                                    "Вопрос":      st.column_config.TextColumn(width="medium"),
+                                },
+                            )
+                            st.download_button(
+                                "Скачать CSV",
+                                data=_cdf.to_csv(index=False).encode("utf-8-sig"),
+                                file_name=f"advisor_comments_{datetime.now():%Y%m%d}.csv",
+                                mime="text/csv",
+                                key="adm_fb_csv",
+                            )
+
+                            with st.expander("Подробно: вопрос, ответ ИИ, комментарий"):
+                                for i, c in enumerate(_shown[:50], 1):
+                                    st.markdown(
+                                        f"**{i}. {_RATING_LABELS_UI.get(c['rating'], '')}** · "
+                                        f"{c['ts'][:16].replace('T', ' ')}"
+                                    )
+                                    st.markdown(f"**Комментарий:** {c['comment']}")
+                                    st.markdown(f"**Вопрос:** {c['question']}")
+                                    st.caption(f"Ответ ИИ: {c['answer']}")
+                                    if i < min(len(_shown), 50):
+                                        st.divider()
+                                if len(_shown) > 50:
+                                    st.caption("Показаны первые 50 — полный список в CSV.")
                 except Exception as e:
                     st.error(f"Ошибка загрузки статистики: {e}")
 

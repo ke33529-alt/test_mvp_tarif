@@ -234,6 +234,88 @@ def _adv_task_picker_dialog(user: dict):
         st.info("Активных задач нет. Включите «Показывать выполненные».")
 
 
+def _adv_save_rating(comment: str = ""):
+    """
+    Сохраняет отложенную оценку 😐/👎 из _adv_fb_pending в feedback_log.jsonl.
+
+    Комментарий пользователя пишется в поле description — это то же поле,
+    которое Админка показывает как «Комментарий» во вкладке «Аналитика ИИ»,
+    поэтому отзывы сразу доступны для разбора. Без комментария в description
+    уходит метка оценки («Нормально» / «Не помогло»), как и раньше.
+
+    Payload забирается через pop(): повторный вызов (например, кнопка и
+    закрытие модалки в одном цикле) не создаст дубль.
+    """
+    p = st.session_state.pop("_adv_fb_pending", None)
+    if not p:
+        return
+    comment = (comment or "").strip()
+    submit_feedback(
+        "user", "answer_rating",
+        comment or p["label"],
+        question=p["question"][:500],
+        answer=p["answer"][:1000],
+        rating=p["rating"],
+        category="advisor",
+    )
+    _log_usage("advisor", "answer_rated", meta={
+        "rating":      p["rating"],
+        "step":        p["step"],
+        "has_comment": bool(comment),
+    })
+
+
+def _adv_rating_dismissed():
+    """Модалку закрыли крестиком / кликом мимо — оценку сохраняем без комментария."""
+    _adv_save_rating("")
+
+
+@st.dialog("Что не понравилось в ответе?", on_dismiss=_adv_rating_dismissed)
+def _adv_rating_comment_dialog():
+    """
+    Модалка отзыва после оценки 😐 или 👎.
+
+    Оценка не пишется в момент клика, а откладывается в _adv_fb_pending и
+    сохраняется ОДНОЙ записью вместе с комментарием — так рейтинг и текст
+    отзыва не расходятся по разным строкам журнала. Если модалку закрыть
+    крестиком, срабатывает on_dismiss и оценка сохраняется без комментария —
+    голос не теряется.
+
+    Ответ и цепочка уточнений при этом не сбрасываются.
+
+    Флаг открытия гасится ДО вызова (см. show_advisor) — как у модалки
+    выбора задач, чтобы модалка не открывалась повторно на следующем рероне.
+    """
+    p = st.session_state.get("_adv_fb_pending") or {}
+    st.caption(
+        f"Ваша оценка: «{p.get('label', '')}». Опишите, что было не так, — "
+        "отзывы разбираются и используются для улучшения ответов."
+    )
+    _txt = st.text_area(
+        "Комментарий",
+        height=130,
+        key="_adv_fb_comment",
+        label_visibility="collapsed",
+        placeholder="Например: неверная ссылка на норму; ответ слишком общий; "
+                    "не учтена специфика сферы; устаревшая редакция документа...",
+    )
+    _b1, _b2 = st.columns(2)
+    with _b1:
+        if st.button("Отправить", type="primary", key="_adv_fb_send",
+                     use_container_width=True):
+            if _txt.strip():
+                _adv_save_rating(_txt)
+                st.session_state.pop("_adv_fb_comment", None)
+                st.rerun()
+            else:
+                st.warning("Напишите комментарий или нажмите «Без комментария»")
+    with _b2:
+        if st.button("Без комментария", key="_adv_fb_skip", use_container_width=True):
+            _adv_save_rating("")
+            st.session_state.pop("_adv_fb_comment", None)
+            st.rerun()
+
+
 def _render_jumped_entry(entry: dict):
     """
     Отдельный экран записи, открытой по ссылке из задачи («Перейти к записи»
@@ -870,6 +952,10 @@ def show_advisor():
                     st.session_state.search_triggered = True
                     st.session_state._answer_streamed = True
                     st.session_state.clarifications   = []
+                    # Новый ответ — голосование снова доступно;
+                    # неотправленную оценку 😐/👎 предыдущего ответа сохраняем
+                    st.session_state["_adv_rated_step"] = None
+                    _adv_save_rating("")
 
                     # Автосохранение в историю
                     if answer and not answer.startswith("❌") and not st.session_state.sources_only_mode:
@@ -1004,38 +1090,6 @@ def show_advisor():
                         <b>👉 Перейдите в раздел «{result['redirect']}» в меню слева</b>
                     </div>""", unsafe_allow_html=True)
 
-                # ── Оценка ───────────────────────────────────────────────────
-                if not st.session_state.sources_only_mode and answer and not answer.startswith("❌"):
-                    st.divider()
-                    st.subheader("Оцените ответ")
-                    col1, col2, col3 = st.columns(3)
-                    query_for_fb = st.session_state.last_query
-
-                    def _rate(label: str, rating: int):
-                        submit_feedback("user", "answer_rating", label,
-                                        question=query_for_fb[:500],
-                                        answer=answer[:1000], rating=rating)
-                        _log_usage("advisor", "answer_rated", meta={"rating": rating})
-                        st.session_state.last_result      = None
-                        st.session_state.search_triggered = False
-                        st.session_state.clarifications   = []
-
-                    with col1:
-                        if st.button("👍", key="btn_good", use_container_width=True):
-                            _rate("Полезно", 3)
-                            st.success("Спасибо!")
-                            st.rerun()
-                    with col2:
-                        if st.button("😐", key="btn_neutral", use_container_width=True):
-                            _rate("Нормально", 2)
-                            st.success("Спасибо!")
-                            st.rerun()
-                    with col3:
-                        if st.button("👎", key="btn_bad", use_container_width=True):
-                            _rate("Не помогло", 1)
-                            st.success("Спасибо!")
-                            st.rerun()
-
                 # ── Цепочка уточнений ─────────────────────────────────────────
                 for ci, clar in enumerate(st.session_state.clarifications, 1):
                     st.divider()
@@ -1160,6 +1214,77 @@ def show_advisor():
                         else:
                             st.warning("Введите уточняющий вопрос")
 
+                # ── Оценка ───────────────────────────────────────────────────
+                # Стоит ПОСЛЕ блока уточнения — внизу диалога. Оценивается
+                # последний ответ в цепочке (последнее уточнение, если оно
+                # есть, иначе исходный ответ).
+                #
+                # 👍 — как раньше: оценка сохраняется, диалог закрывается.
+                # 😐/👎 — ответ и уточнения НЕ сбрасываются; открывается
+                # модалка «Что не понравилось в ответе?», и оценка
+                # сохраняется одной записью вместе с комментарием.
+                #
+                # _adv_rated_step — длина цепочки уточнений на момент оценки.
+                # Пока она не изменилась, повторно голосовать не даём; после
+                # нового уточнения кнопки появляются снова — уже для него.
+                if not st.session_state.sources_only_mode and answer and not answer.startswith("❌"):
+                    _clars_now = st.session_state.clarifications
+                    _step      = len(_clars_now)
+                    if _clars_now:
+                        _fb_question = _clars_now[-1]["query"]
+                        _fb_answer   = _clars_now[-1]["answer"]
+                    else:
+                        _fb_question = st.session_state.last_query
+                        _fb_answer   = answer
+
+                    st.divider()
+                    if st.session_state.get("_adv_rated_step") == _step:
+                        st.caption("Спасибо, оценка учтена.")
+                    else:
+                        st.subheader("Оцените ответ" if _step == 0
+                                     else f"Оцените ответ на уточнение №{_step}")
+
+                        def _ask_comment(label: str, rating: int):
+                            st.session_state["_adv_fb_pending"] = {
+                                "label":    label,
+                                "rating":   rating,
+                                "question": _fb_question,
+                                "answer":   _fb_answer,
+                                "step":     _step,
+                            }
+                            st.session_state["_adv_rated_step"]    = _step
+                            st.session_state["_adv_show_fb_modal"] = True
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            if st.button("👍", key="btn_good", use_container_width=True):
+                                submit_feedback("user", "answer_rating", "Полезно",
+                                                question=_fb_question[:500],
+                                                answer=_fb_answer[:1000], rating=3,
+                                                category="advisor")
+                                _log_usage("advisor", "answer_rated",
+                                           meta={"rating": 3, "step": _step})
+                                st.session_state.last_result      = None
+                                st.session_state.search_triggered = False
+                                st.session_state.clarifications   = []
+                                st.session_state["_adv_rated_step"] = None
+                                st.success("Спасибо!")
+                                st.rerun()
+                        with col2:
+                            if st.button("😐", key="btn_neutral", use_container_width=True):
+                                _ask_comment("Нормально", 2)
+                                st.rerun()
+                        with col3:
+                            if st.button("👎", key="btn_bad", use_container_width=True):
+                                _ask_comment("Не помогло", 1)
+                                st.rerun()
+
+                    # Модалка отзыва. Флаг гасим сразу — как у модалки выбора
+                    # задач, чтобы она не открывалась повторно на следующем
+                    # рероне (в т.ч. после уточнения).
+                    if st.session_state.pop("_adv_show_fb_modal", False):
+                        _adv_rating_comment_dialog()
+
                 # ── Новый вопрос ──────────────────────────────────────────────
                 st.divider()
                 col1, col2 = st.columns([3, 1])
@@ -1169,6 +1294,9 @@ def show_advisor():
                         st.session_state.last_result      = None
                         st.session_state.search_triggered = False
                         st.session_state.clarifications   = []
+                        st.session_state["_adv_rated_step"] = None
+                        # Неотправленную оценку 😐/👎 не теряем
+                        _adv_save_rating("")
                         st.rerun()
 
         elif not st.session_state.search_triggered:

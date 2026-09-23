@@ -156,3 +156,24 @@
 {"ts": "2026-09-23T02:35:18.938386", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
 {"ts": "2026-09-23T02:35:21.867128", "module": "doc_scanner", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
 {"ts": "2026-09-23T02:35:25.448922", "module": "claim_analyzer", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:52:30.467185", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:53:24.171770", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 24, "internal_mode": false, "npa_filter": 0}}
+{"ts": "2026-09-23T02:53:24.172380", "module": "advisor", "action": "answer_generated", "user_id": "superadmin", "org": "", "meta": {"model": "qwen3.5:9b", "sources": 50, "hidden_used": 6, "local_kb": false, "internal_mode": false, "duration_sec": 42.0}}
+{"ts": "2026-09-23T02:53:29.474087", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 2, "step": 0}}
+{"ts": "2026-09-23T02:55:02.599199", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 28, "internal_mode": false, "npa_filter": 0}}
+{"ts": "2026-09-23T02:55:02.599599", "module": "advisor", "action": "answer_generated", "user_id": "superadmin", "org": "", "meta": {"model": "qwen3.5:9b", "sources": 50, "hidden_used": 6, "local_kb": false, "internal_mode": false, "duration_sec": 33.9}}
+{"ts": "2026-09-23T02:55:27.260676", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T02:56:39.569141", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 32, "internal_mode": false, "npa_filter": 0}}
+{"ts": "2026-09-23T02:56:39.569342", "module": "advisor", "action": "answer_generated", "user_id": "superadmin", "org": "", "meta": {"model": "qwen3.5:9b", "sources": 50, "hidden_used": 3, "local_kb": false, "internal_mode": false, "duration_sec": 27.3}}
+{"ts": "2026-09-23T02:56:47.053764", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 2, "step": 0}}
+{"ts": "2026-09-23T02:57:13.783385", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"n": 1, "query_len": 12, "sources": 13}}
+{"ts": "2026-09-23T02:57:20.897762", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 2, "step": 1}}
+{"ts": "2026-09-23T02:57:48.211871", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"n": 2, "query_len": 21, "sources": 50}}
+{"ts": "2026-09-23T02:57:50.539469", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 1, "step": 2}}
+{"ts": "2026-09-23T03:04:19.374768", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T03:04:29.146581", "module": "advisor", "action": "module_open", "user_id": "superadmin", "org": "", "meta": {}}
+{"ts": "2026-09-23T03:05:22.600143", "module": "advisor", "action": "query_submitted", "user_id": "superadmin", "org": "", "meta": {"query_len": 34, "internal_mode": false, "npa_filter": 0}}
+{"ts": "2026-09-23T03:05:22.600321", "module": "advisor", "action": "answer_generated", "user_id": "superadmin", "org": "", "meta": {"model": "qwen3.5:9b", "sources": 50, "hidden_used": 4, "local_kb": false, "internal_mode": false, "duration_sec": 38.6}}
+{"ts": "2026-09-23T03:05:50.932693", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 2, "step": 0, "has_comment": false}}
+{"ts": "2026-09-23T03:06:36.179239", "module": "advisor", "action": "clarification_submitted", "user_id": "superadmin", "org": "", "meta": {"n": 1, "query_len": 11, "sources": 50}}
+{"ts": "2026-09-23T03:07:27.278936", "module": "advisor", "action": "answer_rated", "user_id": "superadmin", "org": "", "meta": {"rating": 1, "step": 1, "has_comment": true}}
